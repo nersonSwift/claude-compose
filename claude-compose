@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-compose — Multi-project Claude Code launcher
+# Merges MCP servers, skills, and permissions from external projects
+# into a single Claude Code session.
+
+VERSION="1.0.0"
+
+# ── Globals ──────────────────────────────────────────────────────────
+CONFIG_FILE=""
+DRY_RUN=false
+EXTRA_ARGS=()
+TEMP_MCP_FILE=""
+MERGED_MCP="{}"
+MERGED_PERMISSIONS="[]"
+SKILLS_TO_COPY=()  # pairs: "src_dir|dest_name"
+CLAUDE_ARGS=()
+NEED_CLAUDE_MD_ENV=false
+SESSION_ID="$$"  # PID-based session isolation
+
+# ── Colors ───────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ── Usage ────────────────────────────────────────────────────────────
+usage() {
+    echo -e "${BOLD}claude-compose${NC} v${VERSION} — Multi-project Claude Code launcher"
+    echo ""
+    echo -e "${BOLD}Usage:${NC}"
+    echo "  claude-compose [options] [-- claude-args...]"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -f <file>     Config file (default: claude-compose.json)"
+    echo "  --dry-run     Show what would be launched without executing"
+    echo "  -h, --help    Show this help"
+    echo "  -v, --version Show version"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  claude-compose                          # Use claude-compose.json"
+    echo "  claude-compose -f compose-full.json     # Custom config"
+    echo "  claude-compose --dry-run                # Preview mode"
+    echo "  claude-compose -- -p \"explain arch\"     # Pass args to claude"
+}
+
+# ── Cleanup ──────────────────────────────────────────────────────────
+cleanup() {
+    # Remove temp MCP file
+    if [[ -n "$TEMP_MCP_FILE" && -f "$TEMP_MCP_FILE" ]]; then
+        rm -f "$TEMP_MCP_FILE"
+    fi
+    # Remove only this session's skill directories
+    remove_session_skills
+}
+
+# Remove skills for current session only
+remove_session_skills() {
+    local skills_dir=".claude/skills"
+    if [[ -d "$skills_dir" ]]; then
+        for dir in "$skills_dir"/_compose_${SESSION_ID}_*/; do
+            if [[ -d "$dir" ]]; then
+                rm -rf "$dir"
+            fi
+        done
+    fi
+}
+
+# Remove stale skills from dead sessions (kill -9, power loss)
+remove_stale_skills() {
+    local skills_dir=".claude/skills"
+    [[ -d "$skills_dir" ]] || return 0
+    for dir in "$skills_dir"/_compose_*/; do
+        [[ -d "$dir" ]] || continue
+        local dirname
+        dirname=$(basename "$dir")
+        # Extract PID: _compose_<pid>_<skill_name>
+        local pid
+        pid=$(echo "$dirname" | sed -n 's/^_compose_\([0-9]*\)_.*/\1/p')
+        [[ -z "$pid" ]] && continue
+        # If the PID is not running, it's stale — remove
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$dir"
+        fi
+    done
+}
+
+# ── Glob matching ────────────────────────────────────────────────────
+# Returns 0 if $1 matches any pattern in the include list AND
+# does not match any pattern in the exclude list.
+# $1 = name, $2 = include JSON array, $3 = exclude JSON array
+matches_filter() {
+    local name="$1"
+    local include_json="$2"
+    local exclude_json="$3"
+
+    # Parse include patterns
+    local include_count
+    include_count=$(echo "$include_json" | jq -r 'length')
+
+    if [[ "$include_count" -eq 0 ]]; then
+        return 1  # empty include = nothing included
+    fi
+
+    # Check include
+    local included=false
+    for i in $(seq 0 $((include_count - 1))); do
+        local pattern
+        pattern=$(echo "$include_json" | jq -r ".[$i]")
+        # shellcheck disable=SC2053
+        if [[ "$name" == $pattern ]]; then
+            included=true
+            break
+        fi
+    done
+
+    if [[ "$included" == false ]]; then
+        return 1
+    fi
+
+    # Check exclude
+    local exclude_count
+    exclude_count=$(echo "$exclude_json" | jq -r 'length')
+
+    for i in $(seq 0 $((exclude_count - 1))); do
+        local pattern
+        pattern=$(echo "$exclude_json" | jq -r ".[$i]")
+        # shellcheck disable=SC2053
+        if [[ "$name" == $pattern ]]; then
+            return 1  # excluded
+        fi
+    done
+
+    return 0
+}
+
+# ── Parse CLI args ───────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f)
+                shift
+                CONFIG_FILE="$1"
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "claude-compose v${VERSION}"
+                exit 0
+                ;;
+            --)
+                shift
+                EXTRA_ARGS=("$@")
+                break
+                ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}" >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # Default config file
+    if [[ -z "$CONFIG_FILE" ]]; then
+        CONFIG_FILE="claude-compose.json"
+    fi
+}
+
+# ── Validate prerequisites ───────────────────────────────────────────
+validate() {
+    # Check jq
+    if ! command -v jq &>/dev/null; then
+        echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
+        echo "  Install: brew install jq" >&2
+        exit 1
+    fi
+
+    # Check claude
+    if ! command -v claude &>/dev/null; then
+        echo -e "${RED}Error: claude CLI not found in PATH.${NC}" >&2
+        exit 1
+    fi
+
+    # Check config file
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: Config file not found: ${CONFIG_FILE}${NC}" >&2
+        cat >&2 <<'EXAMPLE'
+
+Create a claude-compose.json:
+
+{
+  "projects": [
+    {
+      "path": "~/Documents/Code/MyProject",
+      "mcp": { "include": ["*"], "exclude": [] },
+      "skills": { "include": ["*"], "exclude": [] },
+      "permissions": { "include": ["*"], "exclude": [] },
+      "claude_md": true,
+      "files": true
+    }
+  ]
+}
+EXAMPLE
+        exit 1
+    fi
+
+    # Validate JSON
+    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
+        jq empty "$CONFIG_FILE" 2>&1 | head -5 >&2
+        exit 1
+    fi
+}
+
+# ── Expand ~ safely ─────────────────────────────────────────────────
+expand_path() {
+    local path="$1"
+    echo "${path/#\~/$HOME}"
+}
+
+# ── Process a single project ────────────────────────────────────────
+process_project() {
+    local project_json="$1"
+    local raw_path
+    raw_path=$(echo "$project_json" | jq -r '.path')
+    local project_path
+    project_path=$(expand_path "$raw_path")
+
+    # Check path exists
+    if [[ ! -d "$project_path" ]]; then
+        echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
+        return
+    fi
+
+    local short_name
+    short_name=$(basename "$project_path")
+
+    echo -e "${CYAN}Processing:${NC} ${short_name} (${project_path})" >&2
+
+    # ── Files / CLAUDE.md ──
+    local files claude_md
+    files=$(echo "$project_json" | jq -r '.files // true')
+    claude_md=$(echo "$project_json" | jq -r '.claude_md // true')
+
+    if [[ "$files" == "true" || "$claude_md" == "true" ]]; then
+        CLAUDE_ARGS+=("--add-dir" "$project_path")
+    fi
+
+    if [[ "$claude_md" == "true" ]]; then
+        NEED_CLAUDE_MD_ENV=true
+    fi
+
+    # ── MCP servers ──
+    local mcp_file="$project_path/.mcp.json"
+    if [[ -f "$mcp_file" ]]; then
+        local mcp_include mcp_exclude mcp_rename
+        mcp_include=$(echo "$project_json" | jq -c '.mcp.include // ["*"]')
+        mcp_exclude=$(echo "$project_json" | jq -c '.mcp.exclude // []')
+        mcp_rename=$(echo "$project_json" | jq -c '.mcp.rename // {}')
+
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
+                local server_config final_name
+                server_config=$(jq -c --arg n "$name" '.mcpServers[$n]' "$mcp_file")
+                final_name=$(echo "$mcp_rename" | jq -r --arg n "$name" '.[$n] // $n')
+                MERGED_MCP=$(echo "$MERGED_MCP" | jq --arg name "$final_name" --argjson config "$server_config" '. + {($name): $config}')
+                if [[ "$final_name" != "$name" ]]; then
+                    echo -e "  ${GREEN}+mcp:${NC} $name → $final_name" >&2
+                else
+                    echo -e "  ${GREEN}+mcp:${NC} $name" >&2
+                fi
+            fi
+        done < <(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+    fi
+
+    # ── Skills ──
+    # --add-dir loads all skills from external project automatically.
+    # Only copy skills when files=false (no --add-dir), otherwise skip to avoid duplicates.
+    if [[ "$files" != "true" ]]; then
+        local skills_dir="$project_path/.claude/skills"
+        if [[ -d "$skills_dir" ]]; then
+            local skills_include skills_exclude
+            skills_include=$(echo "$project_json" | jq -c '.skills.include // ["*"]')
+            skills_exclude=$(echo "$project_json" | jq -c '.skills.exclude // []')
+
+            for skill_path in "$skills_dir"/*/; do
+                [[ -d "$skill_path" ]] || continue
+                local skill_name
+                skill_name=$(basename "$skill_path")
+                [[ "$skill_name" == _compose_* ]] && continue
+
+                if matches_filter "$skill_name" "$skills_include" "$skills_exclude"; then
+                    SKILLS_TO_COPY+=("${skill_path}|${skill_name}")
+                    echo -e "  ${GREEN}+skill:${NC} $skill_name" >&2
+                fi
+            done
+        fi
+    else
+        echo -e "  ${CYAN}skills:${NC} loaded via --add-dir (all)" >&2
+    fi
+
+    # ── Permissions ──
+    local settings_file="$project_path/.claude/settings.local.json"
+    if [[ -f "$settings_file" ]]; then
+        local perm_include perm_exclude
+        perm_include=$(echo "$project_json" | jq -c '.permissions.include // ["*"]')
+        perm_exclude=$(echo "$project_json" | jq -c '.permissions.exclude // []')
+
+        while IFS= read -r perm; do
+            [[ -z "$perm" ]] && continue
+            if matches_filter "$perm" "$perm_include" "$perm_exclude"; then
+                MERGED_PERMISSIONS=$(echo "$MERGED_PERMISSIONS" | jq --arg p "$perm" '. + [$p] | unique')
+                echo -e "  ${GREEN}+perm:${NC} $perm" >&2
+            fi
+        done < <(jq -r '.permissions.allow // [] | .[]' "$settings_file" 2>/dev/null || true)
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+    validate
+
+    echo -e "${BOLD}claude-compose${NC} v${VERSION}" >&2
+    echo -e "Config: ${CONFIG_FILE}" >&2
+    echo "" >&2
+
+    # Register cleanup early
+    trap cleanup EXIT
+
+    # Clean stale _compose_ dirs from interrupted sessions (dead PIDs)
+    remove_stale_skills
+
+    # Read project count
+    local project_count
+    project_count=$(jq '.projects | length' "$CONFIG_FILE")
+
+    if [[ "$project_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No projects defined in config. Launching plain claude.${NC}" >&2
+        claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        return
+    fi
+
+    # Process each project
+    for i in $(seq 0 $((project_count - 1))); do
+        local project_json
+        project_json=$(jq -c ".projects[$i]" "$CONFIG_FILE")
+        process_project "$project_json"
+    done
+
+    echo "" >&2
+
+    # ── Build final command ──
+
+    # MCP config
+    local mcp_server_count
+    mcp_server_count=$(echo "$MERGED_MCP" | jq 'length')
+    # Permissions
+    local perm_count
+    perm_count=$(echo "$MERGED_PERMISSIONS" | jq 'length')
+    if [[ "$perm_count" -gt 0 ]]; then
+        local settings_json
+        settings_json=$(echo "$MERGED_PERMISSIONS" | jq -c '{permissions: {allow: .}}')
+        CLAUDE_ARGS+=("--settings" "$settings_json")
+    fi
+
+    # Extra args
+    if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+        CLAUDE_ARGS+=("${EXTRA_ARGS[@]}")
+    fi
+
+    # ── Dry run ──
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${BOLD}── Dry Run ──${NC}" >&2
+        echo "" >&2
+
+        if [[ "$NEED_CLAUDE_MD_ENV" == true ]]; then
+            echo -e "${CYAN}Environment:${NC}" >&2
+            echo "  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1" >&2
+            echo "" >&2
+        fi
+
+        if [[ "$mcp_server_count" -gt 0 ]]; then
+            echo -e "${CYAN}MCP servers (merged):${NC}" >&2
+            echo "$MERGED_MCP" | jq -r 'keys[]' | while read -r name; do
+                echo "  - $name" >&2
+            done
+            echo "" >&2
+        fi
+
+        if [[ ${#SKILLS_TO_COPY[@]} -gt 0 ]]; then
+            echo -e "${CYAN}Skills (to copy):${NC}" >&2
+            for entry in "${SKILLS_TO_COPY[@]}"; do
+                local skill_name="${entry#*|}"
+                echo "  - $skill_name → .claude/skills/_compose_<pid>_${skill_name}/" >&2
+            done
+            echo "" >&2
+        fi
+
+        if [[ "$perm_count" -gt 0 ]]; then
+            echo -e "${CYAN}Permissions (merged):${NC}" >&2
+            echo "$MERGED_PERMISSIONS" | jq -r '.[]' | while read -r p; do
+                echo "  - $p" >&2
+            done
+            echo "" >&2
+        fi
+
+        echo -e "${CYAN}Command:${NC}" >&2
+        local display_args=("claude")
+        if [[ "$mcp_server_count" -gt 0 ]]; then
+            display_args+=("--mcp-config" "<temp-file>")
+        fi
+        display_args+=("${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}")
+        echo "  ${display_args[*]}" >&2
+
+        echo "" >&2
+        echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
+        return
+    fi
+
+    # ── Apply mutations ──
+
+    # Write MCP temp file
+    if [[ "$mcp_server_count" -gt 0 ]]; then
+        local old_umask
+        old_umask=$(umask)
+        umask 077
+        TEMP_MCP_FILE=$(mktemp "${TMPDIR:-/tmp}/claude-compose-mcp.XXXXXX")
+        umask "$old_umask"
+        echo "$MERGED_MCP" | jq --arg home "$HOME" '{mcpServers: .} | walk(if type == "string" then gsub("\\$\\{HOME\\}"; $home) | gsub("^~(?=/|$)"; $home) else . end)' > "$TEMP_MCP_FILE"
+        CLAUDE_ARGS=("--mcp-config" "$TEMP_MCP_FILE" "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}")
+    fi
+
+    # Copy skills
+    if [[ ${#SKILLS_TO_COPY[@]} -gt 0 ]]; then
+        mkdir -p ".claude/skills"
+        for entry in "${SKILLS_TO_COPY[@]}"; do
+            local src="${entry%|*}"
+            local skill_name="${entry#*|}"
+            local dest=".claude/skills/_compose_${SESSION_ID}_${skill_name}"
+            cp -R "$src" "$dest"
+            echo -e "${GREEN}Copied skill:${NC} $skill_name → $dest" >&2
+        done
+    fi
+
+    # ── Launch ──
+    echo -e "${BOLD}Launching claude...${NC}" >&2
+    echo "" >&2
+
+    if [[ "$NEED_CLAUDE_MD_ENV" == true ]]; then
+        export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
+    fi
+
+    claude "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+}
+
+main "$@"

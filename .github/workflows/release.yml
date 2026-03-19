@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG_DIR="claude-compose_${VERSION}"
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+
+          cp claude-compose "${PKG_DIR}/usr/bin/claude-compose"
+          chmod +x "${PKG_DIR}/usr/bin/claude-compose"
+
+          cat > "${PKG_DIR}/DEBIAN/control" << EOF
+          Package: claude-compose
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: all
+          Depends: jq
+          Maintainer: Aleksandr Senin
+          Description: Multi-project launcher for Claude Code
+           Merges MCP servers, permissions, skills, and CLAUDE.md
+           from external projects into a single Claude Code session.
+          EOF
+
+          # Remove leading spaces from control file (heredoc indentation)
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          dpkg-deb --build "${PKG_DIR}" "claude-compose.deb"
+
+      - name: Compute SHA256
+        id: sha
+        run: |
+          SHA=$(sha256sum <(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz") | cut -d' ' -f1)
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "SHA256 for Homebrew formula: ${SHA}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: claude-compose.deb
+          body: |
+            ## Install
+
+            **Homebrew:**
+            ```bash
+            brew install nersonSwift/tap/claude-compose
+            ```
+
+            **apt/dpkg:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/claude-compose.deb -o /tmp/claude-compose.deb
+            sudo dpkg -i /tmp/claude-compose.deb
+            ```
+
+            **Script:**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+
+            ---
+            SHA256 (tar.gz): `${{ steps.sha.outputs.sha256 }}`
