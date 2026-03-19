@@ -15,6 +15,7 @@ TEMP_MCP_FILE=""
 MERGED_MCP="{}"
 MERGED_PERMISSIONS="[]"
 SKILLS_TO_COPY=()  # pairs: "src_dir|dest_name"
+AGENTS_TO_COPY=()  # pairs: "src_file|dest_name"
 CLAUDE_ARGS=()
 NEED_CLAUDE_MD_ENV=false
 SESSION_ID="$$"  # PID-based session isolation
@@ -53,38 +54,38 @@ cleanup() {
     if [[ -n "$TEMP_MCP_FILE" && -f "$TEMP_MCP_FILE" ]]; then
         rm -f "$TEMP_MCP_FILE"
     fi
-    # Remove only this session's skill directories
-    remove_session_skills
+    # Remove only this session's skill and agent directories
+    remove_session_compose_dirs
 }
 
-# Remove skills for current session only
-remove_session_skills() {
-    local skills_dir=".claude/skills"
-    if [[ -d "$skills_dir" ]]; then
-        for dir in "$skills_dir"/_compose_${SESSION_ID}_*/; do
-            if [[ -d "$dir" ]]; then
-                rm -rf "$dir"
+# Remove skills and agents for current session only
+remove_session_compose_dirs() {
+    for base_dir in ".claude/skills" ".claude/agents"; do
+        if [[ -d "$base_dir" ]]; then
+            for item in "$base_dir"/_compose_${SESSION_ID}_*; do
+                if [[ -e "$item" ]]; then
+                    rm -rf "$item"
+                fi
+            done
+        fi
+    done
+}
+
+# Remove stale skills/agents from dead sessions (kill -9, power loss)
+remove_stale_compose_dirs() {
+    for base_dir in ".claude/skills" ".claude/agents"; do
+        [[ -d "$base_dir" ]] || continue
+        for item in "$base_dir"/_compose_*; do
+            [[ -e "$item" ]] || continue
+            local itemname
+            itemname=$(basename "$item")
+            local pid
+            pid=$(echo "$itemname" | sed -n 's/^_compose_\([0-9]*\)_.*/\1/p')
+            [[ -z "$pid" ]] && continue
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -rf "$item"
             fi
         done
-    fi
-}
-
-# Remove stale skills from dead sessions (kill -9, power loss)
-remove_stale_skills() {
-    local skills_dir=".claude/skills"
-    [[ -d "$skills_dir" ]] || return 0
-    for dir in "$skills_dir"/_compose_*/; do
-        [[ -d "$dir" ]] || continue
-        local dirname
-        dirname=$(basename "$dir")
-        # Extract PID: _compose_<pid>_<skill_name>
-        local pid
-        pid=$(echo "$dirname" | sed -n 's/^_compose_\([0-9]*\)_.*/\1/p')
-        [[ -z "$pid" ]] && continue
-        # If the PID is not running, it's stale — remove
-        if ! kill -0 "$pid" 2>/dev/null; then
-            rm -rf "$dir"
-        fi
     done
 }
 
@@ -310,6 +311,27 @@ process_project() {
         echo -e "  ${CYAN}skills:${NC} loaded via --add-dir (all)" >&2
     fi
 
+    # ── Agents ──
+    # --add-dir does NOT load agents — must always copy
+    local agents_dir="$project_path/.claude/agents"
+    if [[ -d "$agents_dir" ]]; then
+        local agents_include agents_exclude
+        agents_include=$(echo "$project_json" | jq -c '.agents.include // ["*"]')
+        agents_exclude=$(echo "$project_json" | jq -c '.agents.exclude // []')
+
+        for agent_file in "$agents_dir"/*.md; do
+            [[ -f "$agent_file" ]] || continue
+            local agent_name
+            agent_name=$(basename "$agent_file" .md)
+            [[ "$agent_name" == _compose_* ]] && continue
+
+            if matches_filter "$agent_name" "$agents_include" "$agents_exclude"; then
+                AGENTS_TO_COPY+=("${agent_file}|${agent_name}")
+                echo -e "  ${GREEN}+agent:${NC} $agent_name" >&2
+            fi
+        done
+    fi
+
     # ── Permissions ──
     local settings_file="$project_path/.claude/settings.local.json"
     if [[ -f "$settings_file" ]]; then
@@ -340,7 +362,7 @@ main() {
     trap cleanup EXIT
 
     # Clean stale _compose_ dirs from interrupted sessions (dead PIDs)
-    remove_stale_skills
+    remove_stale_compose_dirs
 
     # Read project count
     local project_count
@@ -408,6 +430,15 @@ main() {
             echo "" >&2
         fi
 
+        if [[ ${#AGENTS_TO_COPY[@]} -gt 0 ]]; then
+            echo -e "${CYAN}Agents (to copy):${NC}" >&2
+            for entry in "${AGENTS_TO_COPY[@]}"; do
+                local agent_name="${entry#*|}"
+                echo "  - $agent_name → .claude/agents/_compose_<pid>_${agent_name}.md" >&2
+            done
+            echo "" >&2
+        fi
+
         if [[ "$perm_count" -gt 0 ]]; then
             echo -e "${CYAN}Permissions (merged):${NC}" >&2
             echo "$MERGED_PERMISSIONS" | jq -r '.[]' | while read -r p; do
@@ -451,6 +482,18 @@ main() {
             local dest=".claude/skills/_compose_${SESSION_ID}_${skill_name}"
             cp -R "$src" "$dest"
             echo -e "${GREEN}Copied skill:${NC} $skill_name → $dest" >&2
+        done
+    fi
+
+    # Copy agents
+    if [[ ${#AGENTS_TO_COPY[@]} -gt 0 ]]; then
+        mkdir -p ".claude/agents"
+        for entry in "${AGENTS_TO_COPY[@]}"; do
+            local src="${entry%|*}"
+            local agent_name="${entry#*|}"
+            local dest=".claude/agents/_compose_${SESSION_ID}_${agent_name}.md"
+            cp "$src" "$dest"
+            echo -e "${GREEN}Copied agent:${NC} $agent_name → $dest" >&2
         done
     fi
 
