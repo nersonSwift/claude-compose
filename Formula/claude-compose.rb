@@ -1,8 +1,8 @@
 class ClaudeCompose < Formula
-  desc "Multi-project launcher for Claude Code — merge MCP, permissions, skills across projects"
+  desc "Multi-project launcher for Claude Code — merge MCP, permissions, skills, agents across projects"
   homepage "https://github.com/nersonSwift/claude-compose"
-  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 ""  # Will be filled after first release
+  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v1.1.1.tar.gz"
+  sha256 ""  # Updated by release workflow
   license "MIT"
 
   depends_on "jq"

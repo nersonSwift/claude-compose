@@ -15,7 +15,8 @@ Claude Code's `--add-dir` gives file access to other directories, but **MCP serv
 | **MCP servers** | `--mcp-config` (temp file) | include/exclude/rename |
 | **Permissions** | `--settings` (merge, no file modification) | include/exclude (glob) |
 | **Skills** | Loaded via `--add-dir` when `files: true`; copied when `files: false` | include/exclude (when copied) |
-| **CLAUDE.md** | `--add-dir` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` | on/off |
+| **Agents** | Copied to `.claude/agents/` (always, `--add-dir` does not load them) | include/exclude |
+| **CLAUDE.md / rules** | `--add-dir` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` | on/off |
 | **Files** | `--add-dir` | on/off |
 
 ## Install
@@ -108,7 +109,9 @@ Create `claude-compose.json` in your project root:
 | `permissions.exclude` | `[]` | Permission patterns to exclude (glob) |
 | `skills.include` | `["*"]` | Skill names to include (only when `files: false`) |
 | `skills.exclude` | `[]` | Skill names to exclude (only when `files: false`) |
-| `claude_md` | `true` | Load CLAUDE.md from external project |
+| `agents.include` | `["*"]` | Agent names to include |
+| `agents.exclude` | `[]` | Agent names to exclude |
+| `claude_md` | `true` | Load CLAUDE.md and `.claude/rules/` from external project |
 | `files` | `true` | Add project directory via `--add-dir` |
 
 ### Pattern matching
@@ -121,15 +124,16 @@ Create `claude-compose.json` in your project root:
 ## How it works
 
 1. Reads config and validates prerequisites
-2. For each external project: collects MCP servers, permissions, skills
+2. For each external project: collects MCP servers, permissions, agents
 3. Writes merged MCP config to a temp file (mode 600, in `$TMPDIR`)
 4. Expands `~` and `${HOME}` in all string values
-5. Launches `claude` with `--mcp-config`, `--add-dir`, `--settings` flags
-6. Cleans up temp files and copied skills on exit (`trap EXIT`)
+5. Copies agents to `.claude/agents/_compose_<pid>_<name>.md`
+6. Launches `claude` with `--mcp-config`, `--add-dir`, `--settings` flags
+7. Cleans up temp files and copied agents on exit (`trap EXIT`)
 
 ### Concurrency
 
-Multiple `claude-compose` sessions can run from the same directory without conflicts. Each session uses PID-based isolation for copied skills (`_compose_<pid>_<name>`). Stale directories from crashed sessions (kill -9) are cleaned up on next startup.
+Multiple `claude-compose` sessions can run from the same directory without conflicts. Each session uses PID-based isolation for copied agents and skills (`_compose_<pid>_<name>`). Stale files from crashed sessions (kill -9) are cleaned up on next startup.
 
 ### Security
 
