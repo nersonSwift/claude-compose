@@ -19,6 +19,9 @@ AGENTS_TO_COPY=()  # pairs: "src_file|dest_name"
 CLAUDE_ARGS=()
 NEED_CLAUDE_MD_ENV=false
 SESSION_ID="$$"  # PID-based session isolation
+SUBCOMMAND=""      # "", "init", "configure"
+INIT_YES=false     # -y flag for init
+INIT_PATH=""       # optional path argument for init
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -34,15 +37,25 @@ usage() {
     echo ""
     echo -e "${BOLD}Usage:${NC}"
     echo "  claude-compose [options] [-- claude-args...]"
+    echo "  claude-compose init [-y <path>] [-f <file>]"
+    echo "  claude-compose configure [-f <file>]"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo "  init          Create a new config file (-y for defaults, or interactive)"
+    echo "  configure     Add, edit, or remove projects interactively"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
+    echo "  -y, --yes     Skip prompts, use defaults (init only)"
     echo "  --dry-run     Show what would be launched without executing"
     echo "  -h, --help    Show this help"
     echo "  -v, --version Show version"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  claude-compose                          # Use claude-compose.json"
+    echo "  claude-compose init                     # Interactive setup"
+    echo "  claude-compose init -y ~/Code/app       # Quick template"
+    echo "  claude-compose configure                # Manage projects"
     echo "  claude-compose -f compose-full.json     # Custom config"
     echo "  claude-compose --dry-run                # Preview mode"
     echo "  claude-compose -- -p \"explain arch\"     # Pass args to claude"
@@ -138,16 +151,564 @@ matches_filter() {
     return 0
 }
 
+# ── Interactive helpers ───────────────────────────────────────────────
+
+# Prompt with a default value. Sets REPLY.
+prompt_default() {
+    local text="$1" default="$2"
+    if [[ -n "$default" ]]; then
+        read -rp "$text [$default]: " REPLY
+        [[ -z "$REPLY" ]] && REPLY="$default" || true
+    else
+        read -rp "$text: " REPLY
+    fi
+}
+
+# Yes/no prompt. $2 = default ("Y" or "N"). Returns 0=yes, 1=no.
+prompt_yn() {
+    local text="$1" default="${2:-Y}"
+    local hint
+    if [[ "$default" == "Y" ]]; then hint="Y/n"; else hint="y/N"; fi
+    read -rp "$text [$hint]: " REPLY
+    [[ -z "$REPLY" ]] && REPLY="$default"
+    [[ "$REPLY" =~ ^[Yy] ]]
+}
+
+# Comma-separated string → JSON array via jq
+csv_to_json_array() {
+    local csv="$1"
+    if [[ -z "$csv" ]]; then
+        echo "[]"
+        return
+    fi
+    echo "$csv" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))'
+}
+
+# Atomic JSON write: write to temp then mv
+write_json_atomic() {
+    local file="$1" json="$2"
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXX")
+    if ! echo "$json" | jq '.' > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        echo -e "${RED}Error: Failed to write JSON to ${file}${NC}" >&2
+        return 1
+    fi
+    mv "$tmp" "$file"
+}
+
+# Validate project path. Prints resolved path on stdout. Returns 1 on error.
+validate_project_path() {
+    local raw_path="$1"
+
+    if [[ -z "$raw_path" ]]; then
+        echo -e "${RED}Error: Path is required.${NC}" >&2
+        return 1
+    fi
+
+    local resolved_path
+    resolved_path=$(expand_path "$raw_path")
+    resolved_path=$(cd "$resolved_path" 2>/dev/null && pwd || echo "$resolved_path")
+
+    local config_dir
+    config_dir=$(cd "$(dirname "$CONFIG_FILE")" 2>/dev/null && pwd || pwd)
+
+    if [[ "$resolved_path" == "$config_dir" ]]; then
+        echo -e "${RED}Error: Cannot add the current project directory. Add external projects only.${NC}" >&2
+        return 1
+    fi
+
+    if [[ ! -d "$resolved_path" ]]; then
+        echo -e "${YELLOW}Warning: Path does not exist: ${raw_path}${NC}" >&2
+    fi
+
+    echo "$raw_path"
+}
+
+# Output minimal default project JSON: {"path": "$1"}
+make_default_project() {
+    jq -n --arg p "$1" '{path: $p}'
+}
+
+# Format a one-line summary of project settings.
+# $1 = project JSON string
+format_project_summary() {
+    local pj="$1"
+
+    local mcp_inc mcp_exc rename_json
+    mcp_inc=$(echo "$pj" | jq -c '.mcp.include // ["*"]')
+    mcp_exc=$(echo "$pj" | jq -c '.mcp.exclude // []')
+    rename_json=$(echo "$pj" | jq -c '.mcp.rename // {}')
+
+    local perm_inc perm_exc
+    perm_inc=$(echo "$pj" | jq -c '.permissions.include // ["*"]')
+    perm_exc=$(echo "$pj" | jq -c '.permissions.exclude // []')
+
+    local claude_md files
+    claude_md=$(echo "$pj" | jq -r '.claude_md // true')
+    files=$(echo "$pj" | jq -r '.files // true')
+
+    # MCP part
+    local mcp_str
+    if [[ "$mcp_inc" == '["*"]' ]]; then
+        mcp_str="*"
+    else
+        mcp_str=$(echo "$mcp_inc" | jq -r 'join(", ")')
+    fi
+    if [[ "$mcp_exc" != "[]" ]]; then
+        local exc_list
+        exc_list=$(echo "$mcp_exc" | jq -r 'join(", ")')
+        mcp_str="${mcp_str} (exclude: ${exc_list})"
+    fi
+
+    # Rename part
+    local rename_str=""
+    local rename_len
+    rename_len=$(echo "$rename_json" | jq 'length')
+    if [[ "$rename_len" -gt 0 ]]; then
+        rename_str=$(echo "$rename_json" | jq -r 'to_entries | map("\(.key)→\(.value)") | join(", ")')
+    fi
+
+    # Permissions part
+    local perm_str
+    if [[ "$perm_inc" == '["*"]' ]]; then
+        perm_str="*"
+    else
+        perm_str=$(echo "$perm_inc" | jq -r 'join(", ")')
+    fi
+    if [[ "$perm_exc" != "[]" ]]; then
+        local pexc_list
+        pexc_list=$(echo "$perm_exc" | jq -r 'join(", ")')
+        perm_str="${perm_str} (exclude: ${pexc_list})"
+    fi
+
+    # Agents part
+    local agents_inc agents_exc agents_rename_json
+    agents_inc=$(echo "$pj" | jq -c '.agents.include // ["*"]')
+    agents_exc=$(echo "$pj" | jq -c '.agents.exclude // []')
+    agents_rename_json=$(echo "$pj" | jq -c '.agents.rename // {}')
+    local agents_str
+    if [[ "$agents_inc" == '["*"]' ]]; then
+        agents_str="*"
+    else
+        agents_str=$(echo "$agents_inc" | jq -r 'join(", ")')
+    fi
+    if [[ "$agents_exc" != "[]" ]]; then
+        local aexc_list
+        aexc_list=$(echo "$agents_exc" | jq -r 'join(", ")')
+        agents_str="${agents_str} (exclude: ${aexc_list})"
+    fi
+    local agents_rename_str=""
+    local agents_rename_len
+    agents_rename_len=$(echo "$agents_rename_json" | jq 'length')
+    if [[ "$agents_rename_len" -gt 0 ]]; then
+        agents_rename_str=$(echo "$agents_rename_json" | jq -r 'to_entries | map("\(.key)→\(.value)") | join(", ")')
+    fi
+
+    # Build output
+    local line="MCP: ${mcp_str}"
+    if [[ -n "$rename_str" ]]; then
+        line="${line} | Rename: ${rename_str}"
+    fi
+    line="${line} | Permissions: ${perm_str} | Agents: ${agents_str}"
+    if [[ -n "$agents_rename_str" ]]; then
+        line="${line} (rename: ${agents_rename_str})"
+    fi
+    line="${line} | CLAUDE.md: ${claude_md} | Files: ${files}"
+    echo "$line"
+}
+
+# Parse "old=new,old2=new2" into JSON object {"old":"new","old2":"new2"}
+parse_rename_pairs() {
+    local input="$1"
+    if [[ -z "$input" ]]; then
+        echo "{}"
+        return
+    fi
+    echo "$input" | jq -Rc '
+        split(",")
+        | map(gsub("^\\s+|\\s+$"; ""))
+        | map(select(. != ""))
+        | map(split("=") | {(.[0] | gsub("^\\s+|\\s+$"; "")): (.[1] | gsub("^\\s+|\\s+$"; ""))})
+        | add // {}
+    '
+}
+
+# Remove default-valued keys from .projects[$1] in CONFIG_FILE
+simplify_project() {
+    local idx="$1"
+    local config
+    config=$(jq --argjson i "$idx" '
+        .projects[$i] |= (
+            if .mcp then
+                if .mcp.include == ["*"] then del(.mcp.include) else . end |
+                if .mcp.exclude == [] then del(.mcp.exclude) else . end |
+                if .mcp.rename == {} then del(.mcp.rename) else . end |
+                if (.mcp | length) == 0 then del(.mcp) else . end
+            else . end |
+            if .permissions then
+                if .permissions.include == ["*"] then del(.permissions.include) else . end |
+                if .permissions.exclude == [] then del(.permissions.exclude) else . end |
+                if (.permissions | length) == 0 then del(.permissions) else . end
+            else . end |
+            if .agents then
+                if .agents.include == ["*"] then del(.agents.include) else . end |
+                if .agents.exclude == [] then del(.agents.exclude) else . end |
+                if .agents.rename == {} then del(.agents.rename) else . end |
+                if (.agents | length) == 0 then del(.agents) else . end
+            else . end |
+            if .claude_md == true then del(.claude_md) else . end |
+            if .files == true then del(.files) else . end
+        )
+    ' "$CONFIG_FILE")
+    write_json_atomic "$CONFIG_FILE" "$config"
+}
+
+# Quick-add: prompt path → validate → add with defaults → show summary.
+# Returns 0=added, 1=done (empty input), 2=error
+add_project_quick() {
+    local raw_path
+    read -rp "Project path to connect [Enter to finish]: " raw_path
+
+    # Empty = user is done
+    if [[ -z "$raw_path" ]]; then
+        return 1
+    fi
+
+    local validated_path
+    if ! validated_path=$(validate_project_path "$raw_path"); then
+        return 2
+    fi
+
+    local project_json
+    project_json=$(make_default_project "$validated_path")
+
+    local config
+    config=$(jq --argjson p "$project_json" '.projects += [$p]' "$CONFIG_FILE")
+    write_json_atomic "$CONFIG_FILE" "$config"
+
+    local summary
+    summary=$(format_project_summary "$project_json")
+    echo -e "  ${GREEN}+${NC} ${validated_path}" >&2
+    echo -e "    ${summary}" >&2
+    return 0
+}
+
+# Helper: show current filter state for a section
+# $1=label, $2=include json, $3=exclude json
+show_filter_state() {
+    local label="$1" inc="$2" exc="$3"
+    local inc_str
+    if [[ "$inc" == '["*"]' ]]; then inc_str="*"; else inc_str=$(echo "$inc" | jq -r 'join(", ")'); fi
+    local exc_str
+    if [[ "$exc" == '[]' ]]; then exc_str="none"; else exc_str=$(echo "$exc" | jq -r 'join(", ")'); fi
+    echo -e "  ${CYAN}${label}:${NC} include: ${inc_str} | exclude: ${exc_str}" >&2
+}
+
+# Edit submenu for a single project
+# $1 = 0-based index
+edit_project_submenu() {
+    local idx="$1"
+
+    while true; do
+        local pj path summary
+        pj=$(jq -c ".projects[$idx]" "$CONFIG_FILE")
+        path=$(echo "$pj" | jq -r '.path')
+        summary=$(format_project_summary "$pj")
+
+        echo "" >&2
+        echo -e "${BOLD}Editing:${NC} ${path}" >&2
+        echo -e "  ${summary}" >&2
+        echo "" >&2
+
+        local action
+        read -rp "[m]cp / [p]ermissions / [a]gents / [c]laude_md / [f]iles / [b]ack: " action
+
+        case "$action" in
+            m|mcp)
+                # Resolve path and discover servers
+                local resolved_path
+                resolved_path=$(expand_path "$path")
+                resolved_path=$(cd "$resolved_path" 2>/dev/null && pwd || echo "$resolved_path")
+                local mcp_file="$resolved_path/.mcp.json"
+
+                while true; do
+                    pj=$(jq -c ".projects[$idx]" "$CONFIG_FILE")
+                    local cur_inc cur_exc cur_rename
+                    cur_inc=$(echo "$pj" | jq -c '.mcp.include // ["*"]')
+                    cur_exc=$(echo "$pj" | jq -c '.mcp.exclude // []')
+                    cur_rename=$(echo "$pj" | jq -c '.mcp.rename // {}')
+
+                    echo "" >&2
+                    if [[ -f "$mcp_file" ]]; then
+                        local servers
+                        servers=$(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+                        if [[ -n "$servers" ]]; then
+                            echo -e "${CYAN}Available servers:${NC} $(echo "$servers" | tr '\n' ', ' | sed 's/, $//')" >&2
+                        fi
+                    fi
+                    show_filter_state "MCP" "$cur_inc" "$cur_exc"
+                    local rename_len
+                    rename_len=$(echo "$cur_rename" | jq 'length')
+                    if [[ "$rename_len" -gt 0 ]]; then
+                        local rename_disp
+                        rename_disp=$(echo "$cur_rename" | jq -r 'to_entries | map("\(.key)→\(.value)") | join(", ")')
+                        echo -e "  ${CYAN}Rename:${NC} ${rename_disp}" >&2
+                    fi
+                    echo "" >&2
+
+                    local mcp_action
+                    read -rp "[i]nclude / [e]xclude / [r]ename / [b]ack: " mcp_action
+                    case "$mcp_action" in
+                        i|include)
+                            prompt_default "Include (comma-separated or *)" "*"
+                            local new_inc
+                            new_inc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_inc" '
+                                .projects[$i].mcp = ((.projects[$i].mcp // {}) + {include: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}MCP include updated.${NC}" >&2
+                            ;;
+                        e|exclude)
+                            prompt_default "Exclude (comma-separated, empty=none)" ""
+                            local new_exc
+                            new_exc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_exc" '
+                                .projects[$i].mcp = ((.projects[$i].mcp // {}) + {exclude: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}MCP exclude updated.${NC}" >&2
+                            ;;
+                        r|rename)
+                            echo "Enter as old=new (comma-separated), empty to clear:" >&2
+                            local input
+                            read -rp "> " input
+                            local rename_obj
+                            rename_obj=$(parse_rename_pairs "$input")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson r "$rename_obj" '
+                                if ($r | length) > 0 then .projects[$i].mcp = ((.projects[$i].mcp // {}) + {rename: $r})
+                                else del(.projects[$i].mcp.rename) end
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}MCP rename updated.${NC}" >&2
+                            ;;
+                        b|back) break ;;
+                        *) echo -e "${RED}Unknown action: ${mcp_action}${NC}" >&2 ;;
+                    esac
+                done
+                ;;
+            p|permissions)
+                local resolved_path
+                resolved_path=$(expand_path "$path")
+                resolved_path=$(cd "$resolved_path" 2>/dev/null && pwd || echo "$resolved_path")
+                local settings_file="$resolved_path/.claude/settings.local.json"
+
+                while true; do
+                    pj=$(jq -c ".projects[$idx]" "$CONFIG_FILE")
+                    local cur_inc cur_exc
+                    cur_inc=$(echo "$pj" | jq -c '.permissions.include // ["*"]')
+                    cur_exc=$(echo "$pj" | jq -c '.permissions.exclude // []')
+
+                    echo "" >&2
+                    if [[ -f "$settings_file" ]]; then
+                        local perms
+                        perms=$(jq -r '.permissions.allow // [] | .[]' "$settings_file" 2>/dev/null || true)
+                        if [[ -n "$perms" ]]; then
+                            echo -e "${CYAN}Available permissions:${NC}" >&2
+                            while IFS= read -r p; do
+                                echo "  - ${p}" >&2
+                            done <<< "$perms"
+                        fi
+                    fi
+                    show_filter_state "Permissions" "$cur_inc" "$cur_exc"
+                    echo "" >&2
+
+                    local perm_action
+                    read -rp "[i]nclude / [e]xclude / [b]ack: " perm_action
+                    case "$perm_action" in
+                        i|include)
+                            prompt_default "Include (comma-separated or *)" "*"
+                            local new_inc
+                            new_inc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_inc" '
+                                .projects[$i].permissions = ((.projects[$i].permissions // {}) + {include: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}Permissions include updated.${NC}" >&2
+                            ;;
+                        e|exclude)
+                            prompt_default "Exclude (comma-separated, empty=none)" ""
+                            local new_exc
+                            new_exc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_exc" '
+                                .projects[$i].permissions = ((.projects[$i].permissions // {}) + {exclude: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}Permissions exclude updated.${NC}" >&2
+                            ;;
+                        b|back) break ;;
+                        *) echo -e "${RED}Unknown action: ${perm_action}${NC}" >&2 ;;
+                    esac
+                done
+                ;;
+            a|agents)
+                local resolved_path
+                resolved_path=$(expand_path "$path")
+                resolved_path=$(cd "$resolved_path" 2>/dev/null && pwd || echo "$resolved_path")
+                local agents_dir="$resolved_path/.claude/agents"
+
+                while true; do
+                    pj=$(jq -c ".projects[$idx]" "$CONFIG_FILE")
+                    local cur_inc cur_exc cur_rename
+                    cur_inc=$(echo "$pj" | jq -c '.agents.include // ["*"]')
+                    cur_exc=$(echo "$pj" | jq -c '.agents.exclude // []')
+                    cur_rename=$(echo "$pj" | jq -c '.agents.rename // {}')
+
+                    echo "" >&2
+                    if [[ -d "$agents_dir" ]]; then
+                        local agents_list=""
+                        for af in "$agents_dir"/*.md; do
+                            [[ -f "$af" ]] || continue
+                            local aname
+                            aname=$(basename "$af" .md)
+                            [[ "$aname" == _compose_* ]] && continue
+                            agents_list="${agents_list:+${agents_list}, }${aname}"
+                        done
+                        if [[ -n "$agents_list" ]]; then
+                            echo -e "${CYAN}Available agents:${NC} ${agents_list}" >&2
+                        fi
+                    fi
+                    show_filter_state "Agents" "$cur_inc" "$cur_exc"
+                    local rename_len
+                    rename_len=$(echo "$cur_rename" | jq 'length')
+                    if [[ "$rename_len" -gt 0 ]]; then
+                        local rename_disp
+                        rename_disp=$(echo "$cur_rename" | jq -r 'to_entries | map("\(.key)→\(.value)") | join(", ")')
+                        echo -e "  ${CYAN}Rename:${NC} ${rename_disp}" >&2
+                    fi
+                    echo "" >&2
+
+                    local agent_action
+                    read -rp "[i]nclude / [e]xclude / [r]ename / [b]ack: " agent_action
+                    case "$agent_action" in
+                        i|include)
+                            prompt_default "Include (comma-separated or *)" "*"
+                            local new_inc
+                            new_inc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_inc" '
+                                .projects[$i].agents = ((.projects[$i].agents // {}) + {include: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}Agents include updated.${NC}" >&2
+                            ;;
+                        e|exclude)
+                            prompt_default "Exclude (comma-separated, empty=none)" ""
+                            local new_exc
+                            new_exc=$(csv_to_json_array "$REPLY")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson v "$new_exc" '
+                                .projects[$i].agents = ((.projects[$i].agents // {}) + {exclude: $v})
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}Agents exclude updated.${NC}" >&2
+                            ;;
+                        r|rename)
+                            echo "Enter as old=new (comma-separated), empty to clear:" >&2
+                            local input
+                            read -rp "> " input
+                            local rename_obj
+                            rename_obj=$(parse_rename_pairs "$input")
+                            local config
+                            config=$(jq --argjson i "$idx" --argjson r "$rename_obj" '
+                                if ($r | length) > 0 then .projects[$i].agents = ((.projects[$i].agents // {}) + {rename: $r})
+                                else del(.projects[$i].agents.rename) end
+                            ' "$CONFIG_FILE")
+                            write_json_atomic "$CONFIG_FILE" "$config"
+                            simplify_project "$idx"
+                            echo -e "${GREEN}Agents rename updated.${NC}" >&2
+                            ;;
+                        b|back) break ;;
+                        *) echo -e "${RED}Unknown action: ${agent_action}${NC}" >&2 ;;
+                    esac
+                done
+                ;;
+            c|claude_md)
+                local current
+                current=$(echo "$pj" | jq -r '.claude_md // true')
+                local new_val
+                if [[ "$current" == "true" ]]; then new_val=false; else new_val=true; fi
+                local config
+                config=$(jq --argjson i "$idx" --argjson v "$new_val" '
+                    .projects[$i].claude_md = $v
+                ' "$CONFIG_FILE")
+                write_json_atomic "$CONFIG_FILE" "$config"
+                simplify_project "$idx"
+                echo -e "${GREEN}claude_md → ${new_val}${NC}" >&2
+                ;;
+            f|files)
+                local current
+                current=$(echo "$pj" | jq -r '.files // true')
+                local new_val
+                if [[ "$current" == "true" ]]; then new_val=false; else new_val=true; fi
+                local config
+                config=$(jq --argjson i "$idx" --argjson v "$new_val" '
+                    .projects[$i].files = $v
+                ' "$CONFIG_FILE")
+                write_json_atomic "$CONFIG_FILE" "$config"
+                simplify_project "$idx"
+                echo -e "${GREEN}files → ${new_val}${NC}" >&2
+                ;;
+            b|back)
+                break
+                ;;
+            *)
+                echo -e "${RED}Unknown action: ${action}${NC}" >&2
+                ;;
+        esac
+    done
+}
+
 # ── Parse CLI args ───────────────────────────────────────────────────
 parse_args() {
+    # Detect subcommand as first positional argument
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            init|configure)
+                SUBCOMMAND="$1"
+                shift
+                ;;
+        esac
+    fi
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -f)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}Error: -f requires an argument${NC}" >&2
+                    exit 1
+                fi
                 shift
                 CONFIG_FILE="$1"
                 ;;
             --dry-run)
                 DRY_RUN=true
+                ;;
+            -y|--yes)
+                INIT_YES=true
                 ;;
             -h|--help)
                 usage
@@ -163,9 +724,14 @@ parse_args() {
                 break
                 ;;
             *)
-                echo -e "${RED}Unknown option: $1${NC}" >&2
-                usage >&2
-                exit 1
+                # For init subcommand, treat positional arg as path
+                if [[ "$SUBCOMMAND" == "init" && -z "$INIT_PATH" && "$1" != -* ]]; then
+                    INIT_PATH="$1"
+                else
+                    echo -e "${RED}Unknown option: $1${NC}" >&2
+                    usage >&2
+                    exit 1
+                fi
                 ;;
         esac
         shift
@@ -175,16 +741,26 @@ parse_args() {
     if [[ -z "$CONFIG_FILE" ]]; then
         CONFIG_FILE="claude-compose.json"
     fi
+
+    # Validate flag combinations
+    if [[ "$INIT_YES" == true && "$SUBCOMMAND" != "init" ]]; then
+        echo -e "${RED}Error: -y/--yes can only be used with 'init'${NC}" >&2
+        exit 1
+    fi
 }
 
-# ── Validate prerequisites ───────────────────────────────────────────
-validate() {
-    # Check jq
+# ── Require jq ───────────────────────────────────────────────────────
+require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
         echo "  Install: brew install jq" >&2
         exit 1
     fi
+}
+
+# ── Validate prerequisites ───────────────────────────────────────────
+validate() {
+    require_jq
 
     # Check claude
     if ! command -v claude &>/dev/null; then
@@ -194,25 +770,9 @@ validate() {
 
     # Check config file
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${RED}Error: Config file not found: ${CONFIG_FILE}${NC}" >&2
-        cat >&2 <<'EXAMPLE'
-
-Create a claude-compose.json:
-
-{
-  "projects": [
-    {
-      "path": "~/Documents/Code/MyProject",
-      "mcp": { "include": ["*"], "exclude": [] },
-      "skills": { "include": ["*"], "exclude": [] },
-      "permissions": { "include": ["*"], "exclude": [] },
-      "claude_md": true,
-      "files": true
-    }
-  ]
-}
-EXAMPLE
-        exit 1
+        echo -e "${YELLOW}Config not found: ${CONFIG_FILE}. Launching plain claude.${NC}" >&2
+        claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        exit 0
     fi
 
     # Validate JSON
@@ -315,9 +875,10 @@ process_project() {
     # --add-dir does NOT load agents — must always copy
     local agents_dir="$project_path/.claude/agents"
     if [[ -d "$agents_dir" ]]; then
-        local agents_include agents_exclude
+        local agents_include agents_exclude agents_rename
         agents_include=$(echo "$project_json" | jq -c '.agents.include // ["*"]')
         agents_exclude=$(echo "$project_json" | jq -c '.agents.exclude // []')
+        agents_rename=$(echo "$project_json" | jq -c '.agents.rename // {}')
 
         for agent_file in "$agents_dir"/*.md; do
             [[ -f "$agent_file" ]] || continue
@@ -326,8 +887,14 @@ process_project() {
             [[ "$agent_name" == _compose_* ]] && continue
 
             if matches_filter "$agent_name" "$agents_include" "$agents_exclude"; then
-                AGENTS_TO_COPY+=("${agent_file}|${agent_name}")
-                echo -e "  ${GREEN}+agent:${NC} $agent_name" >&2
+                local final_name
+                final_name=$(echo "$agents_rename" | jq -r --arg n "$agent_name" '.[$n] // $n')
+                AGENTS_TO_COPY+=("${agent_file}|${final_name}")
+                if [[ "$final_name" != "$agent_name" ]]; then
+                    echo -e "  ${GREEN}+agent:${NC} $agent_name → $final_name" >&2
+                else
+                    echo -e "  ${GREEN}+agent:${NC} $agent_name" >&2
+                fi
             fi
         done
     fi
@@ -349,9 +916,169 @@ process_project() {
     fi
 }
 
+# ── Subcommand: init ─────────────────────────────────────────────────
+cmd_init() {
+    require_jq
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} already exists. Use 'configure' to modify it.${NC}" >&2
+        exit 1
+    fi
+
+    if [[ "$INIT_YES" == true ]]; then
+        # Non-interactive: generate template (unchanged)
+        if [[ -z "$INIT_PATH" ]]; then
+            echo -e "${RED}Error: Path is required. Usage: claude-compose init -y <path>${NC}" >&2
+            exit 1
+        fi
+        local config_json
+        config_json=$(jq -n --arg p "$INIT_PATH" '{projects: [{path: $p}]}')
+        write_json_atomic "$CONFIG_FILE" "$config_json"
+        echo -e "${GREEN}Created ${CONFIG_FILE}${NC}" >&2
+        return
+    fi
+
+    # Interactive: multi-project add loop
+    echo -e "${BOLD}claude-compose init${NC} — Create a new config" >&2
+    echo "" >&2
+
+    # Create empty config
+    write_json_atomic "$CONFIG_FILE" '{"projects": []}'
+
+    local added=0
+    while true; do
+        local rc=0
+        add_project_quick || rc=$?
+        case "$rc" in
+            0) added=$((added + 1)) ;;
+            1) break ;;  # Enter = done
+            2) continue ;;  # error, retry
+        esac
+    done
+
+    if [[ "$added" -eq 0 ]]; then
+        rm -f "$CONFIG_FILE"
+        echo "No projects added. Cancelled." >&2
+        return
+    fi
+
+    echo "" >&2
+    echo -e "${GREEN}Created ${CONFIG_FILE} with ${added} project(s)${NC}" >&2
+
+    # Seamless transition to configure
+    configure_menu_loop
+}
+
+# ── Subcommand: configure ───────────────────────────────────────────
+cmd_configure() {
+    require_jq
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found. Run 'init' first.${NC}" >&2
+        exit 1
+    fi
+
+    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${BOLD}claude-compose configure${NC} — Manage projects" >&2
+    configure_menu_loop
+}
+
+show_projects_list() {
+    local count
+    count=$(jq '.projects | length' "$CONFIG_FILE")
+    echo "" >&2
+    if [[ "$count" -eq 0 ]]; then
+        echo -e "${YELLOW}No projects configured.${NC}" >&2
+    else
+        echo -e "${CYAN}Projects:${NC}" >&2
+        for i in $(seq 0 $((count - 1))); do
+            local pj path summary
+            pj=$(jq -c ".projects[$i]" "$CONFIG_FILE")
+            path=$(echo "$pj" | jq -r '.path')
+            summary=$(format_project_summary "$pj")
+            echo -e "  $((i + 1))) ${path}" >&2
+            echo -e "     ${summary}" >&2
+        done
+    fi
+    echo "" >&2
+}
+
+configure_menu_loop() {
+    while true; do
+        show_projects_list
+
+        local action
+        read -rp "[a]dd / [e]dit / [r]emove / [q]uit: " action
+
+        case "$action" in
+            a|add)
+                add_project_quick || true
+                ;;
+            e|edit)
+                local count
+                count=$(jq '.projects | length' "$CONFIG_FILE")
+                if [[ "$count" -eq 0 ]]; then
+                    echo -e "${YELLOW}No projects to edit.${NC}" >&2
+                    continue
+                fi
+                local idx
+                read -rp "Project number to edit: " idx
+                if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$count" ]]; then
+                    echo -e "${RED}Invalid selection.${NC}" >&2
+                    continue
+                fi
+                idx=$((idx - 1))
+                edit_project_submenu "$idx"
+                ;;
+            r|remove)
+                local count
+                count=$(jq '.projects | length' "$CONFIG_FILE")
+                if [[ "$count" -eq 0 ]]; then
+                    echo -e "${YELLOW}No projects to remove.${NC}" >&2
+                    continue
+                fi
+                local idx
+                read -rp "Project number to remove: " idx
+                if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$count" ]]; then
+                    echo -e "${RED}Invalid selection.${NC}" >&2
+                    continue
+                fi
+                idx=$((idx - 1))
+                local path
+                path=$(jq -r ".projects[$idx].path" "$CONFIG_FILE")
+                if prompt_yn "Remove project '${path}'?" "N"; then
+                    local config
+                    config=$(jq --argjson i "$idx" 'del(.projects[$i])' "$CONFIG_FILE")
+                    write_json_atomic "$CONFIG_FILE" "$config"
+                    echo -e "${GREEN}Project removed.${NC}" >&2
+                else
+                    echo "Cancelled." >&2
+                fi
+                ;;
+            q|quit)
+                break
+                ;;
+            *)
+                echo -e "${RED}Unknown action: ${action}${NC}" >&2
+                ;;
+        esac
+    done
+}
+
 # ── Main ─────────────────────────────────────────────────────────────
 main() {
     parse_args "$@"
+
+    # Dispatch subcommands before validate (they have own validation)
+    case "$SUBCOMMAND" in
+        init)      cmd_init; return ;;
+        configure) cmd_configure; return ;;
+    esac
+
     validate
 
     echo -e "${BOLD}claude-compose${NC} v${VERSION}" >&2

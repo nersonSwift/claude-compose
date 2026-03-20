@@ -70,9 +70,45 @@ claude-compose --dry-run
 claude-compose -- -p "explain the architecture"
 ```
 
+### Quick start with `init`
+
+```bash
+# Interactive — add multiple projects with defaults, then fine-tune
+claude-compose init
+
+# Quick template with defaults (non-interactive, path required)
+claude-compose init -y ~/Code/my-app
+
+# Use a custom config file name
+claude-compose init -f compose-work.json
+```
+
+`init` creates a `claude-compose.json` in the current directory. In interactive mode you add projects one by one (just paste paths — all settings default to include-everything). After adding, you enter the `configure` menu to fine-tune any project.
+
+### Managing projects with `configure`
+
+```bash
+# Add, edit, or remove projects interactively
+claude-compose configure
+
+# Configure a specific config file
+claude-compose configure -f compose-work.json
+```
+
+`configure` shows a rich project list with per-project settings summary and opens an interactive menu:
+- **add** — add a project with defaults (path only)
+- **edit** — pick a project number, then toggle individual settings:
+  - **mcp** — submenu: include / exclude / rename (shows available servers)
+  - **permissions** — submenu: include / exclude (shows available permissions)
+  - **agents** — submenu: include / exclude / rename (shows available agents)
+  - **claude_md** — toggle CLAUDE.md loading
+  - **files** — toggle `--add-dir` file access
+- **remove** — remove a project from the config
+- **quit** — exit the menu
+
 ## Config
 
-Create `claude-compose.json` in your project root:
+Create `claude-compose.json` in your project root (or use `claude-compose init`):
 
 ```json
 {
@@ -111,6 +147,7 @@ Create `claude-compose.json` in your project root:
 | `skills.exclude` | `[]` | Skill names to exclude (only when `files: false`) |
 | `agents.include` | `["*"]` | Agent names to include |
 | `agents.exclude` | `[]` | Agent names to exclude |
+| `agents.rename` | `{}` | Rename agents: `{"old": "new"}` |
 | `claude_md` | `true` | Load CLAUDE.md and `.claude/rules/` from external project |
 | `files` | `true` | Add project directory via `--add-dir` |
 
