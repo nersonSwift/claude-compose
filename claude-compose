@@ -24,6 +24,8 @@ SUBCOMMAND=""       # "", "config"
 CONFIG_YES=false    # -y flag for config
 CONFIG_PATH=""      # optional path for config -y
 CONFIG_CHECK=false  # --check flag for config
+PRESETS_DIR="$HOME/.claude-compose/presets"   # global presets directory
+PROCESSED_PRESETS=()                         # cycle detection set
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -241,7 +243,8 @@ Top-level fields:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | \`include_root\` | boolean | \`true\` | Add the launch directory as --add-dir for file access |
-| \`projects\` | array | **required** | List of external projects to merge |
+| \`projects\` | array | \`[]\` | List of external projects to merge |
+| \`presets\` | string[] | \`[]\` | Preset names to activate |
 
 Each project in the \`projects\` array can have these fields:
 
@@ -258,6 +261,64 @@ Each project in the \`projects\` array can have these fields:
 | `agents.rename` | object | `{}` | Rename agents: `{"old-name": "new-name"}` |
 | `claude_md` | boolean | `true` | Load CLAUDE.md from project |
 | `files` | boolean | `true` | Add project dir for file access via --add-dir |
+
+## Presets
+
+Presets are reusable sets of Claude resources stored globally at \`~/.claude-compose/presets/<name>/\`.
+
+### Preset directory structure
+
+A preset directory can contain (all optional):
+- \`.mcp.json\` — MCP server configs
+- \`.claude/agents/*.md\` — agent definitions
+- \`.claude/skills/*/\` — skill definitions
+- \`.claude/settings.local.json\` — permissions
+- \`CLAUDE.md\` — instructions
+- \`preset.json\` — config with filter settings, nested presets, and projects
+
+### preset.json schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| \`mcp.include\` | string[] | \`["*"]\` | Glob patterns for MCP servers to include |
+| \`mcp.exclude\` | string[] | \`[]\` | Glob patterns for MCP servers to exclude |
+| \`mcp.rename\` | object | \`{}\` | Rename MCP servers |
+| \`permissions.include\` | string[] | \`["*"]\` | Patterns for permissions to include |
+| \`permissions.exclude\` | string[] | \`[]\` | Patterns for permissions to exclude |
+| \`agents.include\` | string[] | \`["*"]\` | Glob patterns for agents to include |
+| \`agents.exclude\` | string[] | \`[]\` | Glob patterns for agents to exclude |
+| \`agents.rename\` | object | \`{}\` | Rename agents |
+| \`skills.include\` | string[] | \`["*"]\` | Glob patterns for skills to include |
+| \`skills.exclude\` | string[] | \`[]\` | Glob patterns for skills to exclude |
+| \`claude_md\` | boolean | \`true\` | Load CLAUDE.md from preset |
+| \`files\` | boolean | \`false\` | Add preset dir for file access |
+| \`presets\` | string[] | \`[]\` | Nested preset names (recursive) |
+| \`projects\` | array | \`[]\` | External projects (same format as claude-compose.json projects) |
+
+### Referencing presets from config
+
+Add to claude-compose.json:
+\`\`\`json
+{
+  "presets": ["my-preset"],
+  "projects": [...]
+}
+\`\`\`
+
+### Preset management operations
+
+- **Create preset**: Copy Claude files (\`.mcp.json\`, \`.claude/\`, \`CLAUDE.md\`) from a user-specified project path into \`~/.claude-compose/presets/<name>/\`, optionally create \`preset.json\`
+- **List presets**: Scan \`~/.claude-compose/presets/\` and show contents summary
+- **Delete preset**: Remove the preset directory
+- **Edit preset**: Modify files or \`preset.json\` in the preset directory
+
+### Priority order
+
+Presets are processed before projects. On name conflicts, later entries overwrite earlier ones:
+1. Preset's own resources (lowest priority)
+2. Nested presets
+3. Preset's projects
+4. Top-level projects from claude-compose.json (highest priority)
 
 ## Simplification rules — IMPORTANT
 
@@ -316,6 +377,7 @@ Check if `__CONFIG_FILE__` exists:
    - **Add** a new project
    - **Edit** an existing project
    - **Remove** a project
+   - **Manage presets** — create, list, delete, or edit presets
    - **Done** — finish
 
 3. **Add**: Follow the same flow as create mode (scan, ask, append).
@@ -593,8 +655,8 @@ process_project() {
 
     # ── Files / CLAUDE.md ──
     local files claude_md
-    files=$(echo "$project_json" | jq -r '.files // true')
-    claude_md=$(echo "$project_json" | jq -r '.claude_md // true')
+    files=$(echo "$project_json" | jq -r 'if has("files") then .files else true end')
+    claude_md=$(echo "$project_json" | jq -r 'if has("claude_md") then .claude_md else true end')
 
     if [[ "$files" == "true" || "$claude_md" == "true" ]]; then
         CLAUDE_ARGS+=("--add-dir" "$project_path")
@@ -697,6 +759,78 @@ process_project() {
     fi
 }
 
+# ── Process a single preset ─────────────────────────────────────────
+process_preset() {
+    local preset_name="$1"
+
+    # Cycle detection
+    for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
+        if [[ "$processed" == "$preset_name" ]]; then
+            echo -e "${YELLOW}Warning: Preset already processed, skipping: ${preset_name}${NC}" >&2
+            return
+        fi
+    done
+    PROCESSED_PRESETS+=("$preset_name")
+
+    local preset_dir="$PRESETS_DIR/$preset_name"
+    if [[ ! -d "$preset_dir" ]]; then
+        echo -e "${RED}Error: Preset not found: ${preset_name} (~/.claude-compose/presets/${preset_name}/)${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
+
+    # Read preset.json if present
+    local preset_json="{}"
+    if [[ -f "$preset_dir/preset.json" ]]; then
+        preset_json=$(cat "$preset_dir/preset.json")
+    fi
+
+    # Build synthetic project_json: filter settings from preset.json + path
+    # Default files=false (preset dir is not a real project), claude_md=true (load CLAUDE.md)
+    local synthetic_project
+    synthetic_project=$(echo "$preset_json" | jq -c --arg path "$preset_dir" '
+        {path: $path}
+        + (if has("mcp") then {mcp: .mcp} else {} end)
+        + (if has("permissions") then {permissions: .permissions} else {} end)
+        + (if has("agents") then {agents: .agents} else {} end)
+        + (if has("skills") then {skills: .skills} else {} end)
+        + {files: (if has("files") then .files else false end)}
+        + {claude_md: (if has("claude_md") then .claude_md else true end)}
+    ')
+
+    process_project "$synthetic_project"
+
+    # Recursively process nested presets
+    local nested_presets
+    nested_presets=$(echo "$preset_json" | jq -r '.presets // [] | .[]' 2>/dev/null || true)
+    while IFS= read -r nested; do
+        [[ -z "$nested" ]] && continue
+        process_preset "$nested"
+    done <<< "$nested_presets"
+
+    # Process preset's projects
+    local preset_project_count
+    preset_project_count=$(echo "$preset_json" | jq '.projects // [] | length')
+    if [[ "$preset_project_count" -gt 0 ]]; then
+        for i in $(seq 0 $((preset_project_count - 1))); do
+            local project_json
+            project_json=$(echo "$preset_json" | jq -c ".projects[$i]")
+            process_project "$project_json"
+        done
+    fi
+}
+
+# ── Process all presets from config ────────────────────────────────
+process_all_presets() {
+    local preset_names
+    preset_names=$(jq -r '.presets // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        process_preset "$name"
+    done <<< "$preset_names"
+}
+
 # ── Subcommand: config ───────────────────────────────────────────────
 cmd_config() {
     require_jq
@@ -776,22 +910,28 @@ main() {
     echo -e "Config: ${CONFIG_FILE}" >&2
     echo "" >&2
 
-    # Read project count
-    local project_count
-    project_count=$(jq '.projects | length' "$CONFIG_FILE")
+    # Read project and preset counts
+    local project_count preset_count
+    project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
+    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
 
-    if [[ "$project_count" -eq 0 ]]; then
-        echo -e "${YELLOW}No projects defined in config. Launching plain claude.${NC}" >&2
+    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 ]]; then
+        echo -e "${YELLOW}No projects or presets defined in config. Launching plain claude.${NC}" >&2
         claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         return
     fi
 
+    # Process presets first (lower priority — projects override on conflicts)
+    process_all_presets
+
     # Process each project
-    for i in $(seq 0 $((project_count - 1))); do
-        local project_json
-        project_json=$(jq -c ".projects[$i]" "$CONFIG_FILE")
-        process_project "$project_json"
-    done
+    if [[ "$project_count" -gt 0 ]]; then
+        for i in $(seq 0 $((project_count - 1))); do
+            local project_json
+            project_json=$(jq -c ".projects[$i]" "$CONFIG_FILE")
+            process_project "$project_json"
+        done
+    fi
 
     echo "" >&2
 
@@ -820,6 +960,14 @@ main() {
     if [[ "$DRY_RUN" == true ]]; then
         echo -e "${BOLD}── Dry Run ──${NC}" >&2
         echo "" >&2
+
+        if [[ "$preset_count" -gt 0 ]]; then
+            echo -e "${CYAN}Active presets:${NC}" >&2
+            jq -r '.presets // [] | .[]' "$CONFIG_FILE" | while read -r name; do
+                echo "  - $name" >&2
+            done
+            echo "" >&2
+        fi
 
         echo -e "${CYAN}Session directory:${NC}" >&2
         echo "  ~/.claude-compose/sessions/<config-hash>/" >&2
