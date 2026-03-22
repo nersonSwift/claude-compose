@@ -1,23 +1,29 @@
 # claude-compose
 
-Multi-project launcher for [Claude Code](https://claude.ai/code). Merges MCP servers, permissions, skills, and CLAUDE.md from external projects into a single session — like `docker-compose` for Claude Code workspaces.
+Multi-project launcher for [Claude Code](https://claude.ai/code). Uses a **workspace model** where all Claude configuration lives in one place, and external projects provide file access — like `docker-compose` for Claude Code workspaces.
 
 ## Why
 
-Claude Code's `--add-dir` gives file access to other directories, but **MCP servers, permissions, and settings from added directories are not loaded**. If you work across multiple projects (e.g., an app repo + an Obsidian vault + a shared tooling repo), you need a way to compose them.
+Claude Code's `--add-dir` gives file access to other directories, but **MCP servers, permissions, agents, and settings from added directories are not loaded**. If you work across multiple projects, you need a way to compose them.
 
-`claude-compose` reads a simple JSON config, merges resources from external projects, and launches Claude Code with everything wired up.
+`claude-compose` creates a workspace with all Claude configuration (MCP, agents, skills, permissions) and launches Claude with `--add-dir` for external project file access.
 
-## What it merges
+## Workspace Model
 
-| Resource | How | Filterable |
-|----------|-----|------------|
-| **MCP servers** | `--mcp-config` (temp file) | include/exclude/rename |
-| **Permissions** | `--settings` (merge, no file modification) | include/exclude (glob) |
-| **Skills** | Loaded via `--add-dir` when `files: true`; copied when `files: false` | include/exclude (when copied) |
-| **Agents** | Copied to `.claude/agents/` (always, `--add-dir` does not load them) | include/exclude |
-| **CLAUDE.md / rules** | `--add-dir` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` | on/off |
-| **Files** | `--add-dir` | on/off |
+```
+my-workspace/                    # Your workspace directory
+├── claude-compose.json          # Config — lists projects and presets
+├── .mcp.json                    # MCP servers (yours + from presets)
+├── CLAUDE.md                    # Instructions
+├── .claude/
+│   ├── agents/*.md              # Agent definitions
+│   ├── skills/*/                # Skills
+│   └── settings.local.json      # Permissions
+├── .compose-manifest.json       # Auto-generated: tracks preset resources
+└── .compose-hash                # Auto-generated: build change detection
+```
+
+All Claude configuration lives in the workspace. Projects are external — they provide only file access via `--add-dir`.
 
 ## Install
 
@@ -54,13 +60,26 @@ chmod +x ~/.local/bin/claude-compose
 - [Claude Code CLI](https://claude.ai/code) in PATH
 - [jq](https://jqlang.github.io/jq/) (`brew install jq` / `apt install jq`)
 
+## Quick Start
+
+```bash
+# Create a workspace directory
+mkdir my-workspace && cd my-workspace
+
+# Quick config — point to your project
+claude-compose config -y ~/Code/my-app
+
+# Launch
+claude-compose
+```
+
 ## Usage
 
 ```bash
-# Default config (claude-compose.json in current dir)
+# Launch from workspace (uses claude-compose.json)
 claude-compose
 
-# Custom config
+# Custom config file
 claude-compose -f compose-full.json
 
 # Preview what would be launched (no mutations)
@@ -68,116 +87,167 @@ claude-compose --dry-run
 
 # Pass args through to claude
 claude-compose -- -p "explain the architecture"
+
+# Build presets explicitly
+claude-compose build
+claude-compose build --force
+
+# Import config from an existing project
+claude-compose migrate ~/Code/my-app
+
+# Clone a workspace
+claude-compose copy ~/workspaces/main ~/workspaces/feature
 ```
 
-### Quick start with `init`
+### Config management
 
 ```bash
-# Interactive — add multiple projects with defaults, then fine-tune
-claude-compose init
+# Interactive config creation/editing
+claude-compose config
 
-# Quick template with defaults (non-interactive, path required)
-claude-compose init -y ~/Code/my-app
+# Quick create with defaults
+claude-compose config -y ~/Code/my-app
 
-# Use a custom config file name
-claude-compose init -f compose-work.json
+# Validate config
+claude-compose config --check
 ```
 
-`init` creates a `claude-compose.json` in the current directory. In interactive mode you add projects one by one (just paste paths — all settings default to include-everything). After adding, you enter the `configure` menu to fine-tune any project.
-
-### Managing projects with `configure`
+### Migrate from a project
 
 ```bash
-# Add, edit, or remove projects interactively
-claude-compose configure
+# Import Claude config (MCP, agents, skills, permissions, CLAUDE.md)
+claude-compose migrate ~/Code/my-app
 
-# Configure a specific config file
-claude-compose configure -f compose-work.json
+# Import and remove originals
+claude-compose migrate ~/Code/my-app --delete
+
+# Import to a specific workspace
+claude-compose migrate ~/Code/my-app --workspace ~/workspaces/main
+
+# Preview what would be imported
+claude-compose migrate ~/Code/my-app --dry-run
 ```
-
-`configure` shows a rich project list with per-project settings summary and opens an interactive menu:
-- **add** — add a project with defaults (path only)
-- **edit** — pick a project number, then toggle individual settings:
-  - **mcp** — submenu: include / exclude / rename (shows available servers)
-  - **permissions** — submenu: include / exclude (shows available permissions)
-  - **agents** — submenu: include / exclude / rename (shows available agents)
-  - **claude_md** — toggle CLAUDE.md loading
-  - **files** — toggle `--add-dir` file access
-- **remove** — remove a project from the config
-- **quit** — exit the menu
 
 ## Config
 
-Create `claude-compose.json` in your project root (or use `claude-compose init`):
+Create `claude-compose.json` in your workspace:
 
 ```json
 {
   "projects": [
-    {
-      "path": "~/Documents/Code/MyProject",
-      "mcp": {
-        "include": ["*"],
-        "exclude": ["discord"],
-        "rename": {
-          "linear": "linear-work"
-        }
-      },
-      "permissions": {
-        "include": ["mcp__*"],
-        "exclude": []
-      },
-      "claude_md": true,
-      "files": true
-    }
-  ]
+    {"path": "~/Code/my-app"},
+    {"path": "~/Code/my-lib", "claude_md": false}
+  ],
+  "workspaces": [
+    {"path": "~/workspaces/work"},
+    {"path": "~/workspaces/personal", "mcp": {"rename": {"cal": "personal-cal"}}}
+  ],
+  "presets": ["my-tools"]
 }
 ```
 
-### Fields
+### Project fields
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `path` | *required* | Path to external project (`~` expanded) |
+| `claude_md` | `true` | Load CLAUDE.md from project |
+
+Projects provide **file access only** via `--add-dir`. MCP servers, agents, skills, and permissions are configured directly in the workspace, via presets, or synced from other workspaces.
+
+## Workspaces (cross-workspace sync)
+
+Reference other workspaces to automatically sync their Claude configuration:
+
+```json
+{
+  "workspaces": [
+    {"path": "~/workspaces/work"},
+    {"path": "~/workspaces/personal", "mcp": {"rename": {"cal": "personal-cal"}}},
+    {"path": "~/workspaces/business", "agents": {"exclude": ["internal-*"]}}
+  ]
+}
+```
+
+At build time, each referenced workspace's MCP servers, agents, and skills are synced into the current workspace. When the source workspace changes (e.g., a new MCP server is added), the next launch auto-rebuilds.
+
+### Workspace fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `path` | *required* | Path to source workspace |
 | `mcp.include` | `["*"]` | MCP server names to include (glob) |
 | `mcp.exclude` | `[]` | MCP server names to exclude (glob) |
 | `mcp.rename` | `{}` | Rename servers: `{"old": "new"}` |
-| `permissions.include` | `["*"]` | Permission patterns to include (glob) |
-| `permissions.exclude` | `[]` | Permission patterns to exclude (glob) |
-| `skills.include` | `["*"]` | Skill names to include (only when `files: false`) |
-| `skills.exclude` | `[]` | Skill names to exclude (only when `files: false`) |
-| `agents.include` | `["*"]` | Agent names to include |
-| `agents.exclude` | `[]` | Agent names to exclude |
+| `agents.include` | `["*"]` | Agent names to include (glob) |
+| `agents.exclude` | `[]` | Agent names to exclude (glob) |
 | `agents.rename` | `{}` | Rename agents: `{"old": "new"}` |
-| `claude_md` | `true` | Load CLAUDE.md and `.claude/rules/` from external project |
-| `files` | `true` | Add project directory via `--add-dir` |
+| `skills.include` | `["*"]` | Skill names to include (glob) |
+| `skills.exclude` | `[]` | Skill names to exclude (glob) |
+| `claude_md` | `true` | Load CLAUDE.md from source workspace |
 
-### Pattern matching
+Source workspace's own projects (from its `claude-compose.json`) are transitively added via `--add-dir`.
 
-- `*` — matches everything
-- `"linear"` — exact match
-- `"mcp__linear__*"` — glob pattern
-- Include is evaluated first, then exclude removes from the result
+## Presets
+
+Presets are reusable sets of Claude resources stored at `~/.claude-compose/presets/<name>/`. Each preset uses a `claude-compose.json` file with explicit resource declarations (same format as workspace config).
+
+```
+~/.claude-compose/presets/my-tools/
+├── claude-compose.json          # Resource declarations (required)
+├── agents/*.md                  # Agent files
+├── skills/*/                    # Skill directories
+├── CLAUDE.md                    # Instructions (loaded via --add-dir)
+└── .env.json                    # Optional: env vars for MCP prefixing
+```
+
+Example `claude-compose.json` for a preset:
+
+```json
+{
+  "resources": {
+    "agents": ["agents/reviewer.md"],
+    "skills": ["skills/commit", "skills/task-s"],
+    "mcp": {"my-server": {"command": "npx", "args": ["..."]}},
+    "env_files": [".env.json"]
+  },
+  "presets": ["base-tools"],
+  "projects": [{"path": "~/Code/shared-lib", "name": "shared"}]
+}
+```
+
+Reference presets in config:
+
+```json
+{
+  "presets": ["my-tools", "common-agents"],
+  "projects": [...]
+}
+```
+
+Build copies preset resources into your workspace:
+
+```bash
+claude-compose build
+```
+
+The build is **idempotent** and uses content-based hashing — it only rebuilds when preset files change. A `.compose-manifest.json` tracks which resources came from which preset, so rebuilds cleanly remove old resources before adding new ones.
+
+MCP servers from presets get env var prefixing (`{name}_{hash4}_`) to prevent cross-source conflicts.
 
 ## How it works
 
-1. Reads config and validates prerequisites
-2. For each external project: collects MCP servers, permissions, agents
-3. Writes merged MCP config to a temp file (mode 600, in `$TMPDIR`)
-4. Expands `~` and `${HOME}` in all string values
-5. Copies agents to `.claude/agents/_compose_<pid>_<name>.md`
-6. Launches `claude` with `--mcp-config`, `--add-dir`, `--settings` flags
-7. Cleans up temp files and copied agents on exit (`trap EXIT`)
-
-### Concurrency
-
-Multiple `claude-compose` sessions can run from the same directory without conflicts. Each session uses PID-based isolation for copied agents and skills (`_compose_<pid>_<name>`). Stale files from crashed sessions (kill -9) are cleaned up on next startup.
+1. Reads `claude-compose.json` from workspace directory
+2. Auto-builds from presets if changes detected (or run `build` explicitly)
+3. Collects `--add-dir` args from projects (file access) and preset dirs (CLAUDE.md)
+4. Sets `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` for CLAUDE.md loading
+5. Launches `claude` with collected args
 
 ### Security
 
-- Temp MCP files created with `umask 077` in `$TMPDIR` (per-user directory on macOS)
-- Permissions passed via `--settings` flag — no files modified
 - `--dry-run` performs zero mutations
 - No `eval` — tilde expansion uses safe string substitution
+- Preset resources tracked via manifest — rebuilds are clean
 
 ## License
 

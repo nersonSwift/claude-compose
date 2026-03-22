@@ -1,31 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# claude-compose — Multi-project Claude Code launcher
-# Merges MCP servers, skills, and permissions from external projects
-# into a single Claude Code session.
+# claude-compose — Multi-project Claude Code launcher (workspace model)
+# Projects provide file access via --add-dir. All Claude configuration
+# (MCP, agents, skills, permissions) lives in the workspace directory.
+# Presets contribute shared resources at build time.
 
-VERSION="1.1.1"
+VERSION="2.0.0"
 
 # ── Globals ──────────────────────────────────────────────────────────
 CONFIG_FILE=""
 DRY_RUN=false
 EXTRA_ARGS=()
 ORIGINAL_CWD="$(pwd)"
-SESSION_DIR=""
-MERGED_MCP="{}"
-MERGED_PERMISSIONS="[]"
-SKILLS_TO_COPY=()  # pairs: "src_dir|dest_name"
-AGENTS_TO_COPY=()  # pairs: "src_file|dest_name"
 CLAUDE_ARGS=()
 NEED_CLAUDE_MD_ENV=false
-SESSION_ID="$$"  # PID for temp session naming (config command)
-SUBCOMMAND=""       # "", "config"
-CONFIG_YES=false    # -y flag for config
-CONFIG_PATH=""      # optional path for config -y
-CONFIG_CHECK=false  # --check flag for config
-PRESETS_DIR="$HOME/.claude-compose/presets"   # global presets directory
-PROCESSED_PRESETS=()                         # cycle detection set
+SUBCOMMAND=""           # "", "config", "build", "migrate", "copy"
+CONFIG_YES=false        # -y flag for config
+CONFIG_PATH=""          # optional path for config -y
+CONFIG_CHECK=false      # --check flag for config
+BUILD_FORCE=false       # --force flag for build
+MIGRATE_DELETE=false    # --delete flag for migrate
+MIGRATE_WORKSPACE=""    # --workspace flag for migrate
+MIGRATE_PATH=""         # positional arg for migrate
+COPY_SOURCE=""          # positional arg for copy
+COPY_DEST=""            # positional arg for copy
+PRESETS_DIR="$HOME/.claude-compose/presets"
+BUILTIN_SKILLS_DIR="$HOME/.claude-compose/skills"
+GLOBAL_CONFIG="$HOME/.claude-compose/global.json"
+GLOBAL_CONFIG_DIR="$HOME/.claude-compose"
+PROCESSED_PRESETS=()    # cycle detection set
+PROCESSED_WORKSPACES=() # workspace dedup (absolute paths)
+
+# Manifest state (built during process_preset / process_workspace)
+MANIFEST_JSON='{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
+CURRENT_SOURCE_AGENTS=()
+CURRENT_SOURCE_SKILLS=()
+CURRENT_SOURCE_MCP_SERVERS=()
+CURRENT_SOURCE_ADD_DIRS=()
+CURRENT_SOURCE_PROJECT_DIRS=()
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -34,433 +47,45 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
-
 # ── Usage ────────────────────────────────────────────────────────────
 usage() {
     echo -e "${BOLD}claude-compose${NC} v${VERSION} — Multi-project Claude Code launcher"
     echo ""
     echo -e "${BOLD}Usage:${NC}"
     echo "  claude-compose [options] [-- claude-args...]"
+    echo "  claude-compose build [--force]"
     echo "  claude-compose config [-y <path>] [--check] [-f <file>]"
+    echo "  claude-compose migrate <project-path> [--delete] [--workspace <path>]"
+    echo "  claude-compose copy <source-workspace> [dest-path]"
+    echo "  claude-compose instructions"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
-    echo "  config        Create or manage config (via Claude, or -y for quick create)"
+    echo "  build         Build workspace from presets/workspaces/resources (auto on launch)"
+    echo "  config        Create or manage claude-compose.json config"
+    echo "  migrate       Copy Claude config from a project into this workspace"
+    echo "  copy          Clone a workspace to a new location"
+    echo "  instructions  Show instructions for managing workspace resources"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
+    echo "  --dry-run     Show what would happen without executing"
+    echo "  --force       Force rebuild even if up to date (build only)"
+    echo "  --delete      Remove originals after migration (migrate only)"
+    echo "  --workspace   Target workspace directory (migrate only, default: CWD)"
     echo "  -y, --yes     Skip prompts, use defaults (config only)"
     echo "  --check       Validate config via dry-run (config only)"
-    echo "  --dry-run     Show what would be launched without executing"
     echo "  -h, --help    Show this help"
     echo "  -v, --version Show version"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  claude-compose                          # Use claude-compose.json"
-    echo "  claude-compose config                   # Create or edit config via Claude"
-    echo "  claude-compose config -y ~/Code/app     # Quick create with defaults"
-    echo "  claude-compose config --check           # Validate config"
-    echo "  claude-compose -f compose-full.json     # Custom config"
-    echo "  claude-compose --dry-run                # Preview mode"
-    echo "  claude-compose -- -p \"explain arch\"     # Pass args to claude"
-}
-
-# ── Session directory ───────────────────────────────────────────────
-
-# Stable session dir for normal launches (persists for --resume)
-create_session_dir() {
-    local config_hash
-    config_hash=$(printf '%s' "$CONFIG_FILE" | md5sum 2>/dev/null | cut -d' ' -f1 \
-        || printf '%s' "$CONFIG_FILE" | md5 -q 2>/dev/null \
-        || printf '%s' "$CONFIG_FILE" | shasum -a 256 | cut -c1-32)
-    SESSION_DIR="$HOME/.claude-compose/sessions/${config_hash}"
-    mkdir -p "$SESSION_DIR/.claude/agents"
-    mkdir -p "$SESSION_DIR/.claude/skills"
-}
-
-# Temp session dir for config command (cleaned up on exit)
-create_temp_session_dir() {
-    SESSION_DIR="${TMPDIR:-/tmp}/claude-compose-${SESSION_ID}"
-    mkdir -p "$SESSION_DIR/.claude/agents"
-    mkdir -p "$SESSION_DIR/.claude/skills"
-}
-
-# Compute hash of config file content
-config_content_hash() {
-    if command -v md5sum &>/dev/null; then
-        md5sum "$CONFIG_FILE" | cut -d' ' -f1
-    elif command -v md5 &>/dev/null; then
-        md5 -q "$CONFIG_FILE"
-    else
-        shasum -a 256 "$CONFIG_FILE" | cut -c1-32
-    fi
-}
-
-# Clean compose-generated files before regenerating (preserves Claude session data)
-clean_compose_files() {
-    rm -rf "$SESSION_DIR/.claude/agents"/*
-    rm -rf "$SESSION_DIR/.claude/skills"/*
-    rm -f "$SESSION_DIR/.mcp.json"
-    rm -f "$SESSION_DIR/.claude/settings.local.json"
-}
-
-# Register this session's PID, save config content hash, GC dead PIDs
-register_session() {
-    local content_hash
-    content_hash=$(config_content_hash)
-    echo "$content_hash" > "$SESSION_DIR/.compose-hash"
-
-    # GC dead PIDs and add our own
-    local live_pids
-    live_pids=$(get_live_session_pids)
-    { [[ -n "$live_pids" ]] && echo "$live_pids"; echo "$SESSION_ID"; } > "$SESSION_DIR/.compose-pids"
-}
-
-# Remove this session's PID on exit
-unregister_session() {
-    if [[ -n "$SESSION_DIR" && -f "$SESSION_DIR/.compose-pids" ]]; then
-        local remaining
-        remaining=$(grep -v "^${SESSION_ID}$" "$SESSION_DIR/.compose-pids" 2>/dev/null | grep -v '^$' || true)
-        if [[ -n "$remaining" ]]; then
-            echo "$remaining" > "$SESSION_DIR/.compose-pids"
-        else
-            : > "$SESSION_DIR/.compose-pids"
-        fi
-    fi
-}
-
-# Get list of still-alive PIDs from session dir
-get_live_session_pids() {
-    [[ -f "$SESSION_DIR/.compose-pids" ]] || return 0
-    while IFS= read -r pid; do
-        [[ -z "$pid" ]] && continue
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "$pid"
-        fi
-    done < "$SESSION_DIR/.compose-pids"
-}
-
-# Check session state and decide whether to clean/regenerate
-# Returns: 0 = proceed, 1 = user aborted
-check_session_state() {
-    local current_hash live_pids stored_hash
-
-    # Fresh session dir — no hash yet
-    if [[ ! -f "$SESSION_DIR/.compose-hash" ]]; then
-        clean_compose_files
-        return 0
-    fi
-
-    current_hash=$(config_content_hash)
-    stored_hash=$(cat "$SESSION_DIR/.compose-hash")
-    live_pids=$(get_live_session_pids)
-
-    if [[ "$current_hash" != "$stored_hash" && -n "$live_pids" ]]; then
-        # Config changed with active sessions — warn
-        echo -e "${YELLOW}Warning: Config has changed since the last launch, but there are active sessions:${NC}" >&2
-        echo "$live_pids" | while read -r pid; do
-            echo -e "  PID: $pid" >&2
-        done
-        echo "" >&2
-        echo -n "Overwrite session files? Active sessions may be affected. [y/N] " >&2
-        local reply
-        read -r reply < /dev/tty
-        if [[ "$reply" != [yY] ]]; then
-            echo -e "${RED}Aborted.${NC}" >&2
-            return 1
-        fi
-    fi
-
-    # Always clean and regenerate — project contents may have changed
-    clean_compose_files
-    return 0
-}
-
-# Remove temp session dir entirely (config command only)
-cleanup_temp_session() {
-    if [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]]; then
-        rm -rf "$SESSION_DIR"
-    fi
-}
-
-# ── Session settings ────────────────────────────────────────────────
-write_session_settings() {
-    local settings_file="$SESSION_DIR/.claude/settings.local.json"
-    local deny_rules
-    deny_rules=$(jq -n --arg dir "$SESSION_DIR" '[
-        ("Edit(" + $dir + "/**)"),
-        ("Write(" + $dir + "/**)")
-    ]')
-
-    if [[ $(echo "$MERGED_PERMISSIONS" | jq 'length') -gt 0 ]]; then
-        jq -n \
-            --argjson allow "$MERGED_PERMISSIONS" \
-            --argjson deny "$deny_rules" \
-            '{permissions: {allow: $allow, deny: $deny}}' \
-            > "$settings_file"
-    else
-        jq -n \
-            --argjson deny "$deny_rules" \
-            '{permissions: {deny: $deny}}' \
-            > "$settings_file"
-    fi
-}
-
-# ── Compose management skill ─────────────────────────────────────────
-# Write compose-config skill for this session
-write_compose_skills() {
-    local config_file="$1"
-    local skill_dir="$SESSION_DIR/.claude/skills/compose-config"
-    mkdir -p "$skill_dir"
-
-    cat > "$skill_dir/SKILL.md" << 'SKILLCONFIG'
----
-name: compose-config
-description: Create or manage a claude-compose.json configuration. Use when the user runs /compose-config or needs to create, edit, or review their claude-compose config.
----
-
-# compose-config — Create or manage claude-compose config
-
-Config file: `__CONFIG_FILE__`__CONFIG_DEFAULT__
-
-## Multiple config files
-
-A project can have several config files for different scenarios (e.g., `claude-compose.json` for daily work, `compose-full.json` with all projects). The default file is `claude-compose.json` — it's used when running `claude-compose` without `-f`. Additional configs are used via:
-
-```
-claude-compose -f compose-full.json
-```
-
-After finishing, if the user wants to create another config for a different scenario, suggest:
-
-```
-claude-compose config -f <other-name>.json
-```
-
-## Config schema
-
-Top-level fields:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| \`include_root\` | boolean | \`true\` | Add the launch directory as --add-dir for file access |
-| \`projects\` | array | \`[]\` | List of external projects to merge |
-| \`presets\` | string[] | \`[]\` | Preset names to activate |
-
-Each project in the \`projects\` array can have these fields:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `path` | string | **required** | Path to external project directory |
-| `mcp.include` | string[] | `["*"]` | Glob patterns for MCP servers to include |
-| `mcp.exclude` | string[] | `[]` | Glob patterns for MCP servers to exclude |
-| `mcp.rename` | object | `{}` | Rename MCP servers: `{"old-name": "new-name"}` |
-| `permissions.include` | string[] | `["*"]` | Patterns for permissions to include |
-| `permissions.exclude` | string[] | `[]` | Patterns for permissions to exclude |
-| `agents.include` | string[] | `["*"]` | Glob patterns for agents to include |
-| `agents.exclude` | string[] | `[]` | Glob patterns for agents to exclude |
-| `agents.rename` | object | `{}` | Rename agents: `{"old-name": "new-name"}` |
-| `claude_md` | boolean | `true` | Load CLAUDE.md from project |
-| `files` | boolean | `true` | Add project dir for file access via --add-dir |
-
-## Presets
-
-Presets are reusable sets of Claude resources stored globally at \`~/.claude-compose/presets/<name>/\`.
-
-### Preset directory structure
-
-A preset directory can contain (all optional):
-- \`.mcp.json\` — MCP server configs
-- \`.claude/agents/*.md\` — agent definitions
-- \`.claude/skills/*/\` — skill definitions
-- \`.claude/settings.local.json\` — permissions
-- \`CLAUDE.md\` — instructions
-- \`preset.json\` — config with filter settings, nested presets, and projects
-
-### preset.json schema
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| \`mcp.include\` | string[] | \`["*"]\` | Glob patterns for MCP servers to include |
-| \`mcp.exclude\` | string[] | \`[]\` | Glob patterns for MCP servers to exclude |
-| \`mcp.rename\` | object | \`{}\` | Rename MCP servers |
-| \`permissions.include\` | string[] | \`["*"]\` | Patterns for permissions to include |
-| \`permissions.exclude\` | string[] | \`[]\` | Patterns for permissions to exclude |
-| \`agents.include\` | string[] | \`["*"]\` | Glob patterns for agents to include |
-| \`agents.exclude\` | string[] | \`[]\` | Glob patterns for agents to exclude |
-| \`agents.rename\` | object | \`{}\` | Rename agents |
-| \`skills.include\` | string[] | \`["*"]\` | Glob patterns for skills to include |
-| \`skills.exclude\` | string[] | \`[]\` | Glob patterns for skills to exclude |
-| \`claude_md\` | boolean | \`true\` | Load CLAUDE.md from preset |
-| \`files\` | boolean | \`false\` | Add preset dir for file access |
-| \`presets\` | string[] | \`[]\` | Nested preset names (recursive) |
-| \`projects\` | array | \`[]\` | External projects (same format as claude-compose.json projects) |
-
-### Referencing presets from config
-
-Add to claude-compose.json:
-\`\`\`json
-{
-  "presets": ["my-preset"],
-  "projects": [...]
-}
-\`\`\`
-
-### Preset management operations
-
-- **Create preset**: Copy Claude files (\`.mcp.json\`, \`.claude/\`, \`CLAUDE.md\`) from a user-specified project path into \`~/.claude-compose/presets/<name>/\`, optionally create \`preset.json\`
-- **List presets**: Scan \`~/.claude-compose/presets/\` and show contents summary
-- **Delete preset**: Remove the preset directory
-- **Edit preset**: Modify files or \`preset.json\` in the preset directory
-
-### Priority order
-
-Presets are processed before projects. On name conflicts, later entries overwrite earlier ones:
-1. Preset's own resources (lowest priority)
-2. Nested presets
-3. Preset's projects
-4. Top-level projects from claude-compose.json (highest priority)
-
-## Simplification rules — IMPORTANT
-
-When writing config, **omit any field that equals its default**:
-- `include_root: true` → omit (top-level)
-- `mcp.include: ["*"]` → omit
-- `mcp.exclude: []` → omit
-- `mcp.rename: {}` → omit
-- Empty `mcp` object after removals → omit entirely
-- Same for `permissions` and `agents` sections
-- `claude_md: true` → omit
-- `files: true` → omit
-
-A project with all defaults is just `{"path": "~/path"}`.
-
-## Mode detection
-
-Check if `__CONFIG_FILE__` exists:
-- **File does not exist** → **Create mode**
-- **File exists** → **Edit mode**
-
-## Create mode
-
-1. **Ask** for project paths. For each path:
-   a. Verify directory exists (warn if not, but allow — user may set up later)
-   b. Reject if a project path resolves to the session directory (the current working directory) or to \`__ORIGINAL_CWD__\`
-   c. **Scan resources**:
-      - Read `<path>/.mcp.json` → show server names from `.mcpServers` keys
-      - Read `<path>/.claude/settings.local.json` → show permissions from `.permissions.allow[]`
-      - List `<path>/.claude/agents/*.md` → show agent names (filename without .md)
-   d. Show discovered resources to the user
-   e. Ask if they want defaults (include everything) or customize filtering
-   f. If customizing — ask about each relevant section
-
-2. Ask if user wants to add another project or finish.
-
-3. **Write config** using bash + jq for proper JSON formatting:
-   ```bash
-   tmp=$(mktemp "__CONFIG_FILE__.XXXXXX")
-   echo '<json>' | jq '.' > "$tmp" && mv "$tmp" "__CONFIG_FILE__"
-   ```
-   Apply simplification rules before writing.
-
-4. **Show summary**: number of projects, key settings for each.
-
-## Edit mode
-
-1. **Read** `__CONFIG_FILE__` and show a summary of all projects:
-   - Path
-   - MCP settings (include/exclude/rename, or "defaults" if none set)
-   - Permissions settings (include/exclude, or "defaults")
-   - Agents settings (include/exclude/rename, or "defaults")
-   - claude_md and files toggles (only show if non-default)
-
-2. **Ask** what to do:
-   - **Add** a new project
-   - **Edit** an existing project
-   - **Remove** a project
-   - **Manage presets** — create, list, delete, or edit presets
-   - **Done** — finish
-
-3. **Add**: Follow the same flow as create mode (scan, ask, append).
-
-4. **Edit**:
-   a. Let user pick which project (by number or path)
-   b. Show current settings + scan project dir for available resources
-   c. Let user modify any section: MCP (include/exclude/rename), permissions (include/exclude), agents (include/exclude/rename), claude_md toggle, files toggle
-   d. Apply simplification rules
-
-5. **Remove**: Confirm with user, then delete from array.
-
-6. After each operation, show updated config state and ask for next action.
-
-7. **Write** changes atomically:
-   ```bash
-   tmp=$(mktemp "__CONFIG_FILE__.XXXXXX")
-   echo '<json>' | jq '.' > "$tmp" && mv "$tmp" "__CONFIG_FILE__"
-   ```
-
-## Validation
-
-After writing config (in either mode), run validation and show results:
-
-```bash
-cd __ORIGINAL_CWD__ && claude-compose --dry-run__CONFIG_F_FLAG__
-```
-
-Show the dry-run output to the user so they can verify what would be launched.
-
-## After finishing
-
-Show the user how to launch and manage:
-
-```
-Ready to launch:
-  cd __ORIGINAL_CWD__ && claude-compose__CONFIG_F_FLAG__
-
-Validate:
-  cd __ORIGINAL_CWD__ && claude-compose config --check__CONFIG_F_FLAG__
-
-Create another config for a different scenario:
-  cd __ORIGINAL_CWD__ && claude-compose config -f <name>.json
-```
-
-If running inside an existing claude-compose session, recommend starting a new session for changes to take effect.
-
-## Rules
-- Keep `~` in paths as-is (claude-compose expands at runtime)
-- Glob patterns: `*` matches everything, `prefix-*` matches by prefix
-- Always validate JSON with `jq` before writing
-- Reject project paths that resolve to the current working directory or to `__ORIGINAL_CWD__`
-- Do NOT create the config if user adds zero projects (create mode)
-- Do NOT modify or delete the config if user made no changes (edit mode)
-- When showing current state, read the file fresh each time (edit mode)
-SKILLCONFIG
-
-    # Inject config file path, default marker, and original CWD
-    local escaped_config default_marker f_flag escaped_cwd
-    escaped_config=$(printf '%s' "$config_file" | sed 's/[&/|\\]/\\&/g')
-    escaped_cwd=$(printf '%s' "$ORIGINAL_CWD" | sed 's/[&/|\\]/\\&/g')
-    if [[ "$config_file" == "claude-compose.json" ]]; then
-        default_marker=" (default)"
-        f_flag=""
-    else
-        default_marker=""
-        f_flag=" -f ${escaped_config}"
-    fi
-    if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' \
-            -e "s|__CONFIG_FILE__|${escaped_config}|g" \
-            -e "s|__CONFIG_DEFAULT__|${default_marker}|g" \
-            -e "s|__CONFIG_F_FLAG__|${f_flag}|g" \
-            -e "s|__ORIGINAL_CWD__|${escaped_cwd}|g" \
-            "$skill_dir/SKILL.md"
-    else
-        sed -i \
-            -e "s|__CONFIG_FILE__|${escaped_config}|g" \
-            -e "s|__CONFIG_DEFAULT__|${default_marker}|g" \
-            -e "s|__CONFIG_F_FLAG__|${f_flag}|g" \
-            -e "s|__ORIGINAL_CWD__|${escaped_cwd}|g" \
-            "$skill_dir/SKILL.md"
-    fi
+    echo "  claude-compose                              # Launch from workspace"
+    echo "  claude-compose build                        # Build presets explicitly"
+    echo "  claude-compose config                       # Create or edit config"
+    echo "  claude-compose config -y ~/Code/app         # Quick create with defaults"
+    echo "  claude-compose migrate ~/Code/app           # Import config from project"
+    echo "  claude-compose copy ~/ws/main ~/ws/feature  # Clone workspace"
+    echo "  claude-compose --dry-run                    # Preview mode"
+    echo "  claude-compose -- -p \"explain arch\"         # Pass args to claude"
 }
 
 # ── Glob matching ────────────────────────────────────────────────────
@@ -472,15 +97,13 @@ matches_filter() {
     local include_json="$2"
     local exclude_json="$3"
 
-    # Parse include patterns
     local include_count
     include_count=$(echo "$include_json" | jq -r 'length')
 
     if [[ "$include_count" -eq 0 ]]; then
-        return 1  # empty include = nothing included
+        return 1
     fi
 
-    # Check include
     local included=false
     for i in $(seq 0 $((include_count - 1))); do
         local pattern
@@ -496,7 +119,6 @@ matches_filter() {
         return 1
     fi
 
-    # Check exclude
     local exclude_count
     exclude_count=$(echo "$exclude_json" | jq -r 'length')
 
@@ -505,20 +127,25 @@ matches_filter() {
         pattern=$(echo "$exclude_json" | jq -r ".[$i]")
         # shellcheck disable=SC2053
         if [[ "$name" == $pattern ]]; then
-            return 1  # excluded
+            return 1
         fi
     done
 
     return 0
 }
 
+# ── Expand ~ safely ─────────────────────────────────────────────────
+expand_path() {
+    local path="$1"
+    echo "${path/#\~/$HOME}"
+}
 
 # ── Parse CLI args ───────────────────────────────────────────────────
 parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config)
+            config|build|migrate|copy|instructions)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -538,8 +165,22 @@ parse_args() {
             --dry-run)
                 DRY_RUN=true
                 ;;
+            --force)
+                BUILD_FORCE=true
+                ;;
             --check)
                 CONFIG_CHECK=true
+                ;;
+            --delete)
+                MIGRATE_DELETE=true
+                ;;
+            --workspace)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}Error: --workspace requires an argument${NC}" >&2
+                    exit 1
+                fi
+                shift
+                MIGRATE_WORKSPACE="$1"
                 ;;
             -y|--yes)
                 CONFIG_YES=true
@@ -558,14 +199,43 @@ parse_args() {
                 break
                 ;;
             *)
-                # For config subcommand, treat positional arg as path
-                if [[ "$SUBCOMMAND" == "config" && -z "$CONFIG_PATH" && "$1" != -* ]]; then
-                    CONFIG_PATH="$1"
-                else
-                    echo -e "${RED}Unknown option: $1${NC}" >&2
-                    usage >&2
-                    exit 1
-                fi
+                # Handle positional args per subcommand
+                case "$SUBCOMMAND" in
+                    config)
+                        if [[ -z "$CONFIG_PATH" && "$1" != -* ]]; then
+                            CONFIG_PATH="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    migrate)
+                        if [[ -z "$MIGRATE_PATH" && "$1" != -* ]]; then
+                            MIGRATE_PATH="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    copy)
+                        if [[ -z "$COPY_SOURCE" && "$1" != -* ]]; then
+                            COPY_SOURCE="$1"
+                        elif [[ -z "$COPY_DEST" && "$1" != -* ]]; then
+                            COPY_DEST="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    *)
+                        echo -e "${RED}Unknown option: $1${NC}" >&2
+                        usage >&2
+                        exit 1
+                        ;;
+                esac
                 ;;
         esac
         shift
@@ -585,9 +255,21 @@ parse_args() {
         echo -e "${RED}Error: --check can only be used with 'config'${NC}" >&2
         exit 1
     fi
+    if [[ "$BUILD_FORCE" == true && "$SUBCOMMAND" != "build" ]]; then
+        echo -e "${RED}Error: --force can only be used with 'build'${NC}" >&2
+        exit 1
+    fi
+    if [[ "$MIGRATE_DELETE" == true && "$SUBCOMMAND" != "migrate" ]]; then
+        echo -e "${RED}Error: --delete can only be used with 'migrate'${NC}" >&2
+        exit 1
+    fi
+    if [[ -n "$MIGRATE_WORKSPACE" && "$SUBCOMMAND" != "migrate" ]]; then
+        echo -e "${RED}Error: --workspace can only be used with 'migrate'${NC}" >&2
+        exit 1
+    fi
 }
 
-# ── Require jq ───────────────────────────────────────────────────────
+# ── Require tools ────────────────────────────────────────────────────
 require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
@@ -602,128 +284,598 @@ require_claude() {
         exit 1
     fi
 }
-
-# ── Validate prerequisites ───────────────────────────────────────────
+# ── Validate workspace ──────────────────────────────────────────────
 validate() {
     require_jq
+    require_claude
 
-    # Check claude
-    if ! command -v claude &>/dev/null; then
-        echo -e "${RED}Error: claude CLI not found in PATH.${NC}" >&2
-        exit 1
-    fi
+    # Validate global config first (before workspace config check)
+    validate_global_config
 
-    # Check config file
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${YELLOW}Config not found: ${CONFIG_FILE}. Launching plain claude.${NC}" >&2
-        claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+        echo -e "${RED}Error: Config not found: ${CONFIG_FILE}${NC}" >&2
+        echo -e "${YELLOW}Launching Claude to create the config...${NC}" >&2
+        local ws_dir
+        ws_dir="$(dirname "$CONFIG_FILE")"
+        local prompt
+        prompt=$(compose_config_prompt "$CONFIG_FILE")
+        (cd "$ws_dir" && claude --system-prompt "$prompt" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
         exit 0
     fi
 
-    # Validate JSON
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
         jq empty "$CONFIG_FILE" 2>&1 | head -5 >&2
         exit 1
     fi
+
+    local semantic_error
+    semantic_error=$(validate_config_semantics "$CONFIG_FILE")
+    if [[ -n "$semantic_error" ]]; then
+        echo -e "${RED}Config error: ${semantic_error}${NC}" >&2
+        if [[ "$DRY_RUN" == true ]]; then
+            exit 1
+        fi
+        echo -e "${YELLOW}Launching Claude to fix the config...${NC}" >&2
+        local ws_dir
+        ws_dir=$(dirname "$CONFIG_FILE")
+        local prompt
+        prompt=$(compose_fix_prompt "$CONFIG_FILE" "$semantic_error")
+        (cd "$ws_dir" && claude --system-prompt "$prompt" -p "do it")
+        exit 0
+    fi
 }
 
-# ── Expand ~ safely ─────────────────────────────────────────────────
-expand_path() {
-    local path="$1"
-    echo "${path/#\~/$HOME}"
-}
+validate_config_semantics() {
+    local config_file="$1"
 
-# ── Process a single project ────────────────────────────────────────
-process_project() {
-    local project_json="$1"
-    local raw_path
-    raw_path=$(echo "$project_json" | jq -r '.path')
-    local project_path
-    project_path=$(expand_path "$raw_path")
-
-    # Check path exists
-    if [[ ! -d "$project_path" ]]; then
-        echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
+    local projects_type
+    projects_type=$(jq -r 'if has("projects") then .projects | type else "null" end' "$config_file")
+    if [[ "$projects_type" != "null" && "$projects_type" != "array" ]]; then
+        echo "\"projects\" must be an array, got: ${projects_type}"
         return
     fi
 
-    local short_name
-    short_name=$(basename "$project_path")
+    local project_count
+    project_count=$(jq '.projects // [] | length' "$config_file")
 
-    echo -e "${CYAN}Processing:${NC} ${short_name} (${project_path})" >&2
+    [[ "$project_count" -eq 0 ]] && return
+    local missing=()
+    for i in $(seq 0 $((project_count - 1))); do
+        local name
+        name=$(jq -r ".projects[$i].name // empty" "$config_file")
+        if [[ -z "$name" ]]; then
+            local path
+            path=$(jq -r ".projects[$i].path // \"(unknown)\"" "$config_file")
+            missing+=("projects[$i] (${path})")
+        fi
+    done
 
-    # ── Files / CLAUDE.md ──
-    local files claude_md
-    files=$(echo "$project_json" | jq -r 'if has("files") then .files else true end')
-    claude_md=$(echo "$project_json" | jq -r 'if has("claude_md") then .claude_md else true end')
-
-    if [[ "$files" == "true" || "$claude_md" == "true" ]]; then
-        CLAUDE_ARGS+=("--add-dir" "$project_path")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        local joined
+        joined=$(IFS=', '; echo "${missing[*]}")
+        echo "Each project must have a \"name\" field. Missing in: ${joined}"
+        return
     fi
 
-    if [[ "$claude_md" == "true" ]]; then
-        NEED_CLAUDE_MD_ENV=true
+    # ── Validate resources section ──
+    local resources_type
+    resources_type=$(jq -r 'if has("resources") then .resources | type else "null" end' "$config_file")
+    if [[ "$resources_type" == "null" ]]; then
+        return
+    fi
+    if [[ "$resources_type" != "object" ]]; then
+        echo "\"resources\" must be an object, got: ${resources_type}"
+        return
     fi
 
-    # ── MCP servers ──
-    local mcp_file="$project_path/.mcp.json"
-    if [[ -f "$mcp_file" ]]; then
-        local mcp_include mcp_exclude mcp_rename
-        mcp_include=$(echo "$project_json" | jq -c '.mcp.include // ["*"]')
-        mcp_exclude=$(echo "$project_json" | jq -c '.mcp.exclude // []')
-        mcp_rename=$(echo "$project_json" | jq -c '.mcp.rename // {}')
+    # resources.agents — array of strings
+    local agents_type
+    agents_type=$(jq -r 'if .resources | has("agents") then .resources.agents | type else "null" end' "$config_file")
+    if [[ "$agents_type" != "null" && "$agents_type" != "array" ]]; then
+        echo "\"resources.agents\" must be an array, got: ${agents_type}"
+        return
+    fi
+    if [[ "$agents_type" == "array" ]]; then
+        local bad_agents
+        bad_agents=$(jq -r '.resources.agents | to_entries[] | select((.value | type) != "string") | "resources.agents[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+        if [[ -n "$bad_agents" ]]; then
+            echo "$bad_agents"
+            return
+        fi
+    fi
+
+    # resources.skills — array of strings
+    local skills_type
+    skills_type=$(jq -r 'if .resources | has("skills") then .resources.skills | type else "null" end' "$config_file")
+    if [[ "$skills_type" != "null" && "$skills_type" != "array" ]]; then
+        echo "\"resources.skills\" must be an array, got: ${skills_type}"
+        return
+    fi
+    if [[ "$skills_type" == "array" ]]; then
+        local bad_skills
+        bad_skills=$(jq -r '.resources.skills | to_entries[] | select((.value | type) != "string") | "resources.skills[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+        if [[ -n "$bad_skills" ]]; then
+            echo "$bad_skills"
+            return
+        fi
+    fi
+
+    # resources.mcp — object of objects
+    local mcp_type
+    mcp_type=$(jq -r 'if .resources | has("mcp") then .resources.mcp | type else "null" end' "$config_file")
+    if [[ "$mcp_type" != "null" && "$mcp_type" != "object" ]]; then
+        echo "\"resources.mcp\" must be an object, got: ${mcp_type}"
+        return
+    fi
+    if [[ "$mcp_type" == "object" ]]; then
+        local bad_mcp
+        bad_mcp=$(jq -r '.resources.mcp | to_entries[] | select((.value | type) != "object") | "resources.mcp.\(.key): expected object, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+        if [[ -n "$bad_mcp" ]]; then
+            echo "$bad_mcp"
+            return
+        fi
+    fi
+
+    # resources.env_files — array of strings
+    local env_files_type
+    env_files_type=$(jq -r 'if .resources | has("env_files") then .resources.env_files | type else "null" end' "$config_file")
+    if [[ "$env_files_type" != "null" && "$env_files_type" != "array" ]]; then
+        echo "\"resources.env_files\" must be an array, got: ${env_files_type}"
+        return
+    fi
+    if [[ "$env_files_type" == "array" ]]; then
+        local bad_env_files
+        bad_env_files=$(jq -r '.resources.env_files | to_entries[] | select((.value | type) != "string") | "resources.env_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+        if [[ -n "$bad_env_files" ]]; then
+            echo "$bad_env_files"
+            return
+        fi
+    fi
+}
+
+validate_global_config() {
+    [[ ! -f "$GLOBAL_CONFIG" ]] && return
+
+    if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
+        echo -e "${RED}Error: Invalid JSON in global config: ${GLOBAL_CONFIG}${NC}" >&2
+        jq empty "$GLOBAL_CONFIG" 2>&1 | head -5 >&2
+        exit 1
+    fi
+
+    local semantic_error
+    semantic_error=$(validate_config_semantics "$GLOBAL_CONFIG")
+    if [[ -n "$semantic_error" ]]; then
+        echo -e "${RED}Global config error (${GLOBAL_CONFIG}): ${semantic_error}${NC}" >&2
+        exit 1
+    fi
+}
+# ── Build System ─────────────────────────────────────────────────────
+
+# Collect all preset names recursively (for hashing)
+collect_all_presets() {
+    local -a visited=()
+    local -a queue=("$@")
+
+    while [[ ${#queue[@]} -gt 0 ]]; do
+        local name="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        local skip=false
+        for v in "${visited[@]+"${visited[@]}"}"; do
+            [[ "$v" == "$name" ]] && skip=true && break
+        done
+        [[ "$skip" == true ]] && continue
+
+        visited+=("$name")
+        echo "$name"
+
+        local preset_dir="$PRESETS_DIR/$name"
+        if [[ -f "$preset_dir/claude-compose.json" ]]; then
+            local nested
+            nested=$(jq -r '.presets // [] | .[]' "$preset_dir/claude-compose.json" 2>/dev/null || true)
+            while IFS= read -r n; do
+                [[ -z "$n" ]] && continue
+                queue+=("$n")
+            done <<< "$nested"
+        fi
+    done
+}
+
+# Hash Claude config files from a workspace directory (for change detection)
+hash_workspace_config_files() {
+    local ws_dir="$1"
+    local result=""
+    for f in "$ws_dir/.mcp.json" "$ws_dir/.claude/settings.local.json" "$ws_dir/claude-compose.json"; do
+        [[ -f "$f" ]] && result+=$(shasum "$f" 2>/dev/null || true)
+    done
+    [[ -d "$ws_dir/.claude/agents" ]] && result+=$(find "$ws_dir/.claude/agents" -name '*.md' -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+    [[ -d "$ws_dir/.claude/skills" ]] && result+=$(find "$ws_dir/.claude/skills" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+    echo "$result"
+}
+
+# Compute content-based hash of config + all preset/workspace source files
+compute_build_hash() {
+    local hash_input=""
+    hash_input+=$(cat "$CONFIG_FILE")
+
+    # Hash global config
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        hash_input+=$(cat "$GLOBAL_CONFIG")
+    fi
+
+    # Hash built-in skills
+    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
+        hash_input+=$(find "$BUILTIN_SKILLS_DIR" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+    fi
+
+    # Hash global presets
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        local global_presets
+        global_presets=$(jq -r '.presets // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        local -a global_preset_list=()
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            global_preset_list+=("$name")
+        done <<< "$global_presets"
 
         while IFS= read -r name; do
             [[ -z "$name" ]] && continue
-            if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
-                local server_config final_name
-                server_config=$(jq -c --arg n "$name" '.mcpServers[$n]' "$mcp_file")
-                final_name=$(echo "$mcp_rename" | jq -r --arg n "$name" '.[$n] // $n')
-                MERGED_MCP=$(echo "$MERGED_MCP" | jq --arg name "$final_name" --argjson config "$server_config" '. + {($name): $config}')
-                if [[ "$final_name" != "$name" ]]; then
-                    echo -e "  ${GREEN}+mcp:${NC} $name → $final_name" >&2
-                else
-                    echo -e "  ${GREEN}+mcp:${NC} $name" >&2
-                fi
-            fi
-        done < <(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+            local preset_dir="$PRESETS_DIR/$name"
+            [[ -d "$preset_dir" ]] || continue
+            hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
+        done < <(collect_all_presets "${global_preset_list[@]+"${global_preset_list[@]}"}")
     fi
 
-    # ── Skills ──
-    # --add-dir loads all skills from external project automatically.
-    # Only copy skills when files=false (no --add-dir), otherwise skip to avoid duplicates.
-    if [[ "$files" != "true" ]]; then
-        local skills_dir="$project_path/.claude/skills"
-        if [[ -d "$skills_dir" ]]; then
-            local skills_include skills_exclude
-            skills_include=$(echo "$project_json" | jq -c '.skills.include // ["*"]')
-            skills_exclude=$(echo "$project_json" | jq -c '.skills.exclude // []')
+    # Hash preset dirs (recursively collected)
+    local top_presets
+    top_presets=$(jq -r '.presets // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    local -a preset_list=()
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        preset_list+=("$name")
+    done <<< "$top_presets"
 
-            for skill_path in "$skills_dir"/*/; do
-                [[ -d "$skill_path" ]] || continue
-                local skill_name
-                skill_name=$(basename "$skill_path")
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local preset_dir="$PRESETS_DIR/$name"
+        [[ -d "$preset_dir" ]] || continue
+        hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
+    done < <(collect_all_presets "${preset_list[@]+"${preset_list[@]}"}")
 
-                if matches_filter "$skill_name" "$skills_include" "$skills_exclude"; then
-                    SKILLS_TO_COPY+=("${skill_path}|${skill_name}")
-                    echo -e "  ${GREEN}+skill:${NC} $skill_name" >&2
-                fi
-            done
-        fi
+    # Hash workspace source dirs (Claude config files only)
+    local ws_count
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    for i in $(seq 0 $((ws_count - 1))); do
+        local ws_path
+        ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+        ws_path=$(expand_path "$ws_path")
+        [[ -d "$ws_path" ]] || continue
+        hash_input+=$(hash_workspace_config_files "$ws_path")
+    done
+
+    # Hash global workspaces
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        local global_ws_count
+        global_ws_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+        for i in $(seq 0 $((global_ws_count - 1))); do
+            local gws_path
+            gws_path=$(jq -r ".workspaces[$i].path" "$GLOBAL_CONFIG")
+            gws_path=$(expand_path "$gws_path")
+            [[ -d "$gws_path" ]] || continue
+            hash_input+=$(hash_workspace_config_files "$gws_path")
+        done
+    fi
+
+    # Hash resources section content
+    local resources_mcp
+    resources_mcp=$(jq -c '.resources.mcp // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    [[ -n "$resources_mcp" ]] && hash_input+="$resources_mcp"
+
+    # Hash referenced agent/skill files
+    local res_agents
+    res_agents=$(jq -r '.resources.agents // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r agent_path; do
+        [[ -z "$agent_path" ]] && continue
+        local abs_agent="$ORIGINAL_CWD/$agent_path"
+        [[ -f "$abs_agent" ]] && hash_input+=$(shasum "$abs_agent" 2>/dev/null || true)
+    done <<< "$res_agents"
+
+    local res_skills
+    res_skills=$(jq -r '.resources.skills // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r skill_path; do
+        [[ -z "$skill_path" ]] && continue
+        local abs_skill="$ORIGINAL_CWD/$skill_path"
+        [[ -d "$abs_skill" ]] && hash_input+=$(find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+    done <<< "$res_skills"
+
+    # Hash env files
+    local res_env_files
+    res_env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r env_file; do
+        [[ -z "$env_file" ]] && continue
+        local abs_env="$ORIGINAL_CWD/$env_file"
+        [[ -f "$abs_env" ]] && hash_input+=$(shasum "$abs_env" 2>/dev/null || true)
+    done <<< "$res_env_files"
+
+    # Hash global resources
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        local global_mcp
+        global_mcp=$(jq -c '.resources.mcp // empty' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        [[ -n "$global_mcp" ]] && hash_input+="$global_mcp"
+
+        local global_agents
+        global_agents=$(jq -r '.resources.agents // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        while IFS= read -r agent_path; do
+            [[ -z "$agent_path" ]] && continue
+            local abs_agent="$GLOBAL_CONFIG_DIR/$agent_path"
+            [[ -f "$abs_agent" ]] && hash_input+=$(shasum "$abs_agent" 2>/dev/null || true)
+        done <<< "$global_agents"
+
+        local global_skills
+        global_skills=$(jq -r '.resources.skills // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        while IFS= read -r skill_path; do
+            [[ -z "$skill_path" ]] && continue
+            local abs_skill="$GLOBAL_CONFIG_DIR/$skill_path"
+            [[ -d "$abs_skill" ]] && hash_input+=$(find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+        done <<< "$global_skills"
+
+        local global_env_files
+        global_env_files=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        while IFS= read -r env_file; do
+            [[ -z "$env_file" ]] && continue
+            local abs_env="$GLOBAL_CONFIG_DIR/$env_file"
+            [[ -f "$abs_env" ]] && hash_input+=$(shasum "$abs_env" 2>/dev/null || true)
+        done <<< "$global_env_files"
+    fi
+
+    printf '%s' "$hash_input" | shasum -a 256 | cut -c1-32
+}
+
+# Check if rebuild is needed
+needs_rebuild() {
+    [[ ! -f ".compose-manifest.json" ]] && return 0
+    [[ ! -f ".compose-hash" ]] && return 0
+
+    local current_hash stored_hash
+    current_hash=$(compute_build_hash)
+    stored_hash=$(cat ".compose-hash")
+    [[ "$current_hash" != "$stored_hash" ]]
+}
+
+# Read manifest or return empty
+read_manifest() {
+    if [[ -f ".compose-manifest.json" ]]; then
+        cat ".compose-manifest.json"
     else
-        echo -e "  ${CYAN}skills:${NC} loaded via --add-dir (all)" >&2
+        echo '{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
     fi
+}
+# Load JSON env files from resources.env_files at launch time
+load_env_files() {
+    local env_files
+    env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r env_file; do
+        [[ -z "$env_file" ]] && continue
+        local abs_path="$PWD/$env_file"
+        if [[ ! -f "$abs_path" ]]; then
+            echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
+            continue
+        fi
+        if ! jq empty "$abs_path" 2>/dev/null; then
+            echo -e "${RED}Error: invalid JSON in env file: ${env_file}${NC}" >&2
+            continue
+        fi
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local key value
+            key=$(echo "$line" | jq -r '.key')
+            value=$(echo "$line" | jq -r '.value')
+            export "$key=$value"
+        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
+        local var_count
+        var_count=$(jq 'length' "$abs_path")
+        echo -e "  ${GREEN}Loaded:${NC} ${env_file} (${var_count} vars)" >&2
+    done <<< "$env_files"
+}
 
-    # ── Agents ──
-    # --add-dir does NOT load agents — must always copy
-    local agents_dir="$project_path/.claude/agents"
+# Load global env files (no prefix — intended to be available directly)
+load_global_env_files() {
+    [[ ! -f "$GLOBAL_CONFIG" ]] && return
+
+    local env_files
+    env_files=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+    while IFS= read -r env_file; do
+        [[ -z "$env_file" ]] && continue
+        local abs_path="$GLOBAL_CONFIG_DIR/$env_file"
+        if [[ ! -f "$abs_path" ]]; then
+            echo -e "${YELLOW}Warning: global env file not found: ${env_file}${NC}" >&2
+            continue
+        fi
+        if ! jq empty "$abs_path" 2>/dev/null; then
+            echo -e "${RED}Error: invalid JSON in global env file: ${env_file}${NC}" >&2
+            continue
+        fi
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local key value
+            key=$(echo "$line" | jq -r '.key')
+            value=$(echo "$line" | jq -r '.value')
+            export "$key=$value"
+        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
+        local var_count
+        var_count=$(jq 'length' "$abs_path")
+        echo -e "  ${GREEN}Loaded:${NC} ${env_file} (${var_count} vars, global)" >&2
+    done <<< "$env_files"
+}
+
+# Load env files from a source directory with prefixed keys (launch-time)
+load_source_env_files() {
+    local source_dir="$1" source_name="$2"
+    local source_config="$source_dir/claude-compose.json"
+    [[ ! -f "$source_config" ]] && return
+
+    local prefix
+    prefix=$(compute_source_prefix "$source_name" "$source_dir")
+
+    local env_files
+    env_files=$(jq -r '.resources.env_files // [] | .[]' "$source_config" 2>/dev/null || true)
+    while IFS= read -r env_file; do
+        [[ -z "$env_file" ]] && continue
+        local abs_path="$source_dir/$env_file"
+        if [[ ! -f "$abs_path" ]]; then
+            continue
+        fi
+        if ! jq empty "$abs_path" 2>/dev/null; then
+            echo -e "${YELLOW}Warning: invalid JSON in source env file: ${source_name}/${env_file}${NC}" >&2
+            continue
+        fi
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local key value
+            key=$(echo "$line" | jq -r '.key')
+            value=$(echo "$line" | jq -r '.value')
+            export "${prefix}${key}=${value}"
+        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
+    done <<< "$env_files"
+}
+
+# Load env files from all external sources (presets + workspaces) at launch time
+load_all_source_env_files() {
+    [[ ! -f ".compose-manifest.json" ]] && return
+
+    local section
+    for section in presets workspaces; do
+        local source_names
+        source_names=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
+        while IFS= read -r sname; do
+            [[ -z "$sname" ]] && continue
+            local source_dir
+            if [[ "$section" == "presets" ]]; then
+                source_dir="$PRESETS_DIR/$sname"
+            else
+                source_dir="$sname"  # workspaces use absolute path as key
+            fi
+            [[ ! -d "$source_dir" ]] && continue
+            load_source_env_files "$source_dir" "$(basename "$source_dir")"
+        done <<< "$source_names"
+    done
+}
+# Clean resources tracked in manifest for a given section (presets or workspaces)
+# $1 = old manifest, $2 = section name ("presets" or "workspaces")
+clean_manifest_section() {
+    local old_manifest="$1"
+    local section="$2"
+
+    local source_names
+    source_names=$(echo "$old_manifest" | jq -r --arg s "$section" '.[$s] // {} | keys[]' 2>/dev/null || true)
+    while IFS= read -r source_name; do
+        [[ -z "$source_name" ]] && continue
+        local source_data
+        source_data=$(echo "$old_manifest" | jq -c --arg s "$section" --arg n "$source_name" '.[$s][$n]')
+
+        # Delete agent files
+        local agents
+        agents=$(echo "$source_data" | jq -r '.agents // [] | .[]' 2>/dev/null || true)
+        while IFS= read -r agent; do
+            [[ -z "$agent" ]] && continue
+            if [[ -f ".claude/agents/${agent}" ]]; then
+                rm -f ".claude/agents/${agent}"
+                echo -e "  ${YELLOW}-agent:${NC} $agent" >&2
+            fi
+        done <<< "$agents"
+
+        # Delete skill symlinks/directories
+        local skills
+        skills=$(echo "$source_data" | jq -r '.skills // [] | .[]' 2>/dev/null || true)
+        while IFS= read -r skill; do
+            [[ -z "$skill" ]] && continue
+            if [[ -L ".claude/skills/${skill}" ]]; then
+                rm -f ".claude/skills/${skill}"
+                echo -e "  ${YELLOW}-skill:${NC} $skill" >&2
+            elif [[ -d ".claude/skills/${skill}" ]]; then
+                rm -rf ".claude/skills/${skill}"
+                echo -e "  ${YELLOW}-skill:${NC} $skill" >&2
+            fi
+        done <<< "$skills"
+
+        # Remove MCP servers from .mcp.json
+        local mcp_servers
+        mcp_servers=$(echo "$source_data" | jq -r '.mcp_servers // [] | .[]' 2>/dev/null || true)
+        if [[ -f ".mcp.json" ]]; then
+            while IFS= read -r server; do
+                [[ -z "$server" ]] && continue
+                local tmp
+                tmp=$(jq --arg s "$server" 'del(.mcpServers[$s])' ".mcp.json")
+                echo "$tmp" > ".mcp.json"
+                echo -e "  ${YELLOW}-mcp:${NC} $server" >&2
+            done <<< "$mcp_servers"
+            local server_count
+            server_count=$(jq '.mcpServers | length' ".mcp.json" 2>/dev/null || echo 0)
+            if [[ "$server_count" -eq 0 ]]; then
+                rm -f ".mcp.json"
+            fi
+        fi
+    done <<< "$source_names"
+}
+# ── Env var prefixing for nested sources ─────────────────────────────
+
+# Compute a prefix for env vars from a source: {name}_{hash4}_
+compute_source_prefix() {
+    local name="$1" abs_path="$2"
+    # Sanitize name: replace non-alphanumeric chars with underscore (shell var names)
+    local safe_name
+    safe_name=$(printf '%s' "$name" | tr -c '[:alnum:]_' '_')
+    local hash4
+    hash4=$(printf '%s' "$abs_path" | shasum -a 256 | cut -c1-4)
+    echo "${safe_name}_${hash4}_"
+}
+
+# Transform ${VAR} references in MCP server config's env block
+# Only prefixes vars that are defined in the source's env_files (not system vars like HOME)
+# $1 = server config JSON, $2 = prefix, $3 = known var names (newline-separated)
+prefix_env_vars_in_mcp() {
+    local config="$1" prefix="$2" known_vars="$3"
+    if [[ -z "$known_vars" ]]; then
+        # No known vars — nothing to prefix
+        echo "$config"
+        return
+    fi
+    # Build jq array of known var names
+    local vars_json
+    vars_json=$(printf '%s\n' "$known_vars" | jq -R -s 'split("\n") | map(select(. != ""))')
+    echo "$config" | jq --arg pfx "$prefix" --argjson known "$vars_json" '
+      if .env then .env |= with_entries(
+        if (.value | type) == "string" then
+          .value |= reduce $known[] as $var (.; gsub("\\$\\{" + $var + "\\}"; "${\($pfx)\($var)}"))
+        else . end
+      ) else . end'
+}
+# ── Sync resources from a source directory ──────────────────────────
+# Shared logic for presets and workspaces.
+# $1 = source dir, $2 = filter JSON, $3 = source name (for env prefix)
+# Populates CURRENT_SOURCE_* arrays. Caller writes manifest.
+sync_source_dir() {
+    local source_dir="$1"
+    local filter_json="$2"
+    local source_name="${3:-}"
+
+    # Reset tracking
+    CURRENT_SOURCE_AGENTS=()
+    CURRENT_SOURCE_SKILLS=()
+    CURRENT_SOURCE_MCP_SERVERS=()
+    CURRENT_SOURCE_ADD_DIRS=()
+    CURRENT_SOURCE_PROJECT_DIRS=()
+
+    # ── Copy agents ──
+    local agents_dir="$source_dir/.claude/agents"
     if [[ -d "$agents_dir" ]]; then
         local agents_include agents_exclude agents_rename
-        agents_include=$(echo "$project_json" | jq -c '.agents.include // ["*"]')
-        agents_exclude=$(echo "$project_json" | jq -c '.agents.exclude // []')
-        agents_rename=$(echo "$project_json" | jq -c '.agents.rename // {}')
+        agents_include=$(echo "$filter_json" | jq -c '.agents.include // ["*"]')
+        agents_exclude=$(echo "$filter_json" | jq -c '.agents.exclude // []')
+        agents_rename=$(echo "$filter_json" | jq -c '.agents.rename // {}')
 
+        mkdir -p ".claude/agents"
         for agent_file in "$agents_dir"/*.md; do
             [[ -f "$agent_file" ]] || continue
             local agent_name
@@ -732,7 +884,16 @@ process_project() {
             if matches_filter "$agent_name" "$agents_include" "$agents_exclude"; then
                 local final_name
                 final_name=$(echo "$agents_rename" | jq -r --arg n "$agent_name" '.[$n] // $n')
-                AGENTS_TO_COPY+=("${agent_file}|${final_name}")
+                local dest_file="${final_name}.md"
+
+                if [[ -f ".claude/agents/${dest_file}" ]]; then
+                    echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${dest_file}" >&2
+                fi
+
+                local abs_agent_file
+                abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
+                ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
+                CURRENT_SOURCE_AGENTS+=("$dest_file")
                 if [[ "$final_name" != "$agent_name" ]]; then
                     echo -e "  ${GREEN}+agent:${NC} $agent_name → $final_name" >&2
                 else
@@ -742,23 +903,126 @@ process_project() {
         done
     fi
 
-    # ── Permissions ──
-    local settings_file="$project_path/.claude/settings.local.json"
-    if [[ -f "$settings_file" ]]; then
-        local perm_include perm_exclude
-        perm_include=$(echo "$project_json" | jq -c '.permissions.include // ["*"]')
-        perm_exclude=$(echo "$project_json" | jq -c '.permissions.exclude // []')
+    # ── Copy skills ──
+    local skills_dir="$source_dir/.claude/skills"
+    if [[ -d "$skills_dir" ]]; then
+        local skills_include skills_exclude
+        skills_include=$(echo "$filter_json" | jq -c '.skills.include // ["*"]')
+        skills_exclude=$(echo "$filter_json" | jq -c '.skills.exclude // []')
 
-        while IFS= read -r perm; do
-            [[ -z "$perm" ]] && continue
-            if matches_filter "$perm" "$perm_include" "$perm_exclude"; then
-                MERGED_PERMISSIONS=$(echo "$MERGED_PERMISSIONS" | jq --arg p "$perm" '. + [$p] | unique')
-                echo -e "  ${GREEN}+perm:${NC} $perm" >&2
+        mkdir -p ".claude/skills"
+        for skill_path in "$skills_dir"/*/; do
+            [[ -d "$skill_path" ]] || continue
+            local skill_name
+            skill_name=$(basename "$skill_path")
+
+            if matches_filter "$skill_name" "$skills_include" "$skills_exclude"; then
+                if [[ -L ".claude/skills/${skill_name}" || -d ".claude/skills/${skill_name}" ]]; then
+                    echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${skill_name}/" >&2
+                    rm -f ".claude/skills/${skill_name}" 2>/dev/null || rm -rf ".claude/skills/${skill_name}"
+                fi
+
+                local abs_skill_path
+                abs_skill_path=$(cd "$skill_path" && pwd -P)
+                ln -sf "$abs_skill_path" ".claude/skills/${skill_name}"
+                CURRENT_SOURCE_SKILLS+=("$skill_name")
+                echo -e "  ${GREEN}+skill:${NC} $skill_name" >&2
             fi
-        done < <(jq -r '.permissions.allow // [] | .[]' "$settings_file" 2>/dev/null || true)
+        done
+    fi
+
+    # ── Collect known env var names from source's env_files (for selective prefixing) ──
+    local _source_known_vars=""
+    if [[ -n "$source_name" && -f "$source_dir/claude-compose.json" ]]; then
+        local _src_env_files
+        _src_env_files=$(jq -r '.resources.env_files // [] | .[]' "$source_dir/claude-compose.json" 2>/dev/null || true)
+        while IFS= read -r _ef; do
+            [[ -z "$_ef" ]] && continue
+            local _ef_abs="$source_dir/$_ef"
+            [[ -f "$_ef_abs" ]] || continue
+            _source_known_vars+=$(jq -r 'keys[]' "$_ef_abs" 2>/dev/null || true)
+            _source_known_vars+=$'\n'
+        done <<< "$_src_env_files"
+    fi
+
+    # ── Merge MCP servers ──
+    local mcp_file="$source_dir/.mcp.json"
+    if [[ -f "$mcp_file" ]]; then
+        local mcp_include mcp_exclude mcp_rename
+        mcp_include=$(echo "$filter_json" | jq -c '.mcp.include // ["*"]')
+        mcp_exclude=$(echo "$filter_json" | jq -c '.mcp.exclude // []')
+        mcp_rename=$(echo "$filter_json" | jq -c '.mcp.rename // {}')
+
+        if [[ ! -f ".mcp.json" ]]; then
+            echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+        fi
+
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
+                local server_config final_name
+                server_config=$(jq -c --arg n "$name" '.mcpServers[$n]' "$mcp_file")
+                final_name=$(echo "$mcp_rename" | jq -r --arg n "$name" '.[$n] // $n')
+
+                # Prefix only env vars defined in source's env_files
+                if [[ -n "$source_name" && -n "${_source_known_vars:-}" ]]; then
+                    local prefix
+                    prefix=$(compute_source_prefix "$source_name" "$source_dir")
+                    server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
+                fi
+
+                local tmp
+                tmp=$(jq --arg name "$final_name" --argjson config "$server_config" \
+                    '.mcpServers[$name] = $config' ".mcp.json")
+                echo "$tmp" > ".mcp.json"
+
+                CURRENT_SOURCE_MCP_SERVERS+=("$final_name")
+                if [[ "$final_name" != "$name" ]]; then
+                    echo -e "  ${GREEN}+mcp:${NC} $name → $final_name" >&2
+                else
+                    echo -e "  ${GREEN}+mcp:${NC} $name" >&2
+                fi
+            fi
+        done < <(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+    fi
+
+    # ── CLAUDE.md via --add-dir ──
+    local claude_md
+    claude_md=$(echo "$filter_json" | jq -r 'if has("claude_md") then .claude_md else true end')
+    if [[ "$claude_md" == "true" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("$source_dir")
     fi
 }
 
+# Write CURRENT_SOURCE_* arrays to manifest under given section/name
+# $1 = section ("presets" or "workspaces"), $2 = entry name
+write_source_manifest() {
+    local section="$1"
+    local entry_name="$2"
+
+    local agents_json skills_json mcp_json dirs_json
+    agents_json=$(printf '%s\n' "${CURRENT_SOURCE_AGENTS[@]+"${CURRENT_SOURCE_AGENTS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+    skills_json=$(printf '%s\n' "${CURRENT_SOURCE_SKILLS[@]+"${CURRENT_SOURCE_SKILLS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+    mcp_json=$(printf '%s\n' "${CURRENT_SOURCE_MCP_SERVERS[@]+"${CURRENT_SOURCE_MCP_SERVERS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+    dirs_json=$(printf '%s\n' "${CURRENT_SOURCE_ADD_DIRS[@]+"${CURRENT_SOURCE_ADD_DIRS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+    local proj_dirs_json="[]"
+    for entry in "${CURRENT_SOURCE_PROJECT_DIRS[@]+"${CURRENT_SOURCE_PROJECT_DIRS[@]}"}"; do
+        [[ -z "$entry" ]] && continue
+        local p="${entry%|*}"
+        local cmd="${entry#*|}"
+        proj_dirs_json=$(echo "$proj_dirs_json" | jq --arg p "$p" --arg c "$cmd" '. + [{path: $p, claude_md: ($c == "true")}]')
+    done
+
+    MANIFEST_JSON=$(echo "$MANIFEST_JSON" | jq \
+        --arg section "$section" \
+        --arg name "$entry_name" \
+        --argjson agents "$agents_json" \
+        --argjson skills "$skills_json" \
+        --argjson mcp "$mcp_json" \
+        --argjson dirs "$dirs_json" \
+        --argjson pdirs "$proj_dirs_json" \
+        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs}')
+}
 # ── Process a single preset ─────────────────────────────────────────
 process_preset() {
     local preset_name="$1"
@@ -778,57 +1042,868 @@ process_preset() {
         exit 1
     fi
 
-    echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
-
-    # Read preset.json if present
-    local preset_json="{}"
-    if [[ -f "$preset_dir/preset.json" ]]; then
-        preset_json=$(cat "$preset_dir/preset.json")
+    local preset_config="$preset_dir/claude-compose.json"
+    if [[ ! -f "$preset_config" ]]; then
+        if [[ -f "$preset_dir/preset.json" || -d "$preset_dir/.claude" ]]; then
+            echo -e "${RED}Error: Preset '${preset_name}' uses old format (preset.json / .claude/ structure).${NC}" >&2
+            echo -e "${RED}Migrate to claude-compose.json with explicit resources. See: claude-compose instructions${NC}" >&2
+        else
+            echo -e "${YELLOW}Warning: No claude-compose.json in preset: ${preset_name}${NC}" >&2
+        fi
+        return
     fi
 
-    # Build synthetic project_json: filter settings from preset.json + path
-    # Default files=false (preset dir is not a real project), claude_md=true (load CLAUDE.md)
-    local synthetic_project
-    synthetic_project=$(echo "$preset_json" | jq -c --arg path "$preset_dir" '
-        {path: $path}
-        + (if has("mcp") then {mcp: .mcp} else {} end)
-        + (if has("permissions") then {permissions: .permissions} else {} end)
-        + (if has("agents") then {agents: .agents} else {} end)
-        + (if has("skills") then {skills: .skills} else {} end)
-        + {files: (if has("files") then .files else false end)}
-        + {claude_md: (if has("claude_md") then .claude_md else true end)}
-    ')
+    echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
 
-    process_project "$synthetic_project"
+    # Process resources with MCP prefixing, skip manifest (we write it below)
+    process_resources "$preset_config" "$preset_dir" "$preset_name" \
+        "presets" "$preset_name" "$preset_name" "true"
+
+    # CLAUDE.md via --add-dir (process_resources resets arrays, so add_dirs is clean)
+    local claude_md
+    claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
+    if [[ "$claude_md" == "true" && -f "$preset_dir/CLAUDE.md" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("$preset_dir")
+    fi
+
+    # Collect preset's projects
+    local preset_project_count
+    preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    if [[ "$preset_project_count" -gt 0 ]]; then
+        for i in $(seq 0 $((preset_project_count - 1))); do
+            local proj_path proj_claude_md
+            proj_path=$(jq -r ".projects[$i].path" "$preset_config")
+            proj_path=$(expand_path "$proj_path")
+            proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$preset_config")
+
+            if [[ ! -d "$proj_path" ]]; then
+                echo -e "${YELLOW}Warning: Preset project path not found, skipping: ${proj_path}${NC}" >&2
+                continue
+            fi
+
+            CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
+            echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from preset)" >&2
+        done
+    fi
+
+    # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
+    write_source_manifest "presets" "$preset_name"
 
     # Recursively process nested presets
     local nested_presets
-    nested_presets=$(echo "$preset_json" | jq -r '.presets // [] | .[]' 2>/dev/null || true)
+    nested_presets=$(jq -r '.presets // [] | .[]' "$preset_config" 2>/dev/null || true)
     while IFS= read -r nested; do
         [[ -z "$nested" ]] && continue
         process_preset "$nested"
     done <<< "$nested_presets"
+}
 
-    # Process preset's projects
-    local preset_project_count
-    preset_project_count=$(echo "$preset_json" | jq '.projects // [] | length')
-    if [[ "$preset_project_count" -gt 0 ]]; then
-        for i in $(seq 0 $((preset_project_count - 1))); do
-            local project_json
-            project_json=$(echo "$preset_json" | jq -c ".projects[$i]")
-            process_project "$project_json"
+# ── Process a single workspace source ───────────────────────────────
+process_workspace_source() {
+    local ws_json="$1"
+
+    local raw_path
+    raw_path=$(echo "$ws_json" | jq -r '.path')
+    local ws_path
+    ws_path=$(expand_path "$raw_path")
+
+    if [[ ! -d "$ws_path" ]]; then
+        echo -e "${YELLOW}Warning: Workspace not found, skipping: ${raw_path}${NC}" >&2
+        return
+    fi
+
+    # Resolve to absolute (handles symlinks)
+    ws_path=$(cd "$ws_path" && pwd -P)
+
+    # Skip self (cycle prevention)
+    local self_dir
+    self_dir=$(pwd -P)
+    if [[ "$ws_path" == "$self_dir" ]]; then
+        echo -e "${YELLOW}Warning: Skipping self: ${ws_path}${NC}" >&2
+        return
+    fi
+
+    # Deduplication — skip if already processed
+    for processed in "${PROCESSED_WORKSPACES[@]+"${PROCESSED_WORKSPACES[@]}"}"; do
+        if [[ "$processed" == "$ws_path" ]]; then
+            echo -e "${YELLOW}Warning: Workspace already processed, skipping: ${ws_path}${NC}" >&2
+            return
+        fi
+    done
+    PROCESSED_WORKSPACES+=("$ws_path")
+
+    local ws_name
+    ws_name=$(basename "$ws_path")
+    echo -e "${CYAN}Processing workspace:${NC} ${ws_name} (${ws_path})" >&2
+
+    # Build filter JSON from workspace config entry
+    local filter_json
+    filter_json=$(echo "$ws_json" | jq -c '{
+        mcp: (.mcp // {}),
+        agents: (.agents // {}),
+        skills: (.skills // {}),
+        claude_md: (if .claude_md == null then true else .claude_md end)
+    }')
+
+    # Sync resources (MCP, agents, skills — no permissions)
+    sync_source_dir "$ws_path" "$filter_json" "$(basename "$ws_path")"
+
+    # Collect workspace's own projects (from its claude-compose.json)
+    if [[ -f "$ws_path/claude-compose.json" ]]; then
+        local ws_project_count
+        ws_project_count=$(jq '.projects // [] | length' "$ws_path/claude-compose.json" 2>/dev/null || echo 0)
+        if [[ "$ws_project_count" -gt 0 ]]; then
+            for i in $(seq 0 $((ws_project_count - 1))); do
+                local proj_path proj_claude_md
+                proj_path=$(jq -r ".projects[$i].path" "$ws_path/claude-compose.json")
+                proj_path=$(expand_path "$proj_path")
+                proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$ws_path/claude-compose.json")
+
+                if [[ ! -d "$proj_path" ]]; then
+                    continue
+                fi
+
+                CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
+                echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from workspace)" >&2
+            done
+        fi
+    fi
+
+    # Write manifest — use path as key (workspaces don't have global names)
+    write_source_manifest "workspaces" "$ws_path"
+}
+
+# ── Process resources from a config file ───────────────────────────
+# Args: [config_file] [base_dir] [label] [manifest_section] [manifest_key] [source_name] [skip_manifest]
+# Defaults preserve backward compatibility for local resources.
+# source_name: if set, enables env var prefixing for MCP servers (used by presets)
+# skip_manifest: if "true", caller handles write_source_manifest (used by presets)
+process_resources() {
+    local config_file="${1:-$CONFIG_FILE}"
+    local base_dir="${2:-$PWD}"
+    local label="${3:-local}"
+    local manifest_section="${4:-resources}"
+    local manifest_key="${5:-local}"
+    local source_name="${6:-}"
+    local skip_manifest="${7:-false}"
+
+    local resources
+    resources=$(jq -c '.resources // {}' "$config_file")
+    if [[ "$resources" == "{}" || "$resources" == "null" ]]; then
+        return
+    fi
+
+    echo -e "${CYAN}Processing ${label} resources${NC}" >&2
+
+    # Reset tracking
+    CURRENT_SOURCE_AGENTS=()
+    CURRENT_SOURCE_SKILLS=()
+    CURRENT_SOURCE_MCP_SERVERS=()
+    CURRENT_SOURCE_ADD_DIRS=()
+    CURRENT_SOURCE_PROJECT_DIRS=()
+
+    # ── Symlink agents ──
+    local agents
+    agents=$(jq -r '.resources.agents // [] | .[]' "$config_file" 2>/dev/null || true)
+    while IFS= read -r agent_path; do
+        [[ -z "$agent_path" ]] && continue
+        local abs_path="$base_dir/$agent_path"
+        if [[ ! -f "$abs_path" ]]; then
+            echo -e "  ${YELLOW}Warning: agent not found: ${agent_path}${NC}" >&2
+            continue
+        fi
+        abs_path=$(cd "$(dirname "$abs_path")" && pwd -P)/$(basename "$abs_path")
+        local agent_basename
+        agent_basename=$(basename "$agent_path")
+        mkdir -p ".claude/agents"
+        if [[ -f ".claude/agents/${agent_basename}" || -L ".claude/agents/${agent_basename}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${agent_basename}" >&2
+        fi
+        ln -sf "$abs_path" ".claude/agents/${agent_basename}"
+        CURRENT_SOURCE_AGENTS+=("$agent_basename")
+        echo -e "  ${GREEN}+agent:${NC} ${agent_basename} (${label})" >&2
+    done <<< "$agents"
+
+    # ── Symlink skills ──
+    local skills
+    skills=$(jq -r '.resources.skills // [] | .[]' "$config_file" 2>/dev/null || true)
+    while IFS= read -r skill_path; do
+        [[ -z "$skill_path" ]] && continue
+        local abs_path="$base_dir/$skill_path"
+        if [[ ! -d "$abs_path" ]]; then
+            echo -e "  ${YELLOW}Warning: skill not found: ${skill_path}${NC}" >&2
+            continue
+        fi
+        abs_path=$(cd "$abs_path" && pwd -P)
+        local skill_basename
+        skill_basename=$(basename "$skill_path")
+        mkdir -p ".claude/skills"
+        if [[ -L ".claude/skills/${skill_basename}" || -d ".claude/skills/${skill_basename}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${skill_basename}/" >&2
+            rm -f ".claude/skills/${skill_basename}" 2>/dev/null || rm -rf ".claude/skills/${skill_basename}"
+        fi
+        ln -sf "$abs_path" ".claude/skills/${skill_basename}"
+        CURRENT_SOURCE_SKILLS+=("$skill_basename")
+        echo -e "  ${GREEN}+skill:${NC} ${skill_basename} (${label})" >&2
+    done <<< "$skills"
+
+    # ── Collect known env var names for MCP prefixing (when source_name is set) ──
+    local _source_known_vars=""
+    if [[ -n "$source_name" ]]; then
+        local _src_env_files
+        _src_env_files=$(jq -r '.resources.env_files // [] | .[]' "$config_file" 2>/dev/null || true)
+        while IFS= read -r _ef; do
+            [[ -z "$_ef" ]] && continue
+            local _ef_abs="$base_dir/$_ef"
+            [[ -f "$_ef_abs" ]] || continue
+            _source_known_vars+=$(jq -r 'keys[]' "$_ef_abs" 2>/dev/null || true)
+            _source_known_vars+=$'\n'
+        done <<< "$_src_env_files"
+    fi
+
+    # ── Merge MCP servers ──
+    local mcp_keys
+    mcp_keys=$(jq -r '.resources.mcp // {} | keys[]' "$config_file" 2>/dev/null || true)
+    while IFS= read -r server_name; do
+        [[ -z "$server_name" ]] && continue
+        local server_config
+        server_config=$(jq -c --arg n "$server_name" '.resources.mcp[$n]' "$config_file")
+
+        # Prefix env vars from source's env_files (when source_name is set)
+        if [[ -n "$source_name" && -n "${_source_known_vars:-}" ]]; then
+            local prefix
+            prefix=$(compute_source_prefix "$source_name" "$base_dir")
+            server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
+        fi
+
+        if [[ ! -f ".mcp.json" ]]; then
+            echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+        fi
+
+        local tmp
+        tmp=$(jq --arg name "$server_name" --argjson config "$server_config" \
+            '.mcpServers[$name] = $config' ".mcp.json")
+        echo "$tmp" > ".mcp.json"
+
+        CURRENT_SOURCE_MCP_SERVERS+=("$server_name")
+        echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
+    done <<< "$mcp_keys"
+
+    if [[ "$skip_manifest" != "true" ]]; then
+        write_source_manifest "$manifest_section" "$manifest_key"
+    fi
+}
+
+# ── Sync built-in skills from ~/.claude-compose/skills/ ────────────
+process_builtin_skills() {
+    if [[ ! -d "$BUILTIN_SKILLS_DIR" ]]; then
+        return
+    fi
+
+    local has_skills=false
+    for skill_path in "$BUILTIN_SKILLS_DIR"/*/; do
+        [[ -d "$skill_path" ]] || continue
+        has_skills=true
+        break
+    done
+    [[ "$has_skills" == true ]] || return
+
+    echo -e "${CYAN}Processing built-in skills${NC}" >&2
+
+    CURRENT_SOURCE_AGENTS=()
+    CURRENT_SOURCE_SKILLS=()
+    CURRENT_SOURCE_MCP_SERVERS=()
+    CURRENT_SOURCE_ADD_DIRS=()
+    CURRENT_SOURCE_PROJECT_DIRS=()
+
+    mkdir -p ".claude/skills"
+    for skill_path in "$BUILTIN_SKILLS_DIR"/*/; do
+        [[ -d "$skill_path" ]] || continue
+        local skill_name
+        skill_name=$(basename "$skill_path")
+
+        if [[ -L ".claude/skills/${skill_name}" || -d ".claude/skills/${skill_name}" ]]; then
+            rm -f ".claude/skills/${skill_name}" 2>/dev/null || rm -rf ".claude/skills/${skill_name}"
+        fi
+
+        local abs_skill_path
+        abs_skill_path=$(cd "$skill_path" && pwd -P)
+        ln -sf "$abs_skill_path" ".claude/skills/${skill_name}"
+        CURRENT_SOURCE_SKILLS+=("$skill_name")
+        echo -e "  ${GREEN}+skill:${NC} ${skill_name} (built-in)" >&2
+    done
+
+    write_source_manifest "builtin" "skills"
+}
+
+# ── Process global config ────────────────────────────────────────────
+process_global() {
+    [[ ! -f "$GLOBAL_CONFIG" ]] && return
+
+    echo -e "${CYAN}Processing global config${NC}" >&2
+
+    # ── Global presets ──
+    local global_preset_names
+    global_preset_names=$(jq -r '.presets // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        process_preset "$name"
+    done <<< "$global_preset_names"
+
+    # ── Global direct resources (agents, skills, MCP) ──
+    process_resources "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "global" "global" "resources"
+
+    # ── Global projects (top-level, not inside resources) ──
+    local global_project_count
+    global_project_count=$(jq '.projects // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+    if [[ "$global_project_count" -gt 0 ]]; then
+        CURRENT_SOURCE_AGENTS=()
+        CURRENT_SOURCE_SKILLS=()
+        CURRENT_SOURCE_MCP_SERVERS=()
+        CURRENT_SOURCE_ADD_DIRS=()
+        CURRENT_SOURCE_PROJECT_DIRS=()
+
+        for i in $(seq 0 $((global_project_count - 1))); do
+            local proj_path proj_claude_md
+            proj_path=$(jq -r ".projects[$i].path" "$GLOBAL_CONFIG")
+            proj_path=$(expand_path "$proj_path")
+            proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$GLOBAL_CONFIG")
+
+            if [[ ! -d "$proj_path" ]]; then
+                echo -e "  ${YELLOW}Warning: Global project path not found, skipping: ${proj_path}${NC}" >&2
+                continue
+            fi
+
+            CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
+            echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (global)" >&2
+        done
+
+        write_source_manifest "global" "projects"
+    fi
+
+    # ── Global workspaces ──
+    local global_ws_count
+    global_ws_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+    if [[ "$global_ws_count" -gt 0 ]]; then
+        for i in $(seq 0 $((global_ws_count - 1))); do
+            local ws_json
+            ws_json=$(jq -c ".workspaces[$i]" "$GLOBAL_CONFIG")
+            process_workspace_source "$ws_json"
         done
     fi
 }
 
-# ── Process all presets from config ────────────────────────────────
-process_all_presets() {
+# Build orchestrator
+build() {
+    local force="${1:-false}"
+
+    local preset_count ws_count has_resources
+    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
+    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
+
+    local has_builtin_skills=false
+    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
+        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+            [[ -d "$_d" ]] && has_builtin_skills=true && break
+        done
+    fi
+
+    local has_global_config=false
+    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
+
+    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills" != "true" && "$has_global_config" != "true" ]]; then
+        echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
+        return
+    fi
+
+    if [[ "$force" != "true" ]] && ! needs_rebuild; then
+        echo -e "${GREEN}Workspace is up to date. Use --force to rebuild.${NC}" >&2
+        return
+    fi
+
+    echo -e "${BOLD}Building workspace...${NC}" >&2
+
+    # Clean old resources from all sections
+    local old_manifest
+    old_manifest=$(read_manifest)
+    clean_manifest_section "$old_manifest" "builtin"
+    clean_manifest_section "$old_manifest" "global"
+    clean_manifest_section "$old_manifest" "presets"
+    clean_manifest_section "$old_manifest" "workspaces"
+    clean_manifest_section "$old_manifest" "resources"
+
+    # Reset state
+    PROCESSED_PRESETS=()
+    PROCESSED_WORKSPACES=()
+    MANIFEST_JSON='{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
+
+    # Process built-in skills (first — can be overridden by presets/resources)
+    process_builtin_skills
+
+    # Process global config (presets, resources, workspaces)
+    process_global
+
+    # Process presets
     local preset_names
     preset_names=$(jq -r '.presets // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         process_preset "$name"
     done <<< "$preset_names"
+
+    # Process workspaces
+    if [[ "$ws_count" -gt 0 ]]; then
+        for i in $(seq 0 $((ws_count - 1))); do
+            local ws_json
+            ws_json=$(jq -c ".workspaces[$i]" "$CONFIG_FILE")
+            process_workspace_source "$ws_json"
+        done
+    fi
+
+    # Process local resources (last — wins on conflict)
+    process_resources
+
+    # Write manifest and hash
+    echo "$MANIFEST_JSON" | jq '.' > ".compose-manifest.json"
+    compute_build_hash > ".compose-hash"
+
+    # Ensure _warning in .mcp.json
+    if [[ -f ".mcp.json" ]]; then
+        local tmp
+        tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' ".mcp.json")
+        echo "$tmp" > ".mcp.json"
+    fi
+
+    echo "" >&2
+    echo -e "${GREEN}Build complete.${NC}" >&2
+}
+
+# Explicit build subcommand
+cmd_build() {
+    require_jq
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
+        exit 1
+    fi
+
+    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
+        exit 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${BOLD}── Dry Run (build) ──${NC}" >&2
+        echo "" >&2
+
+        local preset_count ws_count has_resources
+        preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+        ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
+        has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
+
+        local has_builtin_skills_dr=false
+        if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
+            for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+                [[ -d "$_d" ]] && has_builtin_skills_dr=true && break
+            done
+        fi
+
+        local has_global_dr=false
+        [[ -f "$GLOBAL_CONFIG" ]] && has_global_dr=true
+
+        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills_dr" != "true" && "$has_global_dr" != "true" ]]; then
+            echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
+            return
+        fi
+
+        if [[ "$has_builtin_skills_dr" == true ]]; then
+            echo -e "${CYAN}Built-in skills:${NC}" >&2
+            for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+                [[ -d "$_d" ]] || continue
+                echo -e "  - $(basename "$_d")" >&2
+            done
+            echo "" >&2
+        fi
+
+        if [[ "$has_global_dr" == true ]]; then
+            echo -e "${CYAN}Global config:${NC} ${GLOBAL_CONFIG}" >&2
+            local gp_count gw_count ghr
+            gp_count=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+            gw_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+            ghr=$(jq 'has("resources") and (.resources | length > 0)' "$GLOBAL_CONFIG" 2>/dev/null || echo false)
+            [[ "$gp_count" -gt 0 ]] && echo "  presets: $gp_count" >&2
+            [[ "$ghr" == "true" ]] && echo "  resources: yes" >&2
+            [[ "$gw_count" -gt 0 ]] && echo "  workspaces: $gw_count" >&2
+            echo "" >&2
+        fi
+
+        if [[ "$preset_count" -gt 0 ]]; then
+            echo -e "${CYAN}Presets to process:${NC}" >&2
+            jq -r '.presets // [] | .[]' "$CONFIG_FILE" | while read -r name; do
+                local preset_dir="$PRESETS_DIR/$name"
+                if [[ -d "$preset_dir" ]]; then
+                    echo -e "  - $name (${preset_dir})" >&2
+                    if [[ -f "$preset_dir/claude-compose.json" ]]; then
+                        local pa ps pm
+                        pa=$(jq '.resources.agents // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                        ps=$(jq '.resources.skills // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                        pm=$(jq '.resources.mcp // {} | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                        [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
+                        [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
+                        [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                    else
+                        echo "    (no claude-compose.json)" >&2
+                    fi
+                    [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
+                else
+                    echo -e "  - $name ${RED}(not found)${NC}" >&2
+                fi
+            done
+            echo "" >&2
+        fi
+
+        if [[ "$ws_count" -gt 0 ]]; then
+            echo -e "${CYAN}Workspaces to sync:${NC}" >&2
+            for i in $(seq 0 $((ws_count - 1))); do
+                local ws_path
+                ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+                local ws_expanded
+                ws_expanded=$(expand_path "$ws_path")
+                if [[ -d "$ws_expanded" ]]; then
+                    echo -e "  - $(basename "$ws_expanded") (${ws_expanded})" >&2
+                else
+                    echo -e "  - $ws_path ${RED}(not found)${NC}" >&2
+                fi
+            done
+            echo "" >&2
+        fi
+
+        if needs_rebuild || [[ "$BUILD_FORCE" == true ]]; then
+            echo -e "${YELLOW}Rebuild needed.${NC}" >&2
+        else
+            echo -e "${GREEN}Workspace is up to date.${NC}" >&2
+        fi
+        echo "" >&2
+        echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
+        return
+    fi
+
+    build "$BUILD_FORCE"
+}
+# ── Migrate Command ─────────────────────────────────────────────────
+cmd_migrate() {
+    require_jq
+
+    if [[ -z "$MIGRATE_PATH" ]]; then
+        echo -e "${RED}Error: Project path required. Usage: claude-compose migrate <project-path>${NC}" >&2
+        exit 1
+    fi
+
+    local project_path
+    project_path=$(expand_path "$MIGRATE_PATH")
+    if [[ ! -d "$project_path" ]]; then
+        echo -e "${RED}Error: Project directory not found: ${project_path}${NC}" >&2
+        exit 1
+    fi
+    # Resolve to absolute path
+    project_path=$(cd "$project_path" && pwd)
+
+    local workspace
+    if [[ -n "$MIGRATE_WORKSPACE" ]]; then
+        workspace=$(expand_path "$MIGRATE_WORKSPACE")
+        mkdir -p "$workspace"
+        workspace=$(cd "$workspace" && pwd)
+    else
+        workspace="$ORIGINAL_CWD"
+    fi
+
+    local project_name
+    project_name=$(basename "$project_path")
+
+    echo -e "${BOLD}Migrating:${NC} ${project_name} → ${workspace}" >&2
+    echo "" >&2
+
+    # Scan project for Claude files
+    local found_something=false
+    local has_mcp=false has_agents=false has_skills=false has_settings=false has_claude_md=false
+
+    [[ -f "$project_path/.mcp.json" ]] && has_mcp=true && found_something=true
+    [[ -d "$project_path/.claude/agents" ]] && ls "$project_path/.claude/agents/"*.md &>/dev/null 2>&1 && has_agents=true && found_something=true
+    [[ -d "$project_path/.claude/skills" ]] && ls -d "$project_path/.claude/skills"/*/ &>/dev/null 2>&1 && has_skills=true && found_something=true
+    [[ -f "$project_path/.claude/settings.local.json" ]] && has_settings=true && found_something=true
+    [[ -f "$project_path/CLAUDE.md" ]] && has_claude_md=true && found_something=true
+
+    if [[ "$found_something" == false ]]; then
+        echo -e "${YELLOW}No Claude configuration files found in ${project_path}${NC}" >&2
+        return
+    fi
+
+    echo -e "${CYAN}Discovered:${NC}" >&2
+    [[ "$has_mcp" == true ]] && echo "  .mcp.json" >&2
+    [[ "$has_agents" == true ]] && echo "  .claude/agents/*.md" >&2
+    [[ "$has_skills" == true ]] && echo "  .claude/skills/*/" >&2
+    [[ "$has_settings" == true ]] && echo "  .claude/settings.local.json" >&2
+    [[ "$has_claude_md" == true ]] && echo "  CLAUDE.md" >&2
+    echo "" >&2
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
+        return
+    fi
+
+    # ── Perform migration ──
+
+    # MCP: merge mcpServers
+    if [[ "$has_mcp" == true ]]; then
+        if [[ -f "$workspace/.mcp.json" ]]; then
+            local tmp
+            tmp=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' \
+                "$workspace/.mcp.json" "$project_path/.mcp.json")
+            echo "$tmp" > "$workspace/.mcp.json"
+            echo -e "${GREEN}Merged:${NC} .mcp.json" >&2
+        else
+            cp "$project_path/.mcp.json" "$workspace/.mcp.json"
+            echo -e "${GREEN}Copied:${NC} .mcp.json" >&2
+        fi
+    fi
+
+    # Agents: copy (warn and skip on conflict)
+    if [[ "$has_agents" == true ]]; then
+        mkdir -p "$workspace/.claude/agents"
+        for agent_file in "$project_path/.claude/agents/"*.md; do
+            [[ -f "$agent_file" ]] || continue
+            local agent_name
+            agent_name=$(basename "$agent_file")
+            if [[ -f "$workspace/.claude/agents/${agent_name}" ]]; then
+                echo -e "${YELLOW}Skip (exists):${NC} .claude/agents/${agent_name}" >&2
+            else
+                cp "$agent_file" "$workspace/.claude/agents/${agent_name}"
+                echo -e "${GREEN}Copied:${NC} .claude/agents/${agent_name}" >&2
+            fi
+        done
+    fi
+
+    # Skills: copy (warn and skip on conflict)
+    if [[ "$has_skills" == true ]]; then
+        mkdir -p "$workspace/.claude/skills"
+        for skill_path in "$project_path/.claude/skills"/*/; do
+            [[ -d "$skill_path" ]] || continue
+            local skill_name
+            skill_name=$(basename "$skill_path")
+            if [[ -d "$workspace/.claude/skills/${skill_name}" ]]; then
+                echo -e "${YELLOW}Skip (exists):${NC} .claude/skills/${skill_name}/" >&2
+            else
+                cp -R "$skill_path" "$workspace/.claude/skills/${skill_name}"
+                echo -e "${GREEN}Copied:${NC} .claude/skills/${skill_name}/" >&2
+            fi
+        done
+    fi
+
+    # Permissions: merge allow arrays (deduplicate)
+    if [[ "$has_settings" == true ]]; then
+        mkdir -p "$workspace/.claude"
+        if [[ -f "$workspace/.claude/settings.local.json" ]]; then
+            local tmp
+            tmp=$(jq -s '
+                .[0] as $a | .[1] as $b |
+                ($a * $b) | .permissions.allow = (($a.permissions.allow // []) + ($b.permissions.allow // []) | unique)
+            ' "$workspace/.claude/settings.local.json" "$project_path/.claude/settings.local.json")
+            echo "$tmp" > "$workspace/.claude/settings.local.json"
+            echo -e "${GREEN}Merged:${NC} .claude/settings.local.json" >&2
+        else
+            cp "$project_path/.claude/settings.local.json" "$workspace/.claude/settings.local.json"
+            echo -e "${GREEN}Copied:${NC} .claude/settings.local.json" >&2
+        fi
+    fi
+
+    # CLAUDE.md: append with separator (check for duplicate marker)
+    if [[ "$has_claude_md" == true ]]; then
+        local marker="# --- Migrated from ${project_name} ---"
+        if [[ -f "$workspace/CLAUDE.md" ]]; then
+            if grep -qF "$marker" "$workspace/CLAUDE.md" 2>/dev/null; then
+                echo -e "${YELLOW}Skip (already migrated):${NC} CLAUDE.md" >&2
+            else
+                {
+                    echo ""
+                    echo "$marker"
+                    echo ""
+                    cat "$project_path/CLAUDE.md"
+                } >> "$workspace/CLAUDE.md"
+                echo -e "${GREEN}Appended:${NC} CLAUDE.md" >&2
+            fi
+        else
+            cp "$project_path/CLAUDE.md" "$workspace/CLAUDE.md"
+            echo -e "${GREEN}Copied:${NC} CLAUDE.md" >&2
+        fi
+    fi
+
+    # Create/update claude-compose.json
+    local config_name
+    config_name=$(basename "$CONFIG_FILE")
+    local config_path="$workspace/$config_name"
+    local rel_path="$MIGRATE_PATH"
+    if [[ -f "$config_path" ]]; then
+        # Check if path already exists
+        local already_exists
+        already_exists=$(jq --arg p "$rel_path" '.projects // [] | map(select(.path == $p)) | length' "$config_path")
+        if [[ "$already_exists" -gt 0 ]]; then
+            echo -e "${YELLOW}Project already in config:${NC} ${rel_path}" >&2
+        else
+            local tmp
+            tmp=$(jq --arg p "$rel_path" '.projects = ((.projects // []) + [{path: $p}])' "$config_path")
+            echo "$tmp" > "$config_path"
+            echo -e "${GREEN}Added to config:${NC} ${rel_path}" >&2
+        fi
+    else
+        jq -n --arg p "$rel_path" '{projects: [{path: $p}]}' > "$config_path"
+        echo -e "${GREEN}Created:${NC} ${CONFIG_FILE}" >&2
+    fi
+
+    # Delete originals if --delete
+    if [[ "$MIGRATE_DELETE" == true ]]; then
+        echo "" >&2
+        echo -e "${CYAN}Removing originals...${NC}" >&2
+        [[ "$has_mcp" == true ]] && rm -f "$project_path/.mcp.json" && echo -e "  ${RED}Deleted:${NC} .mcp.json" >&2
+        [[ "$has_agents" == true ]] && rm -f "$project_path/.claude/agents/"*.md && echo -e "  ${RED}Deleted:${NC} .claude/agents/*.md" >&2
+        [[ "$has_skills" == true ]] && rm -rf "$project_path/.claude/skills" && echo -e "  ${RED}Deleted:${NC} .claude/skills/" >&2
+        [[ "$has_settings" == true ]] && rm -f "$project_path/.claude/settings.local.json" && echo -e "  ${RED}Deleted:${NC} .claude/settings.local.json" >&2
+        [[ "$has_claude_md" == true ]] && rm -f "$project_path/CLAUDE.md" && echo -e "  ${RED}Deleted:${NC} CLAUDE.md" >&2
+    fi
+
+    echo "" >&2
+    echo -e "${GREEN}Migration complete.${NC}" >&2
+}
+
+# ── Copy Command ─────────────────────────────────────────────────────
+cmd_copy() {
+    require_jq
+
+    if [[ -z "$COPY_SOURCE" ]]; then
+        echo -e "${RED}Error: Source workspace required. Usage: claude-compose copy <source> [dest]${NC}" >&2
+        exit 1
+    fi
+
+    local source_path
+    source_path=$(expand_path "$COPY_SOURCE")
+    if [[ ! -d "$source_path" ]]; then
+        echo -e "${RED}Error: Source directory not found: ${source_path}${NC}" >&2
+        exit 1
+    fi
+    source_path=$(cd "$source_path" && pwd)
+
+    local config_name
+    config_name=$(basename "$CONFIG_FILE")
+
+    if [[ ! -f "$source_path/$config_name" ]]; then
+        echo -e "${RED}Error: Source is not a workspace (no ${config_name}): ${source_path}${NC}" >&2
+        exit 1
+    fi
+
+    local dest_path
+    if [[ -n "$COPY_DEST" ]]; then
+        dest_path=$(expand_path "$COPY_DEST")
+    else
+        dest_path="$ORIGINAL_CWD"
+    fi
+
+    echo -e "${BOLD}Copying workspace:${NC} ${source_path} → ${dest_path}" >&2
+    echo "" >&2
+
+    # List what will be copied
+    echo -e "${CYAN}Files to copy:${NC}" >&2
+    echo "  $config_name" >&2
+    [[ -f "$source_path/.mcp.json" ]] && echo "  .mcp.json" >&2
+    [[ -d "$source_path/.claude/agents" ]] && echo "  .claude/agents/" >&2
+    [[ -d "$source_path/.claude/skills" ]] && echo "  .claude/skills/" >&2
+    [[ -f "$source_path/.claude/settings.local.json" ]] && echo "  .claude/settings.local.json" >&2
+    [[ -f "$source_path/CLAUDE.md" ]] && echo "  CLAUDE.md" >&2
+    echo "" >&2
+    echo -e "${CYAN}NOT copied (will rebuild):${NC}" >&2
+    echo "  .compose-manifest.json" >&2
+    echo "  .compose-hash" >&2
+    echo "" >&2
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
+        return
+    fi
+
+    # Create dest and copy
+    mkdir -p "$dest_path"
+
+    cp "$source_path/$config_name" "$dest_path/$config_name"
+    [[ -f "$source_path/.mcp.json" ]] && cp "$source_path/.mcp.json" "$dest_path/.mcp.json"
+    [[ -f "$source_path/CLAUDE.md" ]] && cp "$source_path/CLAUDE.md" "$dest_path/CLAUDE.md"
+
+    if [[ -d "$source_path/.claude/agents" ]]; then
+        mkdir -p "$dest_path/.claude/agents"
+        cp "$source_path/.claude/agents/"*.md "$dest_path/.claude/agents/" 2>/dev/null || true
+    fi
+    if [[ -d "$source_path/.claude/skills" ]]; then
+        mkdir -p "$dest_path/.claude/skills"
+        cp -R "$source_path/.claude/skills/"* "$dest_path/.claude/skills/" 2>/dev/null || true
+    fi
+    if [[ -f "$source_path/.claude/settings.local.json" ]]; then
+        mkdir -p "$dest_path/.claude"
+        cp "$source_path/.claude/settings.local.json" "$dest_path/.claude/settings.local.json"
+    fi
+
+    echo -e "${GREEN}Workspace copied.${NC}" >&2
+    echo "" >&2
+
+    # Launch Claude with compose-config for customization
+    require_claude
+    echo -e "${CYAN}Launching Claude for customization...${NC}" >&2
+    local prompt
+    prompt=$(compose_config_prompt "$dest_path/$config_name")
+    (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+}
+
+# ── Instructions Command ─────────────────────────────────────────────
+cmd_instructions() {
+    require_jq
+
+    local config_file="${CONFIG_FILE:-claude-compose.json}"
+    if [[ ! -f "$config_file" ]]; then
+        echo "No claude-compose.json found. Create one with: claude-compose config"
+        return
+    fi
+
+    # Build dynamic workspace summary
+    local summary=""
+    local project_count preset_count ws_count
+    project_count=$(jq '.projects // [] | length' "$config_file")
+    preset_count=$(jq '.presets // [] | length' "$config_file")
+    ws_count=$(jq '.workspaces // [] | length' "$config_file")
+    local agent_count skill_count mcp_count env_count
+    agent_count=$(jq '.resources.agents // [] | length' "$config_file")
+    skill_count=$(jq '.resources.skills // [] | length' "$config_file")
+    mcp_count=$(jq '.resources.mcp // {} | length' "$config_file")
+    env_count=$(jq '.resources.env_files // [] | length' "$config_file")
+
+    summary="## Current workspace"$'\n'
+    summary+="- Projects: $project_count"$'\n'
+    if [[ "$preset_count" -gt 0 ]]; then
+        local preset_names
+        preset_names=$(jq -r '.presets // [] | join(", ")' "$config_file")
+        summary+="- Presets: $preset_names"$'\n'
+    fi
+    if [[ "$ws_count" -gt 0 ]]; then
+        summary+="- Workspaces: $ws_count"$'\n'
+    fi
+    summary+="- Local resources: $agent_count agents, $skill_count skills, $mcp_count MCP servers, $env_count env files"
+
+    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 ]]; then
+        summary+=$'\n'$'\n'"External resources are synced from presets/workspaces. Agents and skills"
+        summary+=" are symlinked from source directories. MCP servers are merged into .mcp.json"
+        summary+=" with env var prefixes to prevent conflicts."
+    fi
+
+    # Output prompt template with interpolated summary
+    local prompt
+    prompt=$(compose_instructions_prompt "$summary")
+    echo "$prompt"
 }
 
 # ── Subcommand: config ───────────────────────────────────────────────
@@ -856,7 +1931,7 @@ cmd_config() {
         fi
         local tmp
         tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        if ! jq -n --arg p "$CONFIG_PATH" '{projects: [{path: $p}]}' > "$tmp"; then
+        if ! jq -n --arg p "$CONFIG_PATH" --arg n "$(basename "$CONFIG_PATH")" '{projects: [{path: $p, name: $n}]}' > "$tmp"; then
             rm -f "$tmp"
             echo -e "${RED}Error: Failed to create config${NC}" >&2
             exit 1
@@ -866,31 +1941,440 @@ cmd_config() {
         return
     fi
 
-    # Interactive: launch Claude with compose-config skill
+    # Interactive: launch Claude with compose-config prompt
     require_claude
 
-    # Validate existing config JSON (but don't block if file is absent — skill handles create mode)
+    # Validate existing config JSON (but don't block if file is absent — prompt handles create mode)
     if [[ -f "$CONFIG_FILE" ]] && ! jq empty "$CONFIG_FILE" 2>/dev/null; then
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
         exit 1
     fi
 
-    # Informational message about mode
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${CYAN}Config not found. Entering create mode.${NC}" >&2
     fi
 
-    create_temp_session_dir
-    trap cleanup_temp_session EXIT
-    write_compose_skills "$CONFIG_FILE"
-
-    cd "$SESSION_DIR"
-    claude "/compose-config"
+    local prompt
+    prompt=$(compose_config_prompt "$CONFIG_FILE")
+    claude --system-prompt "$prompt" -p "do it"
 }
 
+# ── Embedded built-in skills ────────────────────────────────────────
+# Skills are embedded at build time and extracted to ~/.claude-compose/skills/
+# on first run or when the version changes.
+
+# Marker for Makefile injection — generates extract_embedded_skills() function
+extract_embedded_skills() {
+    local dest="$1"
+    mkdir -p "$dest/compose-init"
+    printf '%s' "LS0tCm5hbWU6IGNvbXBvc2UtaW5pdApkZXNjcmlwdGlvbjogSW5pdGlhbGl6ZSBDTEFVREUubWQgZm9yIGFsbCBwcm9qZWN0cyBhbmQgdGhlIHdvcmtzcGFjZS4gUnVucyAvaW5pdCBpbiBlYWNoIHByb2plY3QgdmlhIHBhcmFsbGVsIGFnZW50cywgdGhlbiBnZW5lcmF0ZXMgYSBjcm9zcy1wcm9qZWN0IHdvcmtzcGFjZSBDTEFVREUubWQuCi0tLQoKIyBjb21wb3NlLWluaXQg4oCUIEluaXRpYWxpemUgd29ya3NwYWNlIGFuZCBwcm9qZWN0IENMQVVERS5tZCBmaWxlcwoKIyMgT3ZlcnZpZXcKClRoaXMgc2tpbGwgaW5pdGlhbGl6ZXMgQ0xBVURFLm1kIGZpbGVzIGFjcm9zcyB0aGUgZW50aXJlIGNvbXBvc2Ugd29ya3NwYWNlOgotIEZvciBlYWNoIHByb2plY3Qg4oCUIHZpYSBgL2luaXRgIChkZWxlZ2F0ZWQgdG8gcGFyYWxsZWwgYWdlbnRzKQotIEZvciB0aGUgd29ya3NwYWNlIGl0c2VsZiDigJQgYSBjcm9zcy1wcm9qZWN0IENMQVVERS5tZCBzeW50aGVzaXplZCBmcm9tIHByb2plY3QgY29udGV4dAoKIyMgUGhhc2UgMTogR2F0aGVyIHdvcmtzcGFjZSBjb250ZXh0CgoxLiBSdW4gYGNsYXVkZS1jb21wb3NlIGluc3RydWN0aW9uc2AgYW5kIHJlYWQgdGhlIG91dHB1dCB0byB1bmRlcnN0YW5kIHdvcmtzcGFjZSBzdHJ1Y3R1cmUgYW5kIHdoYXQgaXMgbWFuYWdlZCBieSBidWlsZC4KCjIuIFJlYWQgYGNsYXVkZS1jb21wb3NlLmpzb25gIHRvIGdldCB0aGUgZXhhY3QgbGlzdCBvZiBwcm9qZWN0czoKICAgYGBgYmFzaAogICBqcSAtciAnLnByb2plY3RzW10gfCAiXCgubmFtZSkg4oaSIFwoLnBhdGgpIicgY2xhdWRlLWNvbXBvc2UuanNvbgogICBgYGAKICAgUmVjb3JkIGVhY2ggcHJvamVjdCdzIGBuYW1lYCAoYWxpYXMgZm9yIGBuYW1lOi8vYCByZWZlcmVuY2VzKSBhbmQgYHBhdGhgLgoKMy4gQ2hlY2sgd2hpY2ggcHJvamVjdHMgYWxyZWFkeSBoYXZlIENMQVVERS5tZDoKICAgYGBgYmFzaAogICAjIEZvciBlYWNoIHByb2plY3QgcGF0aDoKICAgdGVzdCAtZiA8cHJvamVjdF9wYXRoPi9DTEFVREUubWQgJiYgZWNobyAiZXhpc3RzIiB8fCBlY2hvICJtaXNzaW5nIgogICBgYGAKCjQuIENoZWNrIGlmIHRoZSB3b3Jrc3BhY2UgYWxyZWFkeSBoYXMgQ0xBVURFLm1kOgogICBgYGBiYXNoCiAgIHRlc3QgLWYgQ0xBVURFLm1kICYmIGVjaG8gImV4aXN0cyIgfHwgZWNobyAibWlzc2luZyIKICAgYGBgCgojIyBQaGFzZSAyOiBJbml0aWFsaXplIHByb2plY3RzIChwYXJhbGxlbCBhZ2VudHMpCgpGb3IgZWFjaCAqKmRpcmVjdCBwcm9qZWN0KiogKGZyb20gYHByb2plY3RzW11gIGluIGNvbmZpZykgdGhhdCBkb2VzICoqTk9UKiogaGF2ZSBhIENMQVVERS5tZCwgbGF1bmNoIGFuIEFnZW50IGluIHBhcmFsbGVsOgoKYGBgCkFnZW50IHByb21wdDogIkdvIHRvIGRpcmVjdG9yeSA8cHJvamVjdF9wYXRoPi4gVGhpcyBwcm9qZWN0IGlzIGNhbGxlZCAnPHByb2plY3RfbmFtZT4nLgpSdW4gL2luaXQgdG8gaW5pdGlhbGl6ZSBDTEFVREUubWQgZm9yIHRoaXMgcHJvamVjdC4gV29yayBhdXRvbm9tb3VzbHkg4oCUIGRvIG5vdCBhc2sgdGhlIHVzZXIgcXVlc3Rpb25zLCBhbnN3ZXIgL2luaXQgcHJvbXB0cyBiYXNlZCBvbiB0aGUgcHJvamVjdCdzIGNvZGUgYW5kIHN0cnVjdHVyZS4KRG8gbm90IG1vZGlmeSBhbnkgZXhpc3RpbmcgZmlsZXMgb3RoZXIgdGhhbiBjcmVhdGluZyBDTEFVREUubWQuIgpgYGAKClJ1bGVzOgotIExhdW5jaCBhbGwgYWdlbnRzICoqaW4gcGFyYWxsZWwqKiDigJQgb25lIHBlciBwcm9qZWN0Ci0gKipTa2lwKiogcHJvamVjdHMgdGhhdCBhbHJlYWR5IGhhdmUgQ0xBVURFLm1kCi0gKipEbyBOT1QgaW5pdGlhbGl6ZSoqIHByb2plY3RzIGZyb20gY29ubmVjdGVkIHdvcmtzcGFjZXMg4oCUIHRob3NlIGJlbG9uZyB0byBvdGhlciB3b3Jrc3BhY2VzCi0gSWYgQUxMIHByb2plY3RzIGFscmVhZHkgaGF2ZSBDTEFVREUubWQsIHNraXAgdGhpcyBwaGFzZSBlbnRpcmVseSBhbmQgdGVsbCB0aGUgdXNlcgoKV2FpdCBmb3IgYWxsIGFnZW50cyB0byBjb21wbGV0ZSBiZWZvcmUgcHJvY2VlZGluZy4KCiMjIFBoYXNlIDM6IEdlbmVyYXRlIHdvcmtzcGFjZSBDTEFVREUubWQKCiMjIyAzLjAg4oCUIENoZWNrIGV4aXN0aW5nIHdvcmtzcGFjZSBDTEFVREUubWQKCklmIHdvcmtzcGFjZSBDTEFVREUubWQgYWxyZWFkeSBleGlzdHM6Ci0gUmVhZCBpdCBhbmQgc2hvdyB0aGUgY3VycmVudCBjb250ZW50IHRvIHRoZSB1c2VyCi0gQXNrOiAiV29ya3NwYWNlIENMQVVERS5tZCBhbHJlYWR5IGV4aXN0cy4gRG8geW91IHdhbnQgdG8gdXBkYXRlIGl0IG9yIHNraXA/IgotIElmIHVzZXIgY2hvb3NlcyB0byBza2lwIOKAlCBnbyBkaXJlY3RseSB0byBQaGFzZSA0Ci0gSWYgdXNlciBjaG9vc2VzIHRvIHVwZGF0ZSDigJQgY29udGludWUgd2l0aCAzLjEsIHVzaW5nIGV4aXN0aW5nIGNvbnRlbnQgYXMgYmFzZWxpbmUKCiMjIyAzLjEg4oCUIFJlYWQgcHJvamVjdCBjb250ZXh0CgpSZWFkIGV2ZXJ5IHByb2plY3QncyBDTEFVREUubWQgKGJvdGggbmV3bHkgY3JlYXRlZCBhbmQgcHJlLWV4aXN0aW5nKSB0byB1bmRlcnN0YW5kOgotIFdoYXQgZWFjaCBwcm9qZWN0IGRvZXMKLSBUZWNoIHN0YWNrIGFuZCBidWlsZCBjb21tYW5kcwotIEFyY2hpdGVjdHVyZSBwYXR0ZXJucwoKQWxzbyByZWFkIENMQVVERS5tZCBmcm9tIGNvbm5lY3RlZCB3b3Jrc3BhY2VzIChmcm9tIGB3b3Jrc3BhY2VzW11gIGluIGNvbmZpZykgZm9yIGFkZGl0aW9uYWwgY29udGV4dCDigJQgYnV0IGRvIE5PVCBtb2RpZnkgdGhlbS4KCiMjIyAzLjIg4oCUIEFzayB0aGUgdXNlciAoc3RydWN0dXJlZCBmb3JtKQoKVXNlIHRoZSBBc2tVc2VyUXVlc3Rpb24gdG9vbCB0byBjb2xsZWN0IHdvcmtzcGFjZSBjb250ZXh0LiBBc2sgYWxsIHF1ZXN0aW9ucyBpbiBhIHNpbmdsZSBzdHJ1Y3R1cmVkIGZvcm06CgpgYGAKUHJvamVjdCBDTEFVREUubWQgZmlsZXMgYXJlIHJlYWR5LiBUbyBnZW5lcmF0ZSB0aGUgd29ya3NwYWNlIENMQVVERS5tZCwgSSBuZWVkIHNvbWUgY29udGV4dDoKCjEuICoqV29ya3NwYWNlIHB1cnBvc2UqKiDigJQgV2h5IGRvZXMgdGhpcyB3b3Jrc3BhY2UgZXhpc3Q/IFdoYXQgcHJvYmxlbSBkb2VzIHRoZSBjb21iaW5hdGlvbiBvZiBwcm9qZWN0cyBzb2x2ZT8KCjIuICoqUHJvamVjdCByZWxhdGlvbnNoaXBzKiog4oCUIEhvdyBhcmUgdGhlIHByb2plY3RzIGNvbm5lY3RlZD8gKGUuZy4sICJwcm9qZWN0LWEgaXMgdGhlIGFwcCwgcHJvamVjdC1iIGlzIGl0cyBTREsiLCAicHJvamVjdC1jIGlzIGEgcmVmZXJlbmNlL2RvY3Mgd29ya3NwYWNlIikKCjMuICoqQ3Jvc3MtcHJvamVjdCBydWxlcyoqIOKAlCBBbnkgY29udmVudGlvbnMgdGhhdCBtdXN0IGFwcGx5IGFjcm9zcyBBTEwgcHJvamVjdHM/IChlLmcuLCBjb2Rpbmcgc3R5bGUsIGxhbmd1YWdlLCBuYW1pbmcgcGF0dGVybnMpLiBMZWF2ZSBibGFuayBpZiBub25lLgoKNC4gKipDb21tb24gd29ya2Zsb3dzKiog4oCUIFR5cGljYWwgbXVsdGktcHJvamVjdCBzY2VuYXJpb3M/IChlLmcuLCAid2hlbiBjaGFuZ2luZyBBUEkgaW4gWCwgdXBkYXRlIHR5cGVzIGluIFkiKS4gTGVhdmUgYmxhbmsgaWYgbm9uZS4KYGBgCgpXYWl0IGZvciB0aGUgYW5zd2VyIGJlZm9yZSBwcm9jZWVkaW5nLgoKIyMjIDMuMyDigJQgR2VuZXJhdGUgd29ya3NwYWNlIENMQVVERS5tZAoKV3JpdGUgYENMQVVERS5tZGAgaW4gdGhlIHdvcmtzcGFjZSByb290LiAqKklNUE9SVEFOVCBydWxlczoqKgoKKipMYW5ndWFnZToqKiBBbHdheXMgd3JpdGUgaW4gRW5nbGlzaCwgcmVnYXJkbGVzcyBvZiB0aGUgdXNlcidzIGxhbmd1YWdlLiBUcmFuc2xhdGUgdXNlcidzIGFuc3dlcnMgaWYgbmVlZGVkLgoKKipQcm9qZWN0IHJlZmVyZW5jZXM6KiogVXNlIHRoZSBgbmFtZTovL2AgYWxpYXMgc3lzdGVtLCBOT1QgYWJzb2x1dGUgcGF0aHMuIEVhY2ggcHJvamVjdCBoYXMgYSBgbmFtZWAgZmllbGQgaW4gYGNsYXVkZS1jb21wb3NlLmpzb25gIOKAlCB1c2UgaXQgYXMgYG5hbWU6Ly9wYXRoL3RvL2ZpbGVgIHRvIHJlZmVyZW5jZSBmaWxlcy4gV2hlbiByZWZlcnJpbmcgdG8gYSBwcm9qZWN0IGl0c2VsZiwgdXNlIGl0cyBhbGlhcyBuYW1lLiBFeGFtcGxlOiB3cml0ZSAibGV0dGVybHkiIGFuZCBgbGV0dGVybHk6Ly9Tb3VyY2VzL0FwcC9tYWluLnN3aWZ0YCwgbm90IGAvVXNlcnMvdXNlci9Db2RlL0xldHRlcmx5L1NvdXJjZXMvQXBwL21haW4uc3dpZnRgLgoKKipTdHJ1Y3R1cmU6KioKCmBgYG1hcmtkb3duCiMgQ0xBVURFLm1kCgojIyBXb3Jrc3BhY2UgUHVycG9zZQo8V2h5IHRoaXMgd29ya3NwYWNlIGV4aXN0cy4gV2hhdCBwcm9ibGVtIHRoZSBjb21iaW5hdGlvbiBvZiBwcm9qZWN0cyBzb2x2ZXMuPgoKIyMgUHJvamVjdHMKPEZvciBlYWNoIERJUkVDVCBwcm9qZWN0IChmcm9tIHByb2plY3RzW10gaW4gY29uZmlnKTogYWxpYXMgKyBvbmUtbGluZSBkZXNjcmlwdGlvbi4KSG93IHByb2plY3RzIHJlbGF0ZSB0byBlYWNoIG90aGVyLiBVc2UgYWxpYXNlcyBvbmx5IOKAlCBubyBhYnNvbHV0ZSBwYXRocy4+CgojIyBDb25uZWN0ZWQgV29ya3NwYWNlcwo8Rm9yIGVhY2ggY29ubmVjdGVkIHdvcmtzcGFjZSAoZnJvbSB3b3Jrc3BhY2VzW10gaW4gY29uZmlnKTogbmFtZSArIHdoeSBpdCdzIGNvbm5lY3RlZC4KV2hhdCBjb250ZXh0IGl0IHByb3ZpZGVzLiBUaGlzIHNlY3Rpb24gaXMgU0VQQVJBVEUgZnJvbSBQcm9qZWN0cy4KT25seSBpbmNsdWRlIGlmIHRoZXJlIGFyZSBjb25uZWN0ZWQgd29ya3NwYWNlcy4+CgojIyBDcm9zcy1Qcm9qZWN0IFJ1bGVzCjxDb252ZW50aW9ucyB0aGF0IGFwcGx5IGFjcm9zcyBBTEwgcHJvamVjdHMgaW4gdGhpcyB3b3Jrc3BhY2UuPgoKIyMgV29ya2Zsb3dzCjxDb21tb24gbXVsdGktcHJvamVjdCBzY2VuYXJpb3MuPgpgYGAKCioqQ29udGVudCBydWxlczoqKgotICoqRG8gTk9UIGR1cGxpY2F0ZSoqIGluZm9ybWF0aW9uIGFscmVhZHkgaW4gcHJvamVjdCBDTEFVREUubWQgZmlsZXMg4oCUIHJlZmVyZW5jZSBwcm9qZWN0cyBieSBhbGlhcyBpbnN0ZWFkCi0gKipPbWl0IGVtcHR5IHNlY3Rpb25zKiog4oCUIGlmIHRoZXJlIGFyZSBubyBjcm9zcy1wcm9qZWN0IHJ1bGVzLCBkb24ndCBpbmNsdWRlIHRoYXQgc2VjdGlvbgotICoqS2VlcCBpdCBjb25jaXNlKiog4oCUIHdvcmtzcGFjZSBDTEFVREUubWQgc2hvdWxkIGJlIHNob3J0IGFuZCBmb2N1c2VkIG9uIGNyb3NzLXByb2plY3QgY29udGV4dAotICoqTm8gYm9pbGVycGxhdGUqKiDigJQgc2tpcCBnZW5lcmljIGFkdmljZSBsaWtlICJmb2xsb3cgYmVzdCBwcmFjdGljZXMiCi0gKipObyBhYnNvbHV0ZSBwYXRocyoqIOKAlCB1c2UgYG5hbWU6Ly9gIGFsaWFzZXMgKGUuZy4gYG15YXBwOi8vc3JjL2ZpbGUudHNgKQoKIyMjIDMuNCDigJQgQ29uZmlybSBiZWZvcmUgd3JpdGluZwoKU2hvdyB0aGUgZ2VuZXJhdGVkIENMQVVERS5tZCB0byB0aGUgdXNlciBhbmQgYXNrIGZvciBjb25maXJtYXRpb24gYmVmb3JlIHdyaXRpbmcgdGhlIGZpbGUuCgojIyBQaGFzZSA0OiBTdW1tYXJ5CgpBZnRlciBjb21wbGV0aW9uLCBzaG93OgoKYGBgCldvcmtzcGFjZSBpbml0aWFsaXplZDoKICAtIFByb2plY3RzIHdpdGggbmV3IENMQVVERS5tZDogPGxpc3Qgb3IgIm5vbmUiPgogIC0gUHJvamVjdHMgYWxyZWFkeSBoYWQgQ0xBVURFLm1kOiA8bGlzdCBvciAibm9uZSI+CiAgLSBXb3Jrc3BhY2UgQ0xBVURFLm1kOiA8Y3JlYXRlZCAvIHVwZGF0ZWQgLyBza2lwcGVkPgpgYGAKCiMjIFJ1bGVzCgotICoqTmV2ZXIgb3ZlcndyaXRlKiogZXhpc3RpbmcgQ0xBVURFLm1kIGZpbGVzIHdpdGhvdXQgZXhwbGljaXQgdXNlciBwZXJtaXNzaW9uCi0gKipXb3Jrc3BhY2UgQ0xBVURFLm1kIGdvZXMgaW4gdGhlIHdvcmtzcGFjZSByb290Kiog4oCUIG5vdCBpbnNpZGUgYC5jbGF1ZGUvYCBvciBhbnkgcHJvamVjdCBkaXJlY3RvcnkKLSAqKlByb2plY3QgQ0xBVURFLm1kIHN0YXlzIGluIHRoZSBwcm9qZWN0IGRpcmVjdG9yeSoqIOKAlCB0aGUgd29ya3NwYWNlIGRvZXMgbm90IG1hbmFnZSBpdCBhZnRlciBjcmVhdGlvbgotICoqRG8gTk9UIHRvdWNoIHByb2plY3RzIGZyb20gY29ubmVjdGVkIHdvcmtzcGFjZXMqKiDigJQgb25seSByZWFkIHRoZWlyIENMQVVERS5tZCBmb3IgY29udGV4dAotICoqQWx3YXlzIHdyaXRlIENMQVVERS5tZCBjb250ZW50IGluIEVuZ2xpc2gqKiDigJQgdHJhbnNsYXRlIHVzZXIgaW5wdXQgaWYgbmVlZGVkCi0gKipBbHdheXMgdXNlIHByb2plY3QgYWxpYXNlcyoqIOKAlCBuZXZlciBoYXJkY29kZSBhYnNvbHV0ZSBwYXRocyBpbiBDTEFVREUubWQKLSBJZiBgY2xhdWRlLWNvbXBvc2UgaW5zdHJ1Y3Rpb25zYCBmYWlscyBvciBubyBwcm9qZWN0cyBhcmUgY29uZmlndXJlZCwgdGVsbCB0aGUgdXNlciB0byBydW4gYGNsYXVkZS1jb21wb3NlIGNvbmZpZ2AgZmlyc3QK" | base64 --decode > "$dest/compose-init/SKILL.md"
+}
+
+ensure_builtin_skills() {
+    local version_file="$BUILTIN_SKILLS_DIR/.version"
+
+    # Skip if already up to date
+    if [[ -f "$version_file" ]] && [[ "$(cat "$version_file")" == "$VERSION" ]]; then
+        return
+    fi
+
+    mkdir -p "$BUILTIN_SKILLS_DIR"
+    extract_embedded_skills "$BUILTIN_SKILLS_DIR"
+    echo "$VERSION" > "$version_file"
+}
+
+# ── Prompt functions ─────────────────────────────────────────────────
+
+compose_config_prompt() {
+    local config_file="$1"
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
+# compose-config — Create or manage claude-compose workspace config
+
+Config file: `__CONFIG_FILE__`__CONFIG_DEFAULT__
+
+## Workspace Model (v2.0)
+
+claude-compose uses a **workspace** model: the workspace directory contains all Claude configuration (MCP servers, agents, skills, permissions, CLAUDE.md). External projects provide only file access via `--add-dir`.
+
+## Config schema
+
+Top-level fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `projects` | array | `[]` | List of external projects for file access |
+| `workspaces` | array | `[]` | Other workspaces to sync config from |
+| `presets` | string[] | `[]` | Preset names to activate |
+
+Each project in the `projects` array:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | **required** | Path to external project directory |
+| `name` | string | **required** | Short alias for the project (used as `name://` file reference prefix) |
+| `claude_md` | boolean | `true` | Load CLAUDE.md from project |
+
+Projects provide file access via `--add-dir` — nothing else. MCP servers, agents, skills, and permissions are managed directly in the workspace, via presets, or synced from other workspaces.
+
+## Workspaces (cross-sync)
+
+Sync MCP servers, agents, and skills from other workspaces at build time:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | **required** | Path to source workspace |
+| `mcp.include` | string[] | `["*"]` | MCP servers to include (glob) |
+| `mcp.exclude` | string[] | `[]` | MCP servers to exclude |
+| `mcp.rename` | object | `{}` | Rename MCP servers: `{"old": "new"}` |
+| `agents.include` | string[] | `["*"]` | Agents to include |
+| `agents.exclude` | string[] | `[]` | Agents to exclude |
+| `agents.rename` | object | `{}` | Rename agents |
+| `skills.include` | string[] | `["*"]` | Skills to include |
+| `skills.exclude` | string[] | `[]` | Skills to exclude |
+| `claude_md` | boolean | `true` | Load CLAUDE.md from source workspace |
+
+Source workspace's own projects (from its `claude-compose.json`) are transitively added via `--add-dir`.
+
+## Presets
+
+Presets are reusable sets of Claude resources stored globally at `~/.claude-compose/presets/<name>/`. Each preset uses a `claude-compose.json` file with the same format as a workspace config — resources are declared explicitly via paths.
+
+### Preset directory structure
+
+```
+~/.claude-compose/presets/<name>/
+├── claude-compose.json    # required — resource declarations
+├── agents/                # agent .md files
+├── skills/                # skill directories
+├── CLAUDE.md              # optional — loaded via --add-dir
+└── .env.json              # optional — env vars for MCP prefixing
+```
+
+### Preset claude-compose.json schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `resources.agents` | string[] | `[]` | Relative paths to agent .md files |
+| `resources.skills` | string[] | `[]` | Relative paths to skill directories |
+| `resources.mcp` | object | `{}` | MCP server configs (same format as workspace) |
+| `resources.env_files` | string[] | `[]` | Env files for MCP variable substitution |
+| `claude_md` | boolean | `true` | Load CLAUDE.md from preset |
+| `presets` | string[] | `[]` | Nested preset names (recursive) |
+| `projects` | array | `[]` | External projects (`path` + optional `name`, `claude_md`) |
+
+MCP servers from presets get env var prefixing to prevent cross-source conflicts.
+
+### Preset management operations
+
+- **Create preset**: Set up `claude-compose.json` and resource files in `~/.claude-compose/presets/<name>/`
+- **List presets**: Scan `~/.claude-compose/presets/` and show contents summary
+- **Delete preset**: Remove the preset directory
+- **Edit preset**: Modify `claude-compose.json` or resource files in the preset directory
+
+## Simplification rules — IMPORTANT
+
+When writing config, **omit any field that equals its default**:
+- `claude_md: true` → omit
+- `name` is **required** — always include it, never omit
+- A minimal project entry is `{"path": "~/path", "name": "alias"}`
+
+## Mode detection
+
+Check if `__CONFIG_FILE__` exists:
+- **File does not exist** → **Create mode**
+- **File exists** → **Edit mode**
+
+## Create mode
+
+1. **Ask** for project paths. For each path:
+   a. Verify directory exists (warn if not, but allow — user may set up later)
+   b. Reject if a project path resolves to the workspace directory (the current working directory)
+
+2. Ask if user wants to add another project or finish.
+
+3. **Write config** using bash + jq for proper JSON formatting:
+   ```bash
+   tmp=$(mktemp "__CONFIG_FILE__.XXXXXX")
+   echo '<json>' | jq '.' > "$tmp" && mv "$tmp" "__CONFIG_FILE__"
+   ```
+   Apply simplification rules before writing.
+
+4. **Show summary**: number of projects, key settings.
+
+## Edit mode
+
+1. **Read** `__CONFIG_FILE__` and show summary:
+   - Project paths
+   - claude_md toggle (only show if non-default)
+   - Active presets
+
+2. **Ask** what to do:
+   - **Add** a new project
+   - **Edit** a project (change path or claude_md toggle)
+   - **Remove** a project
+   - **Manage presets** — add/remove preset names in config
+   - **Manage workspaces** — add/remove/edit workspace entries (path or scan, with filters)
+   - **Done** — finish
+
+3. After each operation, show updated config state and ask for next action.
+
+4. **Write** changes atomically:
+   ```bash
+   tmp=$(mktemp "__CONFIG_FILE__.XXXXXX")
+   echo '<json>' | jq '.' > "$tmp" && mv "$tmp" "__CONFIG_FILE__"
+   ```
+
+## After finishing
+
+Show the user how to launch and manage:
+
+```
+Ready to launch:
+  claude-compose__CONFIG_F_FLAG__
+
+Build presets:
+  claude-compose build__CONFIG_F_FLAG__
+
+Validate:
+  claude-compose config --check__CONFIG_F_FLAG__
+```
+
+If presets were added/changed, suggest running `claude-compose build`.
+
+## Rules
+- Keep `~` in paths as-is (claude-compose expands at runtime)
+- Always validate JSON with `jq` before writing
+- Reject project paths that resolve to the current working directory
+- Do NOT create the config if user adds zero projects (create mode)
+- Do NOT modify or delete the config if user made no changes (edit mode)
+- When showing current state, read the file fresh each time (edit mode)
+PROMPT_EOF
+    # Interpolate placeholders
+    local default_marker f_flag
+    if [[ "$config_file" == "claude-compose.json" ]]; then
+        default_marker=" (default)"; f_flag=""
+    else
+        default_marker=""; f_flag=" -f ${config_file}"
+    fi
+    prompt="${prompt//__CONFIG_FILE__/$config_file}"
+    prompt="${prompt//__CONFIG_DEFAULT__/$default_marker}"
+    prompt="${prompt//__CONFIG_F_FLAG__/$f_flag}"
+    echo "$prompt"
+}
+
+compose_system_prompt() {
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
+# This session was launched via claude-compose
+The current directory is a **workspace** — the central place for all Claude Code configuration. Projects are external codebases that provide file access only.
+
+## Where to create and modify files
+- **Claude configuration** (CLAUDE.md, agents, skills, settings, etc.) belongs in the workspace — never inside a project directory, even when a slash command (e.g. `/init`) or skill prompt implies otherwise.
+- **Project files** (source code, configs, tests, docs) belong in the project's own directory. Never create project files in the workspace.
+- Some workspace files are **managed by build** (symlinks, generated configs). Before editing anything under `.claude/` or `.mcp.json`, run `claude-compose instructions` to check what is safe to edit and what will be overwritten.
+
+Examples: creating CLAUDE.md → workspace. Adding an agent → workspace. Writing a new source file or test → inside the project's directory.
+PROMPT_EOF
+    echo "$prompt"
+}
+
+compose_instructions_prompt() {
+    local workspace_summary="$1"
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
+# claude-compose workspace guide
+
+claude-compose is a multi-project workspace launcher (like Docker Compose for Claude Code). It creates a unified working environment where you can work across multiple codebases simultaneously.
+
+## Key concepts
+
+**Workspace directory** — the current working directory. It may contain its own code, or serve purely as a launch point for working with external projects. All Claude configuration (.claude/, .mcp.json, agents, skills, permissions) lives here and is managed by claude-compose.
+
+**Projects** — external codebases added via `--add-dir`. They provide file access (read/write) and optionally their CLAUDE.md instructions. Projects are listed in `claude-compose.json` and referenced by aliases (e.g., `myapp://src/main.ts`).
+
+**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose.json` with explicit `resources` declarations (same format as workspace). Activated by name in config.
+
+**Workspaces** — other claude-compose workspaces that can share their configuration (MCP servers, agents, skills) into this one at build time.
+
+**Build** — the process of syncing resources from presets/workspaces/local config into the workspace's `.claude/` directory and `.mcp.json`. Runs automatically at launch when changes are detected.
+
+**Global config** — `~/.claude-compose/global.json` is an optional file with the same schema as `claude-compose.json`. It is auto-applied to **all** workspaces. Useful for presets, MCP servers, agents, or skills you always want available. Paths in `resources` resolve relative to `~/.claude-compose/`. Build priority: built-in → **global** → workspace presets → workspace workspaces → local resources. Global env files are loaded without prefix; local env files with the same keys override them.
+
+## Working with a compose workspace
+
+### Do NOT edit directly
+- `.claude/agents/` and `.claude/skills/` contain **symlinks** managed by build — do not create or modify files there directly
+- `.mcp.json` is **generated** at build time — manual edits will be overwritten
+- `.compose-manifest.json` and `.compose-hash` are internal state files
+
+### How to add resources
+
+**Agents:** Create agent `.md` files in the workspace (e.g., `agents/my-agent.md`), then add the path to `resources.agents` in `claude-compose.json`:
+```json
+"resources": { "agents": ["agents/my-agent.md"] }
+```
+
+**Skills:** Create skill directories in the workspace (e.g., `skills/my-skill/`), then add the path to `resources.skills`:
+```json
+"resources": { "skills": ["skills/my-skill"] }
+```
+
+**MCP Servers:** Add server config to `resources.mcp`:
+```json
+"resources": { "mcp": { "my-server": { "command": "npx", "args": ["..."] } } }
+```
+For secrets, use `${VAR}` references and add values to env files.
+
+**Environment variables / Secrets:** Create a JSON env file (e.g., `.env.secrets.json`) and add to `resources.env_files`:
+```json
+"resources": { "env_files": [".env.json", ".env.secrets.json"] }
+```
+Format: `{"KEY": "value"}`. Variables are loaded at launch. Add secret files to `.gitignore`.
+
+After any change, run `claude-compose build` to apply (or relaunch — build runs automatically).
+
+### Global config (`~/.claude-compose/global.json`)
+
+Same schema as `claude-compose.json`. Applied automatically to all workspaces, no opt-out.
+
+```json
+{
+  "presets": ["my-tools"],
+  "resources": {
+    "agents": ["agents/my-agent.md"],
+    "skills": ["skills/my-skill"],
+    "mcp": { "server-name": { "command": "..." } },
+    "env_files": [".env.json"]
+  },
+  "workspaces": [{ "path": "~/shared-workspace" }],
+  "projects": [{ "path": "~/common-lib", "name": "common" }]
+}
+```
+
+### Config schema (claude-compose.json)
+
+```json
+{
+  "resources": {
+    "agents": ["agents/reviewer.md"],
+    "skills": ["skills/commit"],
+    "mcp": { "server-name": { "command": "...", "args": ["..."] } },
+    "env_files": [".env.json"]
+  },
+  "projects": [
+    { "path": "~/Code/my-app", "name": "myapp" },
+    { "path": "~/Code/my-lib", "name": "mylib", "claude_md": false }
+  ],
+  "workspaces": [
+    { "path": "~/workspaces/shared", "mcp": { "rename": { "cal": "shared-cal" } } }
+  ],
+  "presets": ["my-tools", "common-agents"]
+}
+```
+
+- `projects[].path` — path to external project (required)
+- `projects[].name` — alias for file references (required)
+- `projects[].claude_md` — load CLAUDE.md from project (default: `true`)
+- Omit fields that equal their defaults
+
+### Best practices
+
+1. **Workspace CLAUDE.md** — put cross-project instructions here, not in individual project CLAUDE.md files. This is the right place for workflow rules, conventions, and context that spans multiple projects.
+
+2. **Keep config minimal** — omit default values (`claude_md: true`), use short aliases. A minimal project entry is `{"path": "~/path", "name": "alias"}`.
+
+3. **Use env files for secrets** — never hardcode API keys in `claude-compose.json` or `.mcp.json`. Use `${VAR}` references in MCP configs and provide values in `.env.secrets.json` (gitignored).
+
+4. **Presets for reuse** — if you use the same MCP servers or agents across multiple workspaces, create a preset instead of duplicating config.
+
+5. **Build is idempotent** — running `claude-compose build` multiple times is safe. It uses content hashing to detect changes and only rebuilds when needed.
+
+6. **Validate before launch** — use `claude-compose config --check` or `claude-compose --dry-run` to verify config without launching.
+
+### CLI reference
+
+```
+claude-compose                        # launch workspace
+claude-compose build [--force]        # build/rebuild resources
+claude-compose config                 # create or edit config interactively
+claude-compose config -y ~/path       # quick-create config with one project
+claude-compose config --check         # validate config
+claude-compose migrate ~/project      # import config from existing project
+claude-compose copy ~/ws/src ~/ws/dst # clone workspace
+claude-compose instructions           # show this guide
+claude-compose --dry-run              # preview without mutations
+claude-compose -- -p "prompt"         # pass args through to claude
+```
+
+__WORKSPACE_SUMMARY__
+PROMPT_EOF
+    prompt="${prompt//__WORKSPACE_SUMMARY__/$workspace_summary}"
+    echo "$prompt"
+}
+
+compose_fix_prompt() {
+    local config_file="$1"
+    local error_msg="$2"
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
+# compose-fix — Fix claude-compose config problem
+
+Config file: `__CONFIG_FILE__`
+
+## Problem detected
+
+```
+__ERROR__
+```
+
+## Your task
+
+Read the config file, understand the problem, propose a fix, confirm with the user, and apply it.
+
+## Steps
+
+1. **Read** the current config:
+   ```bash
+   cat __CONFIG_FILE__
+   ```
+
+2. **Explain** the problem in plain language, referencing the specific entries that need fixing.
+
+3. **Propose** the corrected JSON entries. Show the updated section.
+
+4. **Confirm** with the user before writing.
+
+5. **Apply** atomically:
+   ```bash
+   tmp=$(mktemp __CONFIG_FILE__.XXXXXX)
+   echo '<updated json>' | jq '.' > "$tmp" && mv "$tmp" __CONFIG_FILE__
+   ```
+   If `jq` fails, remove `$tmp` and report the error.
+
+6. **Verify** by reading the file again and confirming the relevant sections look correct.
+
+7. **Tell** the user they can now re-run `claude-compose` to launch.
+
+## Rules
+
+- Use `jq` to parse and produce all JSON — never sed or string concatenation.
+- Atomic writes only: `mktemp` + `mv`.
+- Keep `~` in paths as-is (claude-compose expands them at runtime).
+- Fix only what the problem describes. Do not change unrelated fields.
+- If the user wants additional changes, make them after fixing the reported problem.
+- If `__CONFIG_FILE__` does not exist, tell the user and suggest running `claude-compose config`.
+PROMPT_EOF
+    prompt="${prompt//__CONFIG_FILE__/$config_file}"
+    prompt="${prompt//__ERROR__/$error_msg}"
+    echo "$prompt"
+}
 # ── Main ─────────────────────────────────────────────────────────────
 main() {
     parse_args "$@"
+
+    # Ensure built-in skills are extracted
+    ensure_builtin_skills
 
     # Resolve CONFIG_FILE to absolute path (before any cd)
     local config_dir
@@ -902,59 +2386,140 @@ main() {
     # Dispatch subcommands before validate (they have own validation)
     case "$SUBCOMMAND" in
         config) cmd_config; return ;;
+        build) cmd_build; return ;;
+        migrate) cmd_migrate; return ;;
+        copy) cmd_copy; return ;;
+        instructions) cmd_instructions; return ;;
     esac
 
     validate
 
     echo -e "${BOLD}claude-compose${NC} v${VERSION}" >&2
     echo -e "Config: ${CONFIG_FILE}" >&2
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        echo -e "Global: ${GLOBAL_CONFIG}" >&2
+    fi
     echo "" >&2
 
     # Read project and preset counts
-    local project_count preset_count
+    local project_count preset_count ws_count has_resources
     project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
     preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
+    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 ]]; then
-        echo -e "${YELLOW}No projects or presets defined in config. Launching plain claude.${NC}" >&2
+    local has_global_config=false
+    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
+
+    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]]; then
+        echo -e "${YELLOW}No projects, presets, workspaces, or resources defined in config. Launching plain claude.${NC}" >&2
         claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         return
     fi
 
-    # Process presets first (lower priority — projects override on conflicts)
-    process_all_presets
-
-    # Process each project
-    if [[ "$project_count" -gt 0 ]]; then
-        for i in $(seq 0 $((project_count - 1))); do
-            local project_json
-            project_json=$(jq -c ".projects[$i]" "$CONFIG_FILE")
-            process_project "$project_json"
+    # Auto-build from presets/workspaces/resources/built-in skills if needed
+    local has_builtin_skills=false
+    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
+        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+            [[ -d "$_d" ]] && has_builtin_skills=true && break
         done
     fi
 
-    echo "" >&2
+    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_builtin_skills" == "true" || "$has_global_config" == "true" ]]; then
+        if needs_rebuild; then
+            build "false"
+        fi
+    fi
 
-    # ── Build final command ──
+    # Load global env files (no prefix, before local so local wins)
+    load_global_env_files
+    # Load env files from resources.env_files (local)
+    load_env_files
+    # Load env files from external sources with prefixed keys
+    load_all_source_env_files
 
-    # Counts for display
-    local mcp_server_count
-    mcp_server_count=$(echo "$MERGED_MCP" | jq 'length')
-    local perm_count
-    perm_count=$(echo "$MERGED_PERMISSIONS" | jq 'length')
+    # Collect --add-dir args from projects
+    local project_aliases=""
+    if [[ "$project_count" -gt 0 ]]; then
+        for i in $(seq 0 $((project_count - 1))); do
+            local raw_path project_path claude_md project_name
+            raw_path=$(jq -r ".projects[$i].path" "$CONFIG_FILE")
+            project_path=$(expand_path "$raw_path")
+            claude_md=$(jq -r ".projects[$i].claude_md // true" "$CONFIG_FILE")
+            project_name=$(jq -r ".projects[$i].name // empty" "$CONFIG_FILE")
 
-    # include_root: add original CWD as --add-dir
-    local include_root
-    include_root=$(jq -r '.include_root // true' "$CONFIG_FILE")
-    if [[ "$include_root" == "true" ]]; then
-        CLAUDE_ARGS+=("--add-dir" "$ORIGINAL_CWD")
-        NEED_CLAUDE_MD_ENV=true
+            if [[ ! -d "$project_path" ]]; then
+                echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
+                continue
+            fi
+
+            CLAUDE_ARGS+=("--add-dir" "$project_path")
+            echo -e "${CYAN}Project:${NC} $(basename "$project_path") (${project_path})" >&2
+
+            if [[ "$claude_md" == "true" ]]; then
+                NEED_CLAUDE_MD_ENV=true
+            fi
+
+            if [[ -n "$project_name" ]]; then
+                project_aliases+="- ${project_name}: ${project_path}"$'\n'
+            fi
+        done
+    fi
+
+    # Build system prompt — always injected when compose is active
+    local system_prompt
+    system_prompt=$(compose_system_prompt)
+
+    if [[ -n "$project_aliases" ]]; then
+        system_prompt+=$'\n'"Projects in this workspace:"$'\n'"${project_aliases%$'\n'}"
+        system_prompt+=$'\n'"Use name:// to reference files in a project (e.g. project://path/to/file)."
+    fi
+
+    CLAUDE_ARGS+=("--append-system-prompt" "$system_prompt")
+
+    # Add --add-dir from manifest (global + presets + workspaces + resources: add_dirs and project_dirs)
+    if [[ -f ".compose-manifest.json" ]]; then
+        local section
+        for section in global presets workspaces resources; do
+            local source_names
+            source_names=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
+            while IFS= read -r sname; do
+                [[ -z "$sname" ]] && continue
+
+                # add_dirs: preset/workspace dirs for CLAUDE.md
+                local add_dirs
+                add_dirs=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].add_dirs // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r dir; do
+                    [[ -z "$dir" ]] && continue
+                    CLAUDE_ARGS+=("--add-dir" "$dir")
+                    NEED_CLAUDE_MD_ENV=true
+                done <<< "$add_dirs"
+
+                # project_dirs: transitive projects
+                local proj_dirs
+                proj_dirs=$(jq -c --arg s "$section" --arg n "$sname" '.[$s][$n].project_dirs // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r proj_entry; do
+                    [[ -z "$proj_entry" ]] && continue
+                    local proj_path proj_cmd
+                    proj_path=$(echo "$proj_entry" | jq -r '.path')
+                    proj_cmd=$(echo "$proj_entry" | jq -r '.claude_md')
+                    if [[ -d "$proj_path" ]]; then
+                        CLAUDE_ARGS+=("--add-dir" "$proj_path")
+                        if [[ "$proj_cmd" == "true" ]]; then
+                            NEED_CLAUDE_MD_ENV=true
+                        fi
+                    fi
+                done <<< "$proj_dirs"
+            done <<< "$source_names"
+        done
     fi
 
     # Extra args
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
         CLAUDE_ARGS+=("${EXTRA_ARGS[@]}")
     fi
+
+    echo "" >&2
 
     # ── Dry run ──
     if [[ "$DRY_RUN" == true ]]; then
@@ -969,9 +2534,94 @@ main() {
             echo "" >&2
         fi
 
-        echo -e "${CYAN}Session directory:${NC}" >&2
-        echo "  ~/.claude-compose/sessions/<config-hash>/" >&2
-        echo "" >&2
+        if [[ "$ws_count" -gt 0 ]]; then
+            echo -e "${CYAN}Active workspaces:${NC}" >&2
+            for i in $(seq 0 $((ws_count - 1))); do
+                local ws_path
+                ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+                echo "  - $ws_path" >&2
+            done
+            echo "" >&2
+        fi
+
+        if [[ -f "$GLOBAL_CONFIG" ]]; then
+            echo -e "${CYAN}Global config:${NC} ${GLOBAL_CONFIG}" >&2
+            echo "" >&2
+        fi
+
+        if [[ -f ".compose-manifest.json" ]]; then
+            local has_resources=false
+            local section
+            for section in global presets workspaces resources; do
+                local section_keys
+                section_keys=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r skey; do
+                    [[ -z "$skey" ]] && continue
+                    has_resources=true
+                done <<< "$section_keys"
+            done
+            if [[ "$has_resources" == true ]]; then
+                echo -e "${CYAN}Synced resources (from manifest):${NC}" >&2
+                for section in global presets workspaces resources; do
+                    jq -r --arg s "$section" '.[$s] // {} | to_entries[] | (
+                        (.value.agents // [] | map("  agent: " + .)),
+                        (.value.skills // [] | map("  skill: " + .)),
+                        (.value.mcp_servers // [] | map("  mcp: " + .)),
+                        (.value.add_dirs // [] | map("  add_dir: " + .))
+                    ) | .[]' ".compose-manifest.json" 2>/dev/null | while read -r line; do
+                        echo "  $line" >&2
+                    done
+                done
+                echo "" >&2
+            fi
+        fi
+
+        if [[ -n "${project_aliases:-}" ]]; then
+            echo -e "${CYAN}Project aliases (--append-system-prompt):${NC}" >&2
+            while IFS= read -r alias_line; do
+                [[ -n "$alias_line" ]] && echo "  $alias_line" >&2
+            done <<< "${project_aliases%$'\n'}"
+            echo "" >&2
+        fi
+
+        # Show env files info
+        local env_files_list
+        env_files_list=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+        if [[ -n "$env_files_list" ]]; then
+            echo -e "${CYAN}Env files:${NC}" >&2
+            while IFS= read -r ef; do
+                [[ -z "$ef" ]] && continue
+                local ef_abs="$PWD/$ef"
+                if [[ -f "$ef_abs" ]]; then
+                    local vc
+                    vc=$(jq 'length' "$ef_abs" 2>/dev/null || echo "?")
+                    echo "  $ef ($vc vars)" >&2
+                else
+                    echo "  $ef (not found)" >&2
+                fi
+            done <<< "$env_files_list"
+            echo "" >&2
+        fi
+
+        if [[ -f "$GLOBAL_CONFIG" ]]; then
+            local global_env_list
+            global_env_list=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+            if [[ -n "$global_env_list" ]]; then
+                echo -e "${CYAN}Global env files:${NC}" >&2
+                while IFS= read -r ef; do
+                    [[ -z "$ef" ]] && continue
+                    local ef_abs="$GLOBAL_CONFIG_DIR/$ef"
+                    if [[ -f "$ef_abs" ]]; then
+                        local vc
+                        vc=$(jq 'length' "$ef_abs" 2>/dev/null || echo "?")
+                        echo "  $ef ($vc vars)" >&2
+                    else
+                        echo "  $ef (not found)" >&2
+                    fi
+                done <<< "$global_env_list"
+                echo "" >&2
+            fi
+        fi
 
         if [[ "$NEED_CLAUDE_MD_ENV" == true ]]; then
             echo -e "${CYAN}Environment:${NC}" >&2
@@ -979,110 +2629,27 @@ main() {
             echo "" >&2
         fi
 
-        if [[ "$mcp_server_count" -gt 0 ]]; then
-            echo -e "${CYAN}MCP servers → .mcp.json:${NC}" >&2
-            echo "$MERGED_MCP" | jq -r 'keys[]' | while read -r name; do
-                echo "  - $name" >&2
-            done
-            echo "" >&2
-        fi
-
-        if [[ ${#SKILLS_TO_COPY[@]} -gt 0 ]]; then
-            echo -e "${CYAN}Skills → .claude/skills/:${NC}" >&2
-            for entry in "${SKILLS_TO_COPY[@]}"; do
-                local skill_name="${entry#*|}"
-                echo "  - $skill_name" >&2
-            done
-            echo "" >&2
-        fi
-
-        if [[ ${#AGENTS_TO_COPY[@]} -gt 0 ]]; then
-            echo -e "${CYAN}Agents → .claude/agents/:${NC}" >&2
-            for entry in "${AGENTS_TO_COPY[@]}"; do
-                local agent_name="${entry#*|}"
-                echo "  - ${agent_name}.md" >&2
-            done
-            echo "" >&2
-        fi
-
-        echo -e "${CYAN}Settings → .claude/settings.local.json:${NC}" >&2
-        if [[ "$perm_count" -gt 0 ]]; then
-            echo "  Allow:" >&2
-            echo "$MERGED_PERMISSIONS" | jq -r '.[]' | while read -r p; do
-                echo "    - $p" >&2
-            done
-        fi
-        echo "  Deny:" >&2
-        echo "    - Edit(<session-dir>/**)" >&2
-        echo "    - Write(<session-dir>/**)" >&2
-        echo "" >&2
-
         echo -e "${CYAN}Directories (--add-dir):${NC}" >&2
-        if [[ "$include_root" == "true" ]]; then
-            echo "  - $ORIGINAL_CWD (root)" >&2
-        fi
         for arg_idx in $(seq 0 $((${#CLAUDE_ARGS[@]} - 1))); do
             if [[ "${CLAUDE_ARGS[$arg_idx]}" == "--add-dir" && "$arg_idx" -lt $((${#CLAUDE_ARGS[@]} - 1)) ]]; then
                 local dir_val="${CLAUDE_ARGS[$((arg_idx + 1))]}"
-                if [[ "$dir_val" != "$ORIGINAL_CWD" ]]; then
-                    echo "  - $dir_val" >&2
-                fi
+                echo "  - $dir_val" >&2
             fi
         done
         echo "" >&2
 
-        echo -e "${CYAN}Compose skills (in-session):${NC}" >&2
-        echo "  - /compose-config" >&2
+        # Show workspace config files
+        echo -e "${CYAN}Workspace files:${NC}" >&2
+        [[ -f ".mcp.json" ]] && echo "  .mcp.json ($(jq '.mcpServers | length' .mcp.json 2>/dev/null || echo 0) servers)" >&2
+        [[ -d ".claude/agents" ]] && echo "  .claude/agents/ ($(find .claude/agents -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ') agents)" >&2
+        [[ -d ".claude/skills" ]] && echo "  .claude/skills/ ($(find .claude/skills -maxdepth 1 -mindepth 1 \( -type d -o -type l \) 2>/dev/null | wc -l | tr -d ' ') skills)" >&2
+        [[ -f ".claude/settings.local.json" ]] && echo "  .claude/settings.local.json" >&2
+        [[ -f "CLAUDE.md" ]] && echo "  CLAUDE.md" >&2
         echo "" >&2
 
         echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
         return
     fi
-
-    # Create stable session directory, check for conflicts, register early
-    create_session_dir
-    if ! check_session_state; then
-        return 1
-    fi
-    register_session
-    trap unregister_session EXIT
-
-    # ── Apply mutations (write to session dir) ──
-
-    # Write MCP config
-    if [[ "$mcp_server_count" -gt 0 ]]; then
-        echo "$MERGED_MCP" | jq --arg home "$HOME" \
-            '{mcpServers: .} | walk(if type == "string" then gsub("\\$\\{HOME\\}"; $home) | gsub("^~(?=/|$)"; $home) else . end)' \
-            > "$SESSION_DIR/.mcp.json"
-    fi
-
-    # Copy skills
-    if [[ ${#SKILLS_TO_COPY[@]} -gt 0 ]]; then
-        for entry in "${SKILLS_TO_COPY[@]}"; do
-            local src="${entry%|*}"
-            local skill_name="${entry#*|}"
-            local dest="$SESSION_DIR/.claude/skills/${skill_name}"
-            cp -R "$src" "$dest"
-            echo -e "${GREEN}Copied skill:${NC} $skill_name" >&2
-        done
-    fi
-
-    # Copy agents
-    if [[ ${#AGENTS_TO_COPY[@]} -gt 0 ]]; then
-        for entry in "${AGENTS_TO_COPY[@]}"; do
-            local src="${entry%|*}"
-            local agent_name="${entry#*|}"
-            local dest="$SESSION_DIR/.claude/agents/${agent_name}.md"
-            cp "$src" "$dest"
-            echo -e "${GREEN}Copied agent:${NC} $agent_name" >&2
-        done
-    fi
-
-    # Write compose management skills (available in-session)
-    write_compose_skills "$CONFIG_FILE"
-
-    # Write session settings (permissions + deny rules)
-    write_session_settings
 
     # ── Launch ──
     echo -e "${BOLD}Launching claude...${NC}" >&2
@@ -1092,7 +2659,6 @@ main() {
         export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
     fi
 
-    cd "$SESSION_DIR"
     claude "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
 }
 
