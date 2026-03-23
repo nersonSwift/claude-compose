@@ -492,6 +492,40 @@ cmd_update() {
     fi
 }
 
+# ── Doctor Command ─────────────────────────────────────────────────────
+cmd_doctor() {
+    require_jq
+    require_claude
+    launch_doctor ""
+}
+
+# ── Start Command ──────────────────────────────────────────────────────
+cmd_start() {
+    require_claude
+
+    local root_path=""
+    if [[ -n "$START_PATH" ]]; then
+        root_path=$(expand_path "$START_PATH")
+        if [[ ! -d "$root_path" ]]; then
+            echo -e "${RED}Error: Directory not found: ${root_path}${NC}" >&2
+            exit 1
+        fi
+        root_path=$(cd "$root_path" && pwd)
+    fi
+
+    local prompt
+    prompt=$(compose_start_prompt "$root_path")
+
+    echo -e "${BOLD}claude-compose start${NC} — Onboarding wizard" >&2
+    echo "" >&2
+
+    if [[ -n "$root_path" ]]; then
+        (cd "$root_path" && claude --system-prompt "$prompt")
+    else
+        claude --system-prompt "$prompt"
+    fi
+}
+
 # ── Registries Command ─────────────────────────────────────────────────
 cmd_registries() {
     require_jq

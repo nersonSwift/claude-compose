@@ -3,8 +3,7 @@
 # ── Git dependency check ──────────────────────────────────────────────
 require_git() {
     if ! command -v git &>/dev/null; then
-        echo -e "${RED}Error: git is required for GitHub presets but not installed.${NC}" >&2
-        exit 1
+        die_doctor "git is required for GitHub presets but not installed. Install: brew install git / apt install git"
     fi
 }
 
@@ -397,7 +396,7 @@ resolve_github_version() {
     if [[ "$spec_type" == "exact" && -n "$locked_version" ]]; then
         # Ensure clone exists
         if ! registry_has_clone "$owner" "$repo" "$locked_version"; then
-            registry_clone_version "$owner" "$repo" "$locked_tag" || exit 1
+            registry_clone_version "$owner" "$repo" "$locked_tag" || die_doctor "Failed to clone ${owner}/${repo}@${locked_tag}"
         fi
         echo "$locked_version" "$locked_tag"
         return
@@ -420,7 +419,7 @@ resolve_github_version() {
             return
         fi
         echo -e "${RED}Error: Tag v${exact_ver} not found in ${owner}/${repo}${NC}" >&2
-        exit 1
+        die_doctor "Tag v${exact_ver} not found in ${owner}/${repo}. Check the version spec in your config."
     fi
 
     # Non-exact spec: skip network check if within update interval
@@ -454,7 +453,7 @@ resolve_github_version() {
 
             # Clone if needed
             if ! registry_has_clone "$owner" "$repo" "$best_version"; then
-                registry_clone_version "$owner" "$repo" "$best_tag" || exit 1
+                registry_clone_version "$owner" "$repo" "$best_tag" || die_doctor "Failed to clone ${owner}/${repo}@${best_tag}"
             fi
 
             lock_write "$source_key" "$best_version" "$best_tag" "$spec_str"
@@ -467,7 +466,7 @@ resolve_github_version() {
                 echo "$locked_version" "$locked_tag"
                 return
             fi
-            exit 1
+            die_doctor "No matching tag for spec '${spec_str}' in ${owner}/${repo}. Check version spec in config."
         fi
     else
         # Network failure
@@ -475,12 +474,11 @@ resolve_github_version() {
             echo -e "  ${YELLOW}Network unavailable, using locked version:${NC} ${owner}/${repo}@${locked_version}" >&2
             if ! registry_has_clone "$owner" "$repo" "$locked_version"; then
                 echo -e "${RED}Error: Locked version ${locked_version} not available locally${NC}" >&2
-                exit 1
+                die_doctor "Locked version ${locked_version} of ${owner}/${repo} not available locally and network is unavailable"
             fi
             echo "$locked_version" "$locked_tag"
             return
         fi
-        echo -e "${RED}Error: Cannot fetch tags from ${owner}/${repo} (network unavailable) and no locked version${NC}" >&2
-        exit 1
+        die_doctor "Cannot fetch tags from ${owner}/${repo} (network unavailable) and no locked version exists"
     fi
 }

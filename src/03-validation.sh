@@ -26,9 +26,11 @@ validate() {
     fi
 
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$CONFIG_FILE" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
-        jq empty "$CONFIG_FILE" 2>&1 | head -5 >&2
-        exit 1
+        echo "$json_err" >&2
+        die_doctor "Invalid JSON in ${CONFIG_FILE}: ${json_err}"
     fi
 
     local semantic_error
@@ -38,13 +40,7 @@ validate() {
         if [[ "$DRY_RUN" == true ]]; then
             exit 1
         fi
-        echo -e "${YELLOW}Launching Claude to fix the config...${NC}" >&2
-        local ws_dir
-        ws_dir=$(dirname "$CONFIG_FILE")
-        local prompt
-        prompt=$(compose_fix_prompt "$CONFIG_FILE" "$semantic_error")
-        (cd "$ws_dir" && claude --system-prompt "$prompt" -p "do it")
-        exit 0
+        die_doctor "Config validation error: ${semantic_error}"
     fi
 }
 
@@ -181,6 +177,7 @@ validate_config_semantics() {
     if [[ "$presets_type" == "array" ]]; then
         local preset_count_v
         preset_count_v=$(jq '.presets | length' "$config_file")
+        if [[ "$preset_count_v" -gt 0 ]]; then
         local i
         for i in $(seq 0 $((preset_count_v - 1))); do
             local entry_type
@@ -263,6 +260,7 @@ validate_config_semantics() {
                     ;;
             esac
         done
+        fi
     fi
 }
 
@@ -270,15 +268,17 @@ validate_global_config() {
     [[ ! -f "$GLOBAL_CONFIG" ]] && return
 
     if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$GLOBAL_CONFIG" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in global config: ${GLOBAL_CONFIG}${NC}" >&2
-        jq empty "$GLOBAL_CONFIG" 2>&1 | head -5 >&2
-        exit 1
+        echo "$json_err" >&2
+        die_doctor "Invalid JSON in global config ${GLOBAL_CONFIG}: ${json_err}"
     fi
 
     local semantic_error
     semantic_error=$(validate_config_semantics "$GLOBAL_CONFIG")
     if [[ -n "$semantic_error" ]]; then
         echo -e "${RED}Global config error (${GLOBAL_CONFIG}): ${semantic_error}${NC}" >&2
-        exit 1
+        die_doctor "Global config error: ${semantic_error}"
     fi
 }

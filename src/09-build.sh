@@ -14,7 +14,7 @@ process_preset() {
     local preset_dir="$PRESETS_DIR/$preset_name"
     if [[ ! -d "$preset_dir" ]]; then
         echo -e "${RED}Error: Preset not found: ${preset_name} (~/.claude-compose/presets/${preset_name}/)${NC}" >&2
-        exit 1
+        die_doctor "Preset not found: ${preset_name} (expected at ~/.claude-compose/presets/${preset_name}/)"
     fi
 
     local preset_config="$preset_dir/claude-compose.json"
@@ -490,7 +490,7 @@ process_github_preset() {
 
     if [[ ! -d "$preset_dir" ]]; then
         echo -e "${RED}Error: Preset directory not found in registry: ${preset_dir}${NC}" >&2
-        exit 1
+        die_doctor "Preset directory not found in registry: ${preset_dir}. Try running: claude-compose update"
     fi
 
     local preset_config="$preset_dir/claude-compose.json"
@@ -714,12 +714,14 @@ cmd_build() {
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
-        exit 1
+        die_doctor "Config file not found: ${CONFIG_FILE}"
     fi
 
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$CONFIG_FILE" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
-        exit 1
+        die_doctor "Invalid JSON in ${CONFIG_FILE}: ${json_err}"
     fi
 
     if [[ "$DRY_RUN" == true ]]; then

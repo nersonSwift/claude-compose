@@ -25,10 +25,16 @@ MIGRATE_WORKSPACE=""    # --workspace flag for migrate
 MIGRATE_PATH=""         # positional arg for migrate
 COPY_SOURCE=""          # positional arg for copy
 COPY_DEST=""            # positional arg for copy
+UPDATE_SOURCE=""        # optional positional arg for update
+START_PATH=""            # positional arg for start
+DOCTOR_ERROR_MSG=""      # Error message for doctor mode
+DOCTOR_ENABLED=true      # false prevents doctor trap (when claude/jq missing)
 PRESETS_DIR="$HOME/.claude-compose/presets"
 BUILTIN_SKILLS_DIR="$HOME/.claude-compose/skills"
 GLOBAL_CONFIG="$HOME/.claude-compose/global.json"
 GLOBAL_CONFIG_DIR="$HOME/.claude-compose"
+REGISTRIES_DIR="$HOME/.claude-compose/registries"
+LOCK_FILE=""            # Set at runtime: "${CONFIG_FILE%.json}.lock.json"
 PROCESSED_PRESETS=()    # cycle detection set
 PROCESSED_WORKSPACES=() # workspace dedup (absolute paths)
 
@@ -39,6 +45,8 @@ CURRENT_SOURCE_SKILLS=()
 CURRENT_SOURCE_MCP_SERVERS=()
 CURRENT_SOURCE_ADD_DIRS=()
 CURRENT_SOURCE_PROJECT_DIRS=()
+CURRENT_PRESET_PREFIX=""
+CURRENT_PRESET_RENAME='{}'
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -57,14 +65,22 @@ usage() {
     echo "  claude-compose config [-y <path>] [--check] [-f <file>]"
     echo "  claude-compose migrate <project-path> [--delete] [--workspace <path>]"
     echo "  claude-compose copy <source-workspace> [dest-path]"
+    echo "  claude-compose update [source]"
+    echo "  claude-compose registries"
     echo "  claude-compose instructions"
+    echo "  claude-compose doctor"
+    echo "  claude-compose start [root-path]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
     echo "  build         Build workspace from presets/workspaces/resources (auto on launch)"
     echo "  config        Create or manage claude-compose.json config"
     echo "  migrate       Copy Claude config from a project into this workspace"
     echo "  copy          Clone a workspace to a new location"
+    echo "  update        Check and apply updates for GitHub presets"
+    echo "  registries    List configured GitHub presets and their status"
     echo "  instructions  Show instructions for managing workspace resources"
+    echo "  doctor        Diagnose and fix compose problems"
+    echo "  start         Onboarding wizard — scan for projects and create workspaces"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
@@ -84,6 +100,8 @@ usage() {
     echo "  claude-compose config -y ~/Code/app         # Quick create with defaults"
     echo "  claude-compose migrate ~/Code/app           # Import config from project"
     echo "  claude-compose copy ~/ws/main ~/ws/feature  # Clone workspace"
+    echo "  claude-compose doctor                        # Diagnose problems"
+    echo "  claude-compose start ~/Code                  # Onboarding wizard"
     echo "  claude-compose --dry-run                    # Preview mode"
     echo "  claude-compose -- -p \"explain arch\"         # Pass args to claude"
 }
@@ -145,7 +163,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions)
+            config|build|migrate|copy|instructions|update|registries|doctor|start)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -230,6 +248,24 @@ parse_args() {
                             exit 1
                         fi
                         ;;
+                    update)
+                        if [[ -z "$UPDATE_SOURCE" && "$1" != -* ]]; then
+                            UPDATE_SOURCE="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    start)
+                        if [[ -z "$START_PATH" && "$1" != -* ]]; then
+                            START_PATH="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
                     *)
                         echo -e "${RED}Unknown option: $1${NC}" >&2
                         usage >&2
@@ -274,6 +310,8 @@ require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
         echo "  Install: brew install jq" >&2
+        # shellcheck disable=SC2034
+        DOCTOR_ENABLED=false
         exit 1
     fi
 }
@@ -281,13 +319,60 @@ require_jq() {
 require_claude() {
     if ! command -v claude &>/dev/null; then
         echo -e "${RED}Error: claude CLI not found in PATH.${NC}" >&2
+        # shellcheck disable=SC2034
+        DOCTOR_ENABLED=false
         exit 1
+    fi
+}
+
+# ── Doctor helpers ──────────────────────────────────────────────────
+die_doctor() {
+    DOCTOR_ERROR_MSG="${1:-Unknown error}"
+    exit 1
+}
+
+launch_doctor() {
+    local error_msg="$1"
+    local config_file="${CONFIG_FILE:-claude-compose.json}"
+    local ws_dir
+    ws_dir="$(dirname "$config_file")"
+
+    local prompt
+    prompt=$(compose_doctor_prompt "$config_file" "$ws_dir" "$error_msg")
+
+    echo -e "${YELLOW}Launching doctor...${NC}" >&2
+
+    if [[ -n "$error_msg" ]]; then
+        (cd "$ws_dir" && claude --system-prompt "$prompt" "fix it")
+    else
+        (cd "$ws_dir" && claude --system-prompt "$prompt")
+    fi
+}
+
+_doctor_trap() {
+    local exit_code=$?
+    # Remove trap to prevent recursion
+    trap - EXIT
+    local was_enabled="$DOCTOR_ENABLED"
+    # shellcheck disable=SC2034
+    DOCTOR_ENABLED=false
+
+    if [[ "$was_enabled" == true && "$exit_code" -ne 0 && -n "$DOCTOR_ERROR_MSG" && "$DRY_RUN" != true ]]; then
+        launch_doctor "$DOCTOR_ERROR_MSG"
     fi
 }
 # ── Validate workspace ──────────────────────────────────────────────
 validate() {
     require_jq
     require_claude
+
+    # Check git availability if github presets are configured
+    if [[ -f "$CONFIG_FILE" ]] && has_github_presets "$CONFIG_FILE"; then
+        require_git
+    fi
+    if [[ -f "$GLOBAL_CONFIG" ]] && has_github_presets "$GLOBAL_CONFIG"; then
+        require_git
+    fi
 
     # Validate global config first (before workspace config check)
     validate_global_config
@@ -304,9 +389,11 @@ validate() {
     fi
 
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$CONFIG_FILE" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
-        jq empty "$CONFIG_FILE" 2>&1 | head -5 >&2
-        exit 1
+        echo "$json_err" >&2
+        die_doctor "Invalid JSON in ${CONFIG_FILE}: ${json_err}"
     fi
 
     local semantic_error
@@ -316,13 +403,7 @@ validate() {
         if [[ "$DRY_RUN" == true ]]; then
             exit 1
         fi
-        echo -e "${YELLOW}Launching Claude to fix the config...${NC}" >&2
-        local ws_dir
-        ws_dir=$(dirname "$CONFIG_FILE")
-        local prompt
-        prompt=$(compose_fix_prompt "$CONFIG_FILE" "$semantic_error")
-        (cd "$ws_dir" && claude --system-prompt "$prompt" -p "do it")
-        exit 0
+        die_doctor "Config validation error: ${semantic_error}"
     fi
 }
 
@@ -339,97 +420,209 @@ validate_config_semantics() {
     local project_count
     project_count=$(jq '.projects // [] | length' "$config_file")
 
-    [[ "$project_count" -eq 0 ]] && return
-    local missing=()
-    for i in $(seq 0 $((project_count - 1))); do
-        local name
-        name=$(jq -r ".projects[$i].name // empty" "$config_file")
-        if [[ -z "$name" ]]; then
-            local path
-            path=$(jq -r ".projects[$i].path // \"(unknown)\"" "$config_file")
-            missing+=("projects[$i] (${path})")
-        fi
-    done
+    if [[ "$project_count" -gt 0 ]]; then
+        local missing=()
+        for i in $(seq 0 $((project_count - 1))); do
+            local name
+            name=$(jq -r ".projects[$i].name // empty" "$config_file")
+            if [[ -z "$name" ]]; then
+                local path
+                path=$(jq -r ".projects[$i].path // \"(unknown)\"" "$config_file")
+                missing+=("projects[$i] (${path})")
+            fi
+        done
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        local joined
-        joined=$(IFS=', '; echo "${missing[*]}")
-        echo "Each project must have a \"name\" field. Missing in: ${joined}"
-        return
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            local joined
+            joined=$(IFS=', '; echo "${missing[*]}")
+            echo "Each project must have a \"name\" field. Missing in: ${joined}"
+            return
+        fi
     fi
 
     # ── Validate resources section ──
     local resources_type
     resources_type=$(jq -r 'if has("resources") then .resources | type else "null" end' "$config_file")
-    if [[ "$resources_type" == "null" ]]; then
-        return
-    fi
-    if [[ "$resources_type" != "object" ]]; then
+    if [[ "$resources_type" != "null" && "$resources_type" != "object" ]]; then
         echo "\"resources\" must be an object, got: ${resources_type}"
         return
     fi
 
-    # resources.agents — array of strings
-    local agents_type
-    agents_type=$(jq -r 'if .resources | has("agents") then .resources.agents | type else "null" end' "$config_file")
-    if [[ "$agents_type" != "null" && "$agents_type" != "array" ]]; then
-        echo "\"resources.agents\" must be an array, got: ${agents_type}"
+    if [[ "$resources_type" == "object" ]]; then
+        # resources.agents — array of strings
+        local agents_type
+        agents_type=$(jq -r 'if .resources | has("agents") then .resources.agents | type else "null" end' "$config_file")
+        if [[ "$agents_type" != "null" && "$agents_type" != "array" ]]; then
+            echo "\"resources.agents\" must be an array, got: ${agents_type}"
+            return
+        fi
+        if [[ "$agents_type" == "array" ]]; then
+            local bad_agents
+            bad_agents=$(jq -r '.resources.agents | to_entries[] | select((.value | type) != "string") | "resources.agents[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+            if [[ -n "$bad_agents" ]]; then
+                echo "$bad_agents"
+                return
+            fi
+        fi
+
+        # resources.skills — array of strings
+        local skills_type
+        skills_type=$(jq -r 'if .resources | has("skills") then .resources.skills | type else "null" end' "$config_file")
+        if [[ "$skills_type" != "null" && "$skills_type" != "array" ]]; then
+            echo "\"resources.skills\" must be an array, got: ${skills_type}"
+            return
+        fi
+        if [[ "$skills_type" == "array" ]]; then
+            local bad_skills
+            bad_skills=$(jq -r '.resources.skills | to_entries[] | select((.value | type) != "string") | "resources.skills[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+            if [[ -n "$bad_skills" ]]; then
+                echo "$bad_skills"
+                return
+            fi
+        fi
+
+        # resources.mcp — object of objects
+        local mcp_type
+        mcp_type=$(jq -r 'if .resources | has("mcp") then .resources.mcp | type else "null" end' "$config_file")
+        if [[ "$mcp_type" != "null" && "$mcp_type" != "object" ]]; then
+            echo "\"resources.mcp\" must be an object, got: ${mcp_type}"
+            return
+        fi
+        if [[ "$mcp_type" == "object" ]]; then
+            local bad_mcp
+            bad_mcp=$(jq -r '.resources.mcp | to_entries[] | select((.value | type) != "object") | "resources.mcp.\(.key): expected object, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+            if [[ -n "$bad_mcp" ]]; then
+                echo "$bad_mcp"
+                return
+            fi
+        fi
+
+        # resources.env_files — array of strings
+        local env_files_type
+        env_files_type=$(jq -r 'if .resources | has("env_files") then .resources.env_files | type else "null" end' "$config_file")
+        if [[ "$env_files_type" != "null" && "$env_files_type" != "array" ]]; then
+            echo "\"resources.env_files\" must be an array, got: ${env_files_type}"
+            return
+        fi
+        if [[ "$env_files_type" == "array" ]]; then
+            local bad_env_files
+            bad_env_files=$(jq -r '.resources.env_files | to_entries[] | select((.value | type) != "string") | "resources.env_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+            if [[ -n "$bad_env_files" ]]; then
+                echo "$bad_env_files"
+                return
+            fi
+        fi
+    fi
+
+    # ── Validate update_interval ──
+    local ui_type
+    ui_type=$(jq -r 'if has("update_interval") then .update_interval | type else "null" end' "$config_file")
+    if [[ "$ui_type" != "null" && "$ui_type" != "number" ]]; then
+        echo "\"update_interval\" must be a number (hours), got: ${ui_type}"
         return
     fi
-    if [[ "$agents_type" == "array" ]]; then
-        local bad_agents
-        bad_agents=$(jq -r '.resources.agents | to_entries[] | select((.value | type) != "string") | "resources.agents[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-        if [[ -n "$bad_agents" ]]; then
-            echo "$bad_agents"
+    if [[ "$ui_type" == "number" ]]; then
+        local ui_val
+        ui_val=$(jq '.update_interval' "$config_file")
+        if jq -e '.update_interval < 0' "$config_file" &>/dev/null; then
+            echo "\"update_interval\" must be >= 0, got: ${ui_val}"
             return
         fi
     fi
 
-    # resources.skills — array of strings
-    local skills_type
-    skills_type=$(jq -r 'if .resources | has("skills") then .resources.skills | type else "null" end' "$config_file")
-    if [[ "$skills_type" != "null" && "$skills_type" != "array" ]]; then
-        echo "\"resources.skills\" must be an array, got: ${skills_type}"
+    # ── Validate presets array ──
+    local presets_type
+    presets_type=$(jq -r 'if has("presets") then .presets | type else "null" end' "$config_file")
+    if [[ "$presets_type" != "null" && "$presets_type" != "array" ]]; then
+        echo "\"presets\" must be an array, got: ${presets_type}"
         return
     fi
-    if [[ "$skills_type" == "array" ]]; then
-        local bad_skills
-        bad_skills=$(jq -r '.resources.skills | to_entries[] | select((.value | type) != "string") | "resources.skills[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-        if [[ -n "$bad_skills" ]]; then
-            echo "$bad_skills"
-            return
-        fi
-    fi
-
-    # resources.mcp — object of objects
-    local mcp_type
-    mcp_type=$(jq -r 'if .resources | has("mcp") then .resources.mcp | type else "null" end' "$config_file")
-    if [[ "$mcp_type" != "null" && "$mcp_type" != "object" ]]; then
-        echo "\"resources.mcp\" must be an object, got: ${mcp_type}"
-        return
-    fi
-    if [[ "$mcp_type" == "object" ]]; then
-        local bad_mcp
-        bad_mcp=$(jq -r '.resources.mcp | to_entries[] | select((.value | type) != "object") | "resources.mcp.\(.key): expected object, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-        if [[ -n "$bad_mcp" ]]; then
-            echo "$bad_mcp"
-            return
-        fi
-    fi
-
-    # resources.env_files — array of strings
-    local env_files_type
-    env_files_type=$(jq -r 'if .resources | has("env_files") then .resources.env_files | type else "null" end' "$config_file")
-    if [[ "$env_files_type" != "null" && "$env_files_type" != "array" ]]; then
-        echo "\"resources.env_files\" must be an array, got: ${env_files_type}"
-        return
-    fi
-    if [[ "$env_files_type" == "array" ]]; then
-        local bad_env_files
-        bad_env_files=$(jq -r '.resources.env_files | to_entries[] | select((.value | type) != "string") | "resources.env_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-        if [[ -n "$bad_env_files" ]]; then
-            echo "$bad_env_files"
-            return
+    if [[ "$presets_type" == "array" ]]; then
+        local preset_count_v
+        preset_count_v=$(jq '.presets | length' "$config_file")
+        if [[ "$preset_count_v" -gt 0 ]]; then
+        local i
+        for i in $(seq 0 $((preset_count_v - 1))); do
+            local entry_type
+            entry_type=$(jq -r ".presets[$i] | type" "$config_file")
+            case "$entry_type" in
+                string)
+                    # Local preset name — valid
+                    ;;
+                object)
+                    # GitHub preset object — validate fields
+                    local source_val
+                    source_val=$(jq -r ".presets[$i].source // empty" "$config_file")
+                    if [[ -z "$source_val" ]]; then
+                        echo "presets[$i]: object entry must have a \"source\" field"
+                        return
+                    fi
+                    if [[ "$source_val" != github:* ]]; then
+                        echo "presets[$i].source must start with \"github:\", got: ${source_val}"
+                        return
+                    fi
+                    # Validate github source has at least owner/repo with safe characters
+                    local gh_rest="${source_val#github:}"
+                    gh_rest="${gh_rest%%@*}"
+                    if [[ "$gh_rest" != */* ]]; then
+                        echo "presets[$i].source must contain at least owner/repo, got: ${source_val}"
+                        return
+                    fi
+                    # Validate owner and repo contain only safe characters (no path traversal)
+                    local gh_owner="${gh_rest%%/*}"
+                    local gh_after="${gh_rest#*/}"
+                    local gh_repo="${gh_after%%/*}"
+                    if [[ ! "$gh_owner" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_owner" == "." ]] || [[ "$gh_owner" == ".." ]]; then
+                        echo "presets[$i].source: invalid owner name: ${gh_owner}"
+                        return
+                    fi
+                    if [[ ! "$gh_repo" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_repo" == "." ]] || [[ "$gh_repo" == ".." ]]; then
+                        echo "presets[$i].source: invalid repo name: ${gh_repo}"
+                        return
+                    fi
+                    # Validate path segments (no path traversal via ..)
+                    local gh_path_part="${gh_rest#*/*/}"
+                    if [[ "$gh_path_part" != "$gh_rest" && -n "$gh_path_part" ]]; then
+                        local IFS='/'
+                        local gh_seg
+                        for gh_seg in $gh_path_part; do
+                            if [[ "$gh_seg" == ".." || "$gh_seg" == "." ]]; then
+                                echo "presets[$i].source: path contains invalid segment: ${gh_seg}"
+                                return
+                            fi
+                        done
+                        unset IFS
+                    fi
+                    # Validate prefix format if present
+                    local prefix_val
+                    prefix_val=$(jq -r ".presets[$i].prefix // empty" "$config_file")
+                    if [[ -n "$prefix_val" ]]; then
+                        if [[ ! "$prefix_val" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                            echo "presets[$i].prefix must be lowercase alphanumeric with optional hyphens (no leading/trailing hyphens), got: ${prefix_val}"
+                            return
+                        fi
+                    fi
+                    # Validate env_files if present
+                    local ef_type
+                    ef_type=$(jq -r "if .presets[$i] | has(\"env_files\") then .presets[$i].env_files | type else \"null\" end" "$config_file")
+                    if [[ "$ef_type" != "null" && "$ef_type" != "array" ]]; then
+                        echo "presets[$i].env_files must be an array, got: ${ef_type}"
+                        return
+                    fi
+                    # Validate rename if present
+                    local rename_type
+                    rename_type=$(jq -r "if .presets[$i] | has(\"rename\") then .presets[$i].rename | type else \"null\" end" "$config_file")
+                    if [[ "$rename_type" != "null" && "$rename_type" != "object" ]]; then
+                        echo "presets[$i].rename must be an object, got: ${rename_type}"
+                        return
+                    fi
+                    ;;
+                *)
+                    echo "presets[$i]: expected string or object, got: ${entry_type}"
+                    return
+                    ;;
+            esac
+        done
         fi
     fi
 }
@@ -438,46 +631,91 @@ validate_global_config() {
     [[ ! -f "$GLOBAL_CONFIG" ]] && return
 
     if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$GLOBAL_CONFIG" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in global config: ${GLOBAL_CONFIG}${NC}" >&2
-        jq empty "$GLOBAL_CONFIG" 2>&1 | head -5 >&2
-        exit 1
+        echo "$json_err" >&2
+        die_doctor "Invalid JSON in global config ${GLOBAL_CONFIG}: ${json_err}"
     fi
 
     local semantic_error
     semantic_error=$(validate_config_semantics "$GLOBAL_CONFIG")
     if [[ -n "$semantic_error" ]]; then
         echo -e "${RED}Global config error (${GLOBAL_CONFIG}): ${semantic_error}${NC}" >&2
-        exit 1
+        die_doctor "Global config error: ${semantic_error}"
     fi
 }
 # ── Build System ─────────────────────────────────────────────────────
 
-# Collect all preset names recursively (for hashing)
+# Collect all preset identifiers recursively (for hashing)
+# Items are prefixed: "local:name" or "github:source"
 collect_all_presets() {
     local -a visited=()
     local -a queue=("$@")
 
     while [[ ${#queue[@]} -gt 0 ]]; do
-        local name="${queue[0]}"
+        local item="${queue[0]}"
         queue=("${queue[@]:1}")
 
         local skip=false
         for v in "${visited[@]+"${visited[@]}"}"; do
-            [[ "$v" == "$name" ]] && skip=true && break
+            [[ "$v" == "$item" ]] && skip=true && break
         done
         [[ "$skip" == true ]] && continue
 
-        visited+=("$name")
-        echo "$name"
+        visited+=("$item")
+        echo "$item"
 
-        local preset_dir="$PRESETS_DIR/$name"
-        if [[ -f "$preset_dir/claude-compose.json" ]]; then
-            local nested
-            nested=$(jq -r '.presets // [] | .[]' "$preset_dir/claude-compose.json" 2>/dev/null || true)
-            while IFS= read -r n; do
-                [[ -z "$n" ]] && continue
-                queue+=("$n")
-            done <<< "$nested"
+        # Resolve directory for nested preset discovery
+        local preset_dir=""
+        if [[ "$item" == local:* ]]; then
+            preset_dir="$PRESETS_DIR/${item#local:}"
+        elif [[ "$item" == github:* ]]; then
+            # For github presets, resolve from lock file if available
+            parse_github_source "github:${item#github:}"
+            local source_key="github:${_GH_OWNER}/${_GH_REPO}"
+            [[ -n "$_GH_PATH" ]] && source_key+="/${_GH_PATH}"
+            preset_dir=$(resolve_locked_preset_dir "$source_key" 2>/dev/null || true)
+        fi
+
+        if [[ -n "$preset_dir" && -f "$preset_dir/claude-compose.json" ]]; then
+            # Discover nested presets (mixed array)
+            local nested_count
+            nested_count=$(jq '.presets // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+            local j
+            for j in $(seq 0 $((nested_count - 1))); do
+                local entry_type
+                entry_type=$(jq -r ".presets[$j] | type" "$preset_dir/claude-compose.json" 2>/dev/null || echo "null")
+                if [[ "$entry_type" == "string" ]]; then
+                    local nested_name
+                    nested_name=$(jq -r ".presets[$j]" "$preset_dir/claude-compose.json")
+                    # For nested local presets within a github registry, resolve relative to registry root
+                    if [[ "$item" == github:* ]]; then
+                        parse_github_source "github:${item#github:}"
+                        if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                            local reg_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                            [[ -n "$_GH_PATH" ]] && reg_sk+="/${_GH_PATH}"
+                            local reg_ver
+                            reg_ver=$(jq -r --arg k "$reg_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                            if [[ -n "$reg_ver" ]]; then
+                                local reg_base
+                                reg_base=$(registry_version_dir "$_GH_OWNER" "$_GH_REPO" "$reg_ver")
+                                if [[ -d "$reg_base/$nested_name" ]]; then
+                                    queue+=("github:${_GH_OWNER}/${_GH_REPO}/${nested_name}")
+                                    continue
+                                fi
+                            fi
+                        fi
+                    fi
+                    queue+=("local:$nested_name")
+                elif [[ "$entry_type" == "object" ]]; then
+                    local nested_source
+                    nested_source=$(jq -r ".presets[$j].source // empty" "$preset_dir/claude-compose.json")
+                    if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                        queue+=("github:${nested_source#github:}")
+                    fi
+                fi
+            done
         fi
     done
 }
@@ -509,37 +747,84 @@ compute_build_hash() {
         hash_input+=$(find "$BUILTIN_SKILLS_DIR" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
     fi
 
+    # Hash lock file
+    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+        hash_input+=$(cat "$LOCK_FILE")
+    fi
+
     # Hash global presets
     if [[ -f "$GLOBAL_CONFIG" ]]; then
-        local global_presets
-        global_presets=$(jq -r '.presets // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
         local -a global_preset_list=()
-        while IFS= read -r name; do
-            [[ -z "$name" ]] && continue
-            global_preset_list+=("$name")
-        done <<< "$global_presets"
+        local gp_count_h
+        gp_count_h=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+        local gi
+        for gi in $(seq 0 $((gp_count_h - 1))); do
+            local gentry_type
+            gentry_type=$(jq -r ".presets[$gi] | type" "$GLOBAL_CONFIG" 2>/dev/null || echo "null")
+            if [[ "$gentry_type" == "string" ]]; then
+                local gname
+                gname=$(jq -r ".presets[$gi]" "$GLOBAL_CONFIG")
+                global_preset_list+=("local:$gname")
+            elif [[ "$gentry_type" == "object" ]]; then
+                local gsource
+                gsource=$(jq -r ".presets[$gi].source // empty" "$GLOBAL_CONFIG")
+                if [[ -n "$gsource" && "$gsource" == github:* ]]; then
+                    global_preset_list+=("github:${gsource#github:}")
+                    hash_input+=$(jq -c ".presets[$gi]" "$GLOBAL_CONFIG")
+                fi
+            fi
+        done
 
-        while IFS= read -r name; do
-            [[ -z "$name" ]] && continue
-            local preset_dir="$PRESETS_DIR/$name"
-            [[ -d "$preset_dir" ]] || continue
+        while IFS= read -r item; do
+            [[ -z "$item" ]] && continue
+            local preset_dir=""
+            if [[ "$item" == local:* ]]; then
+                preset_dir="$PRESETS_DIR/${item#local:}"
+            elif [[ "$item" == github:* ]]; then
+                parse_github_source "github:${item#github:}"
+                local hp_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                [[ -n "$_GH_PATH" ]] && hp_sk+="/${_GH_PATH}"
+                preset_dir=$(resolve_locked_preset_dir "$hp_sk" 2>/dev/null || true)
+            fi
+            [[ -z "$preset_dir" || ! -d "$preset_dir" ]] && continue
             hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
         done < <(collect_all_presets "${global_preset_list[@]+"${global_preset_list[@]}"}")
     fi
 
-    # Hash preset dirs (recursively collected)
-    local top_presets
-    top_presets=$(jq -r '.presets // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    # Hash preset dirs (recursively collected, handles mixed arrays)
     local -a preset_list=()
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        preset_list+=("$name")
-    done <<< "$top_presets"
+    local lp_count_h
+    lp_count_h=$(jq '.presets // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    local li
+    for li in $(seq 0 $((lp_count_h - 1))); do
+        local lentry_type
+        lentry_type=$(jq -r ".presets[$li] | type" "$CONFIG_FILE" 2>/dev/null || echo "null")
+        if [[ "$lentry_type" == "string" ]]; then
+            local lname
+            lname=$(jq -r ".presets[$li]" "$CONFIG_FILE")
+            preset_list+=("local:$lname")
+        elif [[ "$lentry_type" == "object" ]]; then
+            local lsource
+            lsource=$(jq -r ".presets[$li].source // empty" "$CONFIG_FILE")
+            if [[ -n "$lsource" && "$lsource" == github:* ]]; then
+                preset_list+=("github:${lsource#github:}")
+                hash_input+=$(jq -c ".presets[$li]" "$CONFIG_FILE")
+            fi
+        fi
+    done
 
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        local preset_dir="$PRESETS_DIR/$name"
-        [[ -d "$preset_dir" ]] || continue
+    while IFS= read -r item; do
+        [[ -z "$item" ]] && continue
+        local preset_dir=""
+        if [[ "$item" == local:* ]]; then
+            preset_dir="$PRESETS_DIR/${item#local:}"
+        elif [[ "$item" == github:* ]]; then
+            parse_github_source "github:${item#github:}"
+            local hp2_sk="github:${_GH_OWNER}/${_GH_REPO}"
+            [[ -n "$_GH_PATH" ]] && hp2_sk+="/${_GH_PATH}"
+            preset_dir=$(resolve_locked_preset_dir "$hp2_sk" 2>/dev/null || true)
+        fi
+        [[ -z "$preset_dir" || ! -d "$preset_dir" ]] && continue
         hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
     done < <(collect_all_presets "${preset_list[@]+"${preset_list[@]}"}")
 
@@ -651,6 +936,490 @@ read_manifest() {
         echo '{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
     fi
 }
+# ── Registry: GitHub-based remote presets ──────────────────────────────
+
+# ── Git dependency check ──────────────────────────────────────────────
+require_git() {
+    if ! command -v git &>/dev/null; then
+        die_doctor "git is required for GitHub presets but not installed. Install: brew install git / apt install git"
+    fi
+}
+
+# Check if any config has github: presets (used for conditional git check)
+has_github_presets() {
+    local config_file="$1"
+    [[ ! -f "$config_file" ]] && return 1
+    local count
+    count=$(jq '[.presets // [] | .[] | select(type == "object" and .source and (.source | startswith("github:")))] | length' "$config_file" 2>/dev/null || echo 0)
+    [[ "$count" -gt 0 ]]
+}
+
+# ── Registry directory helpers ────────────────────────────────────────
+
+registry_version_dir() {
+    local owner="$1" repo="$2" version="$3"
+    echo "$REGISTRIES_DIR/$owner/$repo/v$version"
+}
+
+registry_has_clone() {
+    local owner="$1" repo="$2" version="$3"
+    local dir
+    dir=$(registry_version_dir "$owner" "$repo" "$version")
+    [[ -d "$dir/.git" ]]
+}
+
+registry_preset_dir() {
+    local owner="$1" repo="$2" version="$3" preset_path="$4"
+    local base
+    base=$(registry_version_dir "$owner" "$repo" "$version")
+    if [[ -n "$preset_path" ]]; then
+        echo "$base/$preset_path"
+    else
+        echo "$base"
+    fi
+}
+
+# ── Git operations ────────────────────────────────────────────────────
+
+registry_clone_version() {
+    local owner="$1" repo="$2" tag="$3"
+    local dir
+    dir=$(registry_version_dir "$owner" "$repo" "${tag#v}")
+
+    # Already cloned
+    if [[ -d "$dir/.git" ]]; then
+        return 0
+    fi
+
+    # Corrupted: dir exists but no .git
+    if [[ -d "$dir" && ! -d "$dir/.git" ]]; then
+        rm -rf "$dir"
+    fi
+
+    mkdir -p "$(dirname "$dir")"
+
+    echo -e "  ${CYAN}Cloning:${NC} ${owner}/${repo}@${tag}" >&2
+    if ! GIT_TERMINAL_PROMPT=0 git clone --quiet --branch "$tag" --depth 1 \
+        "https://github.com/$owner/$repo.git" "$dir" 2>/dev/null; then
+        rm -rf "$dir"
+        echo -e "${RED}Error: Failed to clone github:${owner}/${repo}@${tag}${NC}" >&2
+        return 1
+    fi
+}
+
+# List remote tags from a GitHub repo. Uses an existing clone if available,
+# otherwise does ls-remote against GitHub.
+registry_list_remote_tags() {
+    local owner="$1" repo="$2"
+
+    local tags_output
+    if ! tags_output=$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs \
+        "https://github.com/$owner/$repo.git" 2>/dev/null); then
+        return 1
+    fi
+
+    # Extract tag names: refs/tags/v1.2.3 → v1.2.3
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        echo "${line##*refs/tags/}"
+    done <<< "$tags_output"
+}
+
+# ── Semver parsing ────────────────────────────────────────────────────
+
+# Parse github:owner/repo/path@spec and set _GH_OWNER, _GH_REPO, _GH_PATH, _GH_SPEC
+# path may be empty, spec may be empty
+parse_github_source() {
+    local source="$1"
+    # Strip github: prefix
+    local rest="${source#github:}"
+
+    # Split on @ for version spec
+    _GH_SPEC=""
+    local path_part
+    if [[ "$rest" == *@* ]]; then
+        _GH_SPEC="${rest##*@}"
+        path_part="${rest%@*}"
+    else
+        path_part="$rest"
+    fi
+
+    # Split path_part: owner/repo[/preset_path]
+    _GH_OWNER="${path_part%%/*}"
+    local after_owner="${path_part#*/}"
+    _GH_PATH=""
+    if [[ "$after_owner" == */* ]]; then
+        _GH_REPO="${after_owner%%/*}"
+        _GH_PATH="${after_owner#*/}"
+    else
+        _GH_REPO="$after_owner"
+    fi
+}
+
+# Parse version spec string → prints "type major minor patch"
+# Types: exact, tilde, caret, latest
+parse_version_spec() {
+    local spec="$1"
+
+    if [[ -z "$spec" ]]; then
+        echo "latest 0 0 0"
+        return
+    fi
+
+    local type="" version_str=""
+    case "$spec" in
+        "~"*)
+            type="tilde"
+            version_str="${spec#\~}"
+            ;;
+        "^"*)
+            type="caret"
+            version_str="${spec#^}"
+            ;;
+        *)
+            type="exact"
+            version_str="$spec"
+            ;;
+    esac
+
+    local major=0 minor=0 patch=0
+    IFS='.' read -r major minor patch <<< "$version_str"
+    major="${major:-0}"
+    minor="${minor:-0}"
+    patch="${patch:-0}"
+
+    echo "$type $major $minor $patch"
+}
+
+# Parse a tag name into version components → prints "major minor patch"
+# Returns 1 for non-semver tags
+parse_tag_version() {
+    local tag="$1"
+    # Strip v prefix
+    local ver="${tag#v}"
+
+    # Must match X.Y.Z pattern (at minimum X.Y)
+    if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        return 1
+    fi
+
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$ver"
+    patch="${patch:-0}"
+
+    echo "$major $minor $patch"
+}
+
+# Check if a tag version satisfies a version spec
+# Returns 0 if tag matches spec
+version_matches() {
+    local tag_major="$1" tag_minor="$2" tag_patch="$3"
+    local spec_type="$4" spec_major="$5" spec_minor="$6" spec_patch="$7"
+
+    case "$spec_type" in
+        latest)
+            return 0
+            ;;
+        exact)
+            (( tag_major == spec_major && tag_minor == spec_minor && tag_patch == spec_patch ))
+            return $?
+            ;;
+        tilde)
+            # ~1.2.3: major+minor match, patch >= spec
+            (( tag_major == spec_major && tag_minor == spec_minor && tag_patch >= spec_patch ))
+            return $?
+            ;;
+        caret)
+            # ^X.Y.Z: compatible changes per semver
+            # ^0.0.Z: exact match only (0.0.Z is fully unstable)
+            # ^0.Y.Z: minor-locked (0.Y.z where z >= Z)
+            # ^X.Y.Z (X>0): major-locked (X.y.z where y>Y or y==Y && z>=Z)
+            if (( tag_major != spec_major )); then
+                return 1
+            fi
+            if (( spec_major == 0 )); then
+                if (( spec_minor == 0 )); then
+                    # ^0.0.Z — exact patch
+                    (( tag_minor == 0 && tag_patch == spec_patch ))
+                    return $?
+                fi
+                # ^0.Y.Z — minor-locked
+                (( tag_minor == spec_minor && tag_patch >= spec_patch ))
+                return $?
+            fi
+            # ^X.Y.Z (X>0)
+            if (( tag_minor > spec_minor )); then
+                return 0
+            fi
+            (( tag_minor == spec_minor && tag_patch >= spec_patch ))
+            return $?
+            ;;
+    esac
+    return 1
+}
+
+# Find the best matching tag from a list of tags
+# $1 = newline-separated tag list, $2-$5 = spec_type spec_major spec_minor spec_patch
+# Prints the best matching tag (original form with v prefix if present)
+find_best_tag() {
+    local tags_list="$1"
+    local spec_type="$2" spec_major="$3" spec_minor="$4" spec_patch="$5"
+
+    local best_tag="" best_major=-1 best_minor=-1 best_patch=-1
+
+    while IFS= read -r tag; do
+        [[ -z "$tag" ]] && continue
+
+        local parsed
+        parsed=$(parse_tag_version "$tag") || continue
+        local t_major t_minor t_patch
+        read -r t_major t_minor t_patch <<< "$parsed"
+
+        if version_matches "$t_major" "$t_minor" "$t_patch" "$spec_type" "$spec_major" "$spec_minor" "$spec_patch"; then
+            # Check if this is better (higher) than current best
+            if (( t_major > best_major )) || \
+               (( t_major == best_major && t_minor > best_minor )) || \
+               (( t_major == best_major && t_minor == best_minor && t_patch > best_patch )); then
+                best_tag="$tag"
+                best_major="$t_major"
+                best_minor="$t_minor"
+                best_patch="$t_patch"
+            fi
+        fi
+    done <<< "$tags_list"
+
+    if [[ -n "$best_tag" ]]; then
+        echo "$best_tag"
+        return 0
+    fi
+    return 1
+}
+
+# Check if major version increased
+check_major_bump() {
+    local old_version="$1" new_version="$2"
+    local old_major new_major
+    old_major="${old_version%%.*}"
+    new_major="${new_version%%.*}"
+    (( new_major > old_major ))
+}
+
+# ── Lock file management ─────────────────────────────────────────────
+
+# Read locked version for a source key from lock file
+# Prints: resolved_version tag spec (space-separated), or empty if not found
+lock_read() {
+    local source_key="$1"
+    [[ ! -f "$LOCK_FILE" ]] && return 1
+
+    local entry
+    entry=$(jq -c --arg k "$source_key" '.registries[$k] // empty' "$LOCK_FILE" 2>/dev/null)
+    [[ -z "$entry" || "$entry" == "null" ]] && return 1
+
+    local resolved tag spec
+    resolved=$(echo "$entry" | jq -r '.resolved')
+    tag=$(echo "$entry" | jq -r '.tag')
+    spec=$(echo "$entry" | jq -r '.spec')
+    echo "$resolved" "$tag" "$spec"
+}
+
+# Write/update a lock entry atomically
+lock_write() {
+    local source_key="$1" version="$2" tag="$3" spec="$4"
+
+    local lock_json
+    if [[ -f "$LOCK_FILE" ]]; then
+        lock_json=$(cat "$LOCK_FILE")
+    else
+        lock_json='{"registries":{}}'
+    fi
+
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local tmp
+    tmp=$(mktemp "${LOCK_FILE}.XXXXXX")
+    if echo "$lock_json" | jq --arg k "$source_key" --arg v "$version" \
+        --arg t "$tag" --arg s "$spec" --arg ts "$now" \
+        '.registries[$k] = {resolved: $v, tag: $t, spec: $s, locked_at: $ts}' > "$tmp"; then
+        mv "$tmp" "$LOCK_FILE"
+    else
+        rm -f "$tmp"
+        echo -e "${YELLOW}Warning: Failed to update lock file${NC}" >&2
+    fi
+}
+
+# Resolve a github preset dir from lock file. Sets _GH_* globals as side effect.
+# $1 = source key (github:owner/repo[/path]), prints dir path or empty
+resolve_locked_preset_dir() {
+    local source_key="$1"
+    [[ ! -f "$LOCK_FILE" ]] && return 1
+
+    parse_github_source "$source_key"
+    local ver
+    ver=$(jq -r --arg k "$source_key" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+    [[ -z "$ver" ]] && return 1
+
+    registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$ver" "$_GH_PATH"
+}
+
+# ── Update interval ───────────────────────────────────────────────────
+
+# Read update_interval from config (hours). Default: 24. 0 = every launch.
+# Checks CONFIG_FILE first, then GLOBAL_CONFIG.
+get_update_interval() {
+    local interval=""
+    if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
+        interval=$(jq -r '.update_interval // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    fi
+    if [[ -z "$interval" && -f "$GLOBAL_CONFIG" ]]; then
+        interval=$(jq -r '.update_interval // empty' "$GLOBAL_CONFIG" 2>/dev/null || true)
+    fi
+    echo "${interval:-24}"
+}
+
+# Check if enough time has passed since last lock update
+# $1 = source_key. Returns 0 if check should be skipped (within interval).
+lock_within_interval() {
+    local source_key="$1"
+    [[ ! -f "$LOCK_FILE" ]] && return 1
+
+    local interval_hours
+    interval_hours=$(get_update_interval)
+    # 0 = always check
+    [[ "$interval_hours" == "0" ]] && return 1
+
+    local locked_at
+    locked_at=$(jq -r --arg k "$source_key" '.registries[$k].locked_at // empty' "$LOCK_FILE" 2>/dev/null || true)
+    [[ -z "$locked_at" ]] && return 1
+
+    local locked_epoch now_epoch
+    # macOS date -j -f for parsing ISO timestamp
+    if date -j -f "%Y-%m-%dT%H:%M:%SZ" "$locked_at" "+%s" &>/dev/null; then
+        locked_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$locked_at" "+%s")
+    elif date -d "$locked_at" "+%s" &>/dev/null; then
+        # GNU date
+        locked_epoch=$(date -d "$locked_at" "+%s")
+    else
+        return 1
+    fi
+    now_epoch=$(date "+%s")
+
+    local interval_seconds=$(( interval_hours * 3600 ))
+    (( (now_epoch - locked_epoch) < interval_seconds ))
+}
+
+# ── Version resolution ────────────────────────────────────────────────
+
+# Resolve a github preset source to a concrete version.
+# Handles locking, auto-update, interval check, and network failure fallback.
+# Prints: resolved_version tag
+# Sets up the clone directory.
+resolve_github_version() {
+    local owner="$1" repo="$2" source_key="$3" spec_str="$4"
+
+    local spec_parsed
+    spec_parsed=$(parse_version_spec "$spec_str")
+    local spec_type spec_major spec_minor spec_patch
+    read -r spec_type spec_major spec_minor spec_patch <<< "$spec_parsed"
+
+    # Read existing lock
+    local locked_version="" locked_tag=""
+    local lock_data
+    if lock_data=$(lock_read "$source_key"); then
+        read -r locked_version locked_tag _ <<< "$lock_data"
+    fi
+
+    # Exact spec with lock: use locked version, no network
+    if [[ "$spec_type" == "exact" && -n "$locked_version" ]]; then
+        # Ensure clone exists
+        if ! registry_has_clone "$owner" "$repo" "$locked_version"; then
+            registry_clone_version "$owner" "$repo" "$locked_tag" || die_doctor "Failed to clone ${owner}/${repo}@${locked_tag}"
+        fi
+        echo "$locked_version" "$locked_tag"
+        return
+    fi
+
+    # Exact spec without lock: clone the exact version
+    if [[ "$spec_type" == "exact" ]]; then
+        local exact_ver="${spec_major}.${spec_minor}.${spec_patch}"
+        # Try v-prefixed tag first
+        local try_tag="v${exact_ver}"
+        if registry_clone_version "$owner" "$repo" "$try_tag" 2>/dev/null; then
+            lock_write "$source_key" "$exact_ver" "$try_tag" "$spec_str"
+            echo "$exact_ver" "$try_tag"
+            return
+        fi
+        # Try without v prefix
+        if registry_clone_version "$owner" "$repo" "$exact_ver" 2>/dev/null; then
+            lock_write "$source_key" "$exact_ver" "$exact_ver" "$spec_str"
+            echo "$exact_ver" "$exact_ver"
+            return
+        fi
+        echo -e "${RED}Error: Tag v${exact_ver} not found in ${owner}/${repo}${NC}" >&2
+        die_doctor "Tag v${exact_ver} not found in ${owner}/${repo}. Check the version spec in your config."
+    fi
+
+    # Non-exact spec: skip network check if within update interval
+    if [[ -n "$locked_version" ]] && lock_within_interval "$source_key"; then
+        if registry_has_clone "$owner" "$repo" "$locked_version"; then
+            echo "$locked_version" "$locked_tag"
+            return
+        fi
+    fi
+
+    # Check for updates (network call)
+    local remote_tags
+    if remote_tags=$(registry_list_remote_tags "$owner" "$repo"); then
+        local best_tag
+        if best_tag=$(find_best_tag "$remote_tags" "$spec_type" "$spec_major" "$spec_minor" "$spec_patch"); then
+            local best_parsed
+            best_parsed=$(parse_tag_version "$best_tag")
+            local best_major best_minor best_patch
+            read -r best_major best_minor best_patch <<< "$best_parsed"
+            local best_version="${best_major}.${best_minor}.${best_patch}"
+
+            # Check if this is an update
+            if [[ -n "$locked_version" && "$best_version" != "$locked_version" ]]; then
+                # Warn on major bump
+                if check_major_bump "$locked_version" "$best_version"; then
+                    echo -e "  ${YELLOW}Major update available:${NC} ${owner}/${repo} ${locked_version} → ${best_version}" >&2
+                else
+                    echo -e "  ${GREEN}Updating:${NC} ${owner}/${repo} ${locked_version} → ${best_version}" >&2
+                fi
+            fi
+
+            # Clone if needed
+            if ! registry_has_clone "$owner" "$repo" "$best_version"; then
+                registry_clone_version "$owner" "$repo" "$best_tag" || die_doctor "Failed to clone ${owner}/${repo}@${best_tag}"
+            fi
+
+            lock_write "$source_key" "$best_version" "$best_tag" "$spec_str"
+            echo "$best_version" "$best_tag"
+            return
+        else
+            echo -e "${RED}Error: No matching tag for spec '${spec_str}' in ${owner}/${repo}${NC}" >&2
+            if [[ -n "$locked_version" ]]; then
+                echo -e "${YELLOW}Falling back to locked version: ${locked_version}${NC}" >&2
+                echo "$locked_version" "$locked_tag"
+                return
+            fi
+            die_doctor "No matching tag for spec '${spec_str}' in ${owner}/${repo}. Check version spec in config."
+        fi
+    else
+        # Network failure
+        if [[ -n "$locked_version" ]]; then
+            echo -e "  ${YELLOW}Network unavailable, using locked version:${NC} ${owner}/${repo}@${locked_version}" >&2
+            if ! registry_has_clone "$owner" "$repo" "$locked_version"; then
+                echo -e "${RED}Error: Locked version ${locked_version} not available locally${NC}" >&2
+                die_doctor "Locked version ${locked_version} of ${owner}/${repo} not available locally and network is unavailable"
+            fi
+            echo "$locked_version" "$locked_tag"
+            return
+        fi
+        die_doctor "Cannot fetch tags from ${owner}/${repo} (network unavailable) and no locked version exists"
+    fi
+}
 # Load JSON env files from resources.env_files at launch time
 load_env_files() {
     local env_files
@@ -752,7 +1521,13 @@ load_all_source_env_files() {
             [[ -z "$sname" ]] && continue
             local source_dir
             if [[ "$section" == "presets" ]]; then
-                source_dir="$PRESETS_DIR/$sname"
+                if [[ "$sname" == github:* ]]; then
+                    # GitHub preset: resolve dir from lock file
+                    source_dir=$(resolve_locked_preset_dir "$sname" 2>/dev/null || true)
+                    [[ -z "$source_dir" ]] && continue
+                else
+                    source_dir="$PRESETS_DIR/$sname"
+                fi
             else
                 source_dir="$sname"  # workspaces use absolute path as key
             fi
@@ -892,7 +1667,12 @@ sync_source_dir() {
 
                 local abs_agent_file
                 abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
-                ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
+                if [[ "$final_name" != "$agent_name" ]]; then
+                    # Name changed — copy and rewrite name: in frontmatter
+                    sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_agent_file" > ".claude/agents/${dest_file}"
+                else
+                    ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
+                fi
                 CURRENT_SOURCE_AGENTS+=("$dest_file")
                 if [[ "$final_name" != "$agent_name" ]]; then
                     echo -e "  ${GREEN}+agent:${NC} $agent_name → $final_name" >&2
@@ -1039,7 +1819,7 @@ process_preset() {
     local preset_dir="$PRESETS_DIR/$preset_name"
     if [[ ! -d "$preset_dir" ]]; then
         echo -e "${RED}Error: Preset not found: ${preset_name} (~/.claude-compose/presets/${preset_name}/)${NC}" >&2
-        exit 1
+        die_doctor "Preset not found: ${preset_name} (expected at ~/.claude-compose/presets/${preset_name}/)"
     fi
 
     local preset_config="$preset_dir/claude-compose.json"
@@ -1054,6 +1834,10 @@ process_preset() {
     fi
 
     echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
+
+    # Local presets don't use prefix/rename
+    CURRENT_PRESET_PREFIX=""
+    CURRENT_PRESET_RENAME='{}'
 
     # Process resources with MCP prefixing, skip manifest (we write it below)
     process_resources "$preset_config" "$preset_dir" "$preset_name" \
@@ -1089,13 +1873,28 @@ process_preset() {
     # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
     write_source_manifest "presets" "$preset_name"
 
-    # Recursively process nested presets
-    local nested_presets
-    nested_presets=$(jq -r '.presets // [] | .[]' "$preset_config" 2>/dev/null || true)
-    while IFS= read -r nested; do
-        [[ -z "$nested" ]] && continue
-        process_preset "$nested"
-    done <<< "$nested_presets"
+    # Recursively process nested presets (handles mixed arrays)
+    local nested_count
+    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    local ni
+    for ni in $(seq 0 $((nested_count - 1))); do
+        local nested_type
+        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
+        if [[ "$nested_type" == "string" ]]; then
+            local nested_name
+            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
+            [[ -z "$nested_name" ]] && continue
+            process_preset "$nested_name"
+        elif [[ "$nested_type" == "object" ]]; then
+            local nested_json
+            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
+            local nested_source
+            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
+            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                process_github_preset "$nested_json"
+            fi
+        fi
+    done
 }
 
 # ── Process a single workspace source ───────────────────────────────
@@ -1202,7 +2001,7 @@ process_resources() {
     CURRENT_SOURCE_ADD_DIRS=()
     CURRENT_SOURCE_PROJECT_DIRS=()
 
-    # ── Symlink agents ──
+    # ── Sync agents (symlink or copy+rename) ──
     local agents
     agents=$(jq -r '.resources.agents // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r agent_path; do
@@ -1215,16 +2014,32 @@ process_resources() {
         abs_path=$(cd "$(dirname "$abs_path")" && pwd -P)/$(basename "$abs_path")
         local agent_basename
         agent_basename=$(basename "$agent_path")
-        mkdir -p ".claude/agents"
-        if [[ -f ".claude/agents/${agent_basename}" || -L ".claude/agents/${agent_basename}" ]]; then
-            echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${agent_basename}" >&2
+        local name_no_ext="${agent_basename%.md}"
+        # Apply prefix/rename if active
+        local final_name="$name_no_ext"
+        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
+            final_name=$(apply_resource_prefix "$name_no_ext" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
         fi
-        ln -sf "$abs_path" ".claude/agents/${agent_basename}"
-        CURRENT_SOURCE_AGENTS+=("$agent_basename")
-        echo -e "  ${GREEN}+agent:${NC} ${agent_basename} (${label})" >&2
+        local final_agent="${final_name}.md"
+        mkdir -p ".claude/agents"
+        if [[ -f ".claude/agents/${final_agent}" || -L ".claude/agents/${final_agent}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${final_agent}" >&2
+        fi
+        if [[ "$final_name" != "$name_no_ext" ]]; then
+            # Name changed — copy and rewrite name: in frontmatter (Claude CLI reads it)
+            sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_path" > ".claude/agents/${final_agent}"
+        else
+            ln -sf "$abs_path" ".claude/agents/${final_agent}"
+        fi
+        CURRENT_SOURCE_AGENTS+=("$final_agent")
+        if [[ "$final_name" != "$name_no_ext" ]]; then
+            echo -e "  ${GREEN}+agent:${NC} ${name_no_ext} → ${final_name} (${label})" >&2
+        else
+            echo -e "  ${GREEN}+agent:${NC} ${name_no_ext} (${label})" >&2
+        fi
     done <<< "$agents"
 
-    # ── Symlink skills ──
+    # ── Sync skills (symlink or copy+rename) ──
     local skills
     skills=$(jq -r '.resources.skills // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r skill_path; do
@@ -1237,14 +2052,34 @@ process_resources() {
         abs_path=$(cd "$abs_path" && pwd -P)
         local skill_basename
         skill_basename=$(basename "$skill_path")
-        mkdir -p ".claude/skills"
-        if [[ -L ".claude/skills/${skill_basename}" || -d ".claude/skills/${skill_basename}" ]]; then
-            echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${skill_basename}/" >&2
-            rm -f ".claude/skills/${skill_basename}" 2>/dev/null || rm -rf ".claude/skills/${skill_basename}"
+        # Apply prefix/rename if active
+        local final_skill="$skill_basename"
+        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
+            final_skill=$(apply_resource_prefix "$skill_basename" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
         fi
-        ln -sf "$abs_path" ".claude/skills/${skill_basename}"
-        CURRENT_SOURCE_SKILLS+=("$skill_basename")
-        echo -e "  ${GREEN}+skill:${NC} ${skill_basename} (${label})" >&2
+        mkdir -p ".claude/skills"
+        if [[ -L ".claude/skills/${final_skill}" || -d ".claude/skills/${final_skill}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${final_skill}/" >&2
+            rm -f ".claude/skills/${final_skill}" 2>/dev/null || rm -rf ".claude/skills/${final_skill}"
+        fi
+        if [[ "$final_skill" != "$skill_basename" ]]; then
+            # Name changed — copy dir and rewrite name: in SKILL.md
+            cp -R "$abs_path" ".claude/skills/${final_skill}"
+            if [[ -f ".claude/skills/${final_skill}/SKILL.md" ]]; then
+                local tmp_skill
+                tmp_skill=$(mktemp ".claude/skills/${final_skill}/SKILL.md.XXXXXX")
+                sed "1,/^---$/s/^name:.*$/name: ${final_skill}/" ".claude/skills/${final_skill}/SKILL.md" > "$tmp_skill"
+                mv "$tmp_skill" ".claude/skills/${final_skill}/SKILL.md"
+            fi
+        else
+            ln -sf "$abs_path" ".claude/skills/${final_skill}"
+        fi
+        CURRENT_SOURCE_SKILLS+=("$final_skill")
+        if [[ "$final_skill" != "$skill_basename" ]]; then
+            echo -e "  ${GREEN}+skill:${NC} ${skill_basename} → ${final_skill} (${label})" >&2
+        else
+            echo -e "  ${GREEN}+skill:${NC} ${skill_basename} (${label})" >&2
+        fi
     done <<< "$skills"
 
     # ── Collect known env var names for MCP prefixing (when source_name is set) ──
@@ -1271,9 +2106,15 @@ process_resources() {
 
         # Prefix env vars from source's env_files (when source_name is set)
         if [[ -n "$source_name" && -n "${_source_known_vars:-}" ]]; then
-            local prefix
-            prefix=$(compute_source_prefix "$source_name" "$base_dir")
-            server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
+            local env_prefix
+            env_prefix=$(compute_source_prefix "$source_name" "$base_dir")
+            server_config=$(prefix_env_vars_in_mcp "$server_config" "$env_prefix" "$_source_known_vars")
+        fi
+
+        # Apply resource prefix/rename to server name
+        local final_server="$server_name"
+        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
+            final_server=$(apply_resource_prefix "$server_name" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
         fi
 
         if [[ ! -f ".mcp.json" ]]; then
@@ -1281,12 +2122,16 @@ process_resources() {
         fi
 
         local tmp
-        tmp=$(jq --arg name "$server_name" --argjson config "$server_config" \
+        tmp=$(jq --arg name "$final_server" --argjson config "$server_config" \
             '.mcpServers[$name] = $config' ".mcp.json")
         echo "$tmp" > ".mcp.json"
 
-        CURRENT_SOURCE_MCP_SERVERS+=("$server_name")
-        echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
+        CURRENT_SOURCE_MCP_SERVERS+=("$final_server")
+        if [[ "$final_server" != "$server_name" ]]; then
+            echo -e "  ${GREEN}+mcp:${NC} ${server_name} → ${final_server} (${label})" >&2
+        else
+            echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
+        fi
     done <<< "$mcp_keys"
 
     if [[ "$skip_manifest" != "true" ]]; then
@@ -1342,13 +2187,28 @@ process_global() {
 
     echo -e "${CYAN}Processing global config${NC}" >&2
 
-    # ── Global presets ──
-    local global_preset_names
-    global_preset_names=$(jq -r '.presets // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        process_preset "$name"
-    done <<< "$global_preset_names"
+    # ── Global presets (handles mixed arrays) ──
+    local gp_count
+    gp_count=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+    local gpi
+    for gpi in $(seq 0 $((gp_count - 1))); do
+        local gp_type
+        gp_type=$(jq -r ".presets[$gpi] | type" "$GLOBAL_CONFIG" 2>/dev/null || echo "null")
+        if [[ "$gp_type" == "string" ]]; then
+            local gp_name
+            gp_name=$(jq -r ".presets[$gpi]" "$GLOBAL_CONFIG")
+            [[ -z "$gp_name" ]] && continue
+            process_preset "$gp_name"
+        elif [[ "$gp_type" == "object" ]]; then
+            local gp_json
+            gp_json=$(jq -c ".presets[$gpi]" "$GLOBAL_CONFIG")
+            local gp_source
+            gp_source=$(echo "$gp_json" | jq -r '.source // empty')
+            if [[ -n "$gp_source" && "$gp_source" == github:* ]]; then
+                process_github_preset "$gp_json"
+            fi
+        fi
+    done
 
     # ── Global direct resources (agents, skills, MCP) ──
     process_resources "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "global" "global" "resources"
@@ -1390,6 +2250,165 @@ process_global() {
             ws_json=$(jq -c ".workspaces[$i]" "$GLOBAL_CONFIG")
             process_workspace_source "$ws_json"
         done
+    fi
+}
+
+# ── Process a GitHub preset ─────────────────────────────────────────
+process_github_preset() {
+    local entry_json="$1"
+
+    local source
+    source=$(echo "$entry_json" | jq -r '.source')
+    local prefix
+    prefix=$(echo "$entry_json" | jq -r '.prefix // empty')
+    local rename_json
+    rename_json=$(echo "$entry_json" | jq -c '.rename // {}')
+    # Parse source
+    parse_github_source "$source"
+    local owner="$_GH_OWNER" repo="$_GH_REPO" preset_path="$_GH_PATH" spec_str="$_GH_SPEC"
+
+    # Build source_key
+    local source_key="github:${owner}/${repo}"
+    [[ -n "$preset_path" ]] && source_key+="/${preset_path}"
+
+    # Cycle detection
+    for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
+        if [[ "$processed" == "$source_key" ]]; then
+            echo -e "${YELLOW}Warning: GitHub preset already processed, skipping: ${source_key}${NC}" >&2
+            return
+        fi
+    done
+    PROCESSED_PRESETS+=("$source_key")
+
+    require_git
+
+    echo -e "${CYAN}Processing GitHub preset:${NC} ${source_key}" >&2
+
+    # Resolve version
+    local resolved_info resolved_version
+    resolved_info=$(resolve_github_version "$owner" "$repo" "$source_key" "$spec_str")
+    read -r resolved_version _ <<< "$resolved_info"
+
+    # Get preset directory
+    local preset_dir
+    preset_dir=$(registry_preset_dir "$owner" "$repo" "$resolved_version" "$preset_path")
+
+    if [[ ! -d "$preset_dir" ]]; then
+        echo -e "${RED}Error: Preset directory not found in registry: ${preset_dir}${NC}" >&2
+        die_doctor "Preset directory not found in registry: ${preset_dir}. Try running: claude-compose update"
+    fi
+
+    local preset_config="$preset_dir/claude-compose.json"
+    if [[ ! -f "$preset_config" ]]; then
+        echo -e "${YELLOW}Warning: No claude-compose.json in GitHub preset: ${source_key}${NC}" >&2
+        return
+    fi
+
+    # Set prefix/rename for resource processing
+    CURRENT_PRESET_PREFIX="$prefix"
+    CURRENT_PRESET_RENAME="$rename_json"
+
+    # Compute stable source_name (without version) for env var prefixing
+    local source_name
+    source_name="${owner}_${repo}"
+    [[ -n "$preset_path" ]] && source_name+="_${preset_path}"
+    # If prefix is set, use it for more readable env var names
+    if [[ -n "$prefix" ]]; then
+        source_name="$prefix"
+    fi
+
+    # Process resources
+    process_resources "$preset_config" "$preset_dir" "$source_key" \
+        "presets" "$source_key" "$source_name" "true"
+
+    # CLAUDE.md via --add-dir
+    local claude_md
+    claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
+    if [[ "$claude_md" == "true" && -f "$preset_dir/CLAUDE.md" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("$preset_dir")
+    fi
+
+    # Collect preset's projects
+    local preset_project_count
+    preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    if [[ "$preset_project_count" -gt 0 ]]; then
+        local pi
+        for pi in $(seq 0 $((preset_project_count - 1))); do
+            local proj_path proj_claude_md
+            proj_path=$(jq -r ".projects[$pi].path" "$preset_config")
+            proj_path=$(expand_path "$proj_path")
+            proj_claude_md=$(jq -r ".projects[$pi].claude_md // true" "$preset_config")
+
+            if [[ ! -d "$proj_path" ]]; then
+                echo -e "${YELLOW}Warning: GitHub preset project path not found, skipping: ${proj_path}${NC}" >&2
+                continue
+            fi
+
+            CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
+            echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from github preset)" >&2
+        done
+    fi
+
+    # Write manifest entry
+    write_source_manifest "presets" "$source_key"
+
+    # Reset prefix/rename before nested presets (they set their own)
+    CURRENT_PRESET_PREFIX=""
+    CURRENT_PRESET_RENAME='{}'
+
+    # Recursively process nested presets
+    local nested_count
+    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    local ni
+    for ni in $(seq 0 $((nested_count - 1))); do
+        local nested_type
+        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
+        if [[ "$nested_type" == "string" ]]; then
+            local nested_name
+            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
+            [[ -z "$nested_name" ]] && continue
+            # Local presets within a github registry resolve relative to registry root
+            local reg_root
+            reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
+            if [[ -d "$reg_root/$nested_name" ]]; then
+                # Treat as another github preset from same repo
+                local nested_entry
+                nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" '{source: $s}')
+                process_github_preset "$nested_entry"
+            else
+                process_preset "$nested_name"
+            fi
+        elif [[ "$nested_type" == "object" ]]; then
+            local nested_json
+            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
+            local nested_source
+            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
+            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                process_github_preset "$nested_json"
+            fi
+        fi
+    done
+}
+
+# ── Apply resource prefix/rename ──────────────────────────────────────
+# $1 = original name, $2 = prefix, $3 = rename JSON object
+# Prints the final name
+apply_resource_prefix() {
+    local name="$1" prefix="$2" rename_json="$3"
+
+    # Check rename map first
+    local renamed
+    renamed=$(echo "$rename_json" | jq -r --arg n "$name" '.[$n] // empty')
+    if [[ -n "$renamed" ]]; then
+        echo "$renamed"
+        return
+    fi
+
+    # Apply prefix
+    if [[ -n "$prefix" ]]; then
+        echo "${prefix}-${name}"
+    else
+        echo "$name"
     fi
 }
 
@@ -1444,13 +2463,28 @@ build() {
     # Process global config (presets, resources, workspaces)
     process_global
 
-    # Process presets
-    local preset_names
-    preset_names=$(jq -r '.presets // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        process_preset "$name"
-    done <<< "$preset_names"
+    # Process presets (handles mixed arrays)
+    local bp_count
+    bp_count=$(jq '.presets // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    local bpi
+    for bpi in $(seq 0 $((bp_count - 1))); do
+        local bp_type
+        bp_type=$(jq -r ".presets[$bpi] | type" "$CONFIG_FILE" 2>/dev/null || echo "null")
+        if [[ "$bp_type" == "string" ]]; then
+            local bp_name
+            bp_name=$(jq -r ".presets[$bpi]" "$CONFIG_FILE")
+            [[ -z "$bp_name" ]] && continue
+            process_preset "$bp_name"
+        elif [[ "$bp_type" == "object" ]]; then
+            local bp_json
+            bp_json=$(jq -c ".presets[$bpi]" "$CONFIG_FILE")
+            local bp_source
+            bp_source=$(echo "$bp_json" | jq -r '.source // empty')
+            if [[ -n "$bp_source" && "$bp_source" == github:* ]]; then
+                process_github_preset "$bp_json"
+            fi
+        fi
+    done
 
     # Process workspaces
     if [[ "$ws_count" -gt 0 ]]; then
@@ -1485,12 +2519,14 @@ cmd_build() {
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
-        exit 1
+        die_doctor "Config file not found: ${CONFIG_FILE}"
     fi
 
     if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local json_err
+        json_err=$(jq empty "$CONFIG_FILE" 2>&1 | head -5)
         echo -e "${RED}Error: Invalid JSON in ${CONFIG_FILE}${NC}" >&2
-        exit 1
+        die_doctor "Invalid JSON in ${CONFIG_FILE}: ${json_err}"
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
@@ -1540,24 +2576,47 @@ cmd_build() {
 
         if [[ "$preset_count" -gt 0 ]]; then
             echo -e "${CYAN}Presets to process:${NC}" >&2
-            jq -r '.presets // [] | .[]' "$CONFIG_FILE" | while read -r name; do
-                local preset_dir="$PRESETS_DIR/$name"
-                if [[ -d "$preset_dir" ]]; then
-                    echo -e "  - $name (${preset_dir})" >&2
-                    if [[ -f "$preset_dir/claude-compose.json" ]]; then
-                        local pa ps pm
-                        pa=$(jq '.resources.agents // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                        ps=$(jq '.resources.skills // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                        pm=$(jq '.resources.mcp // {} | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                        [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
-                        [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
-                        [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+            local dri
+            for dri in $(seq 0 $((preset_count - 1))); do
+                local dr_type
+                dr_type=$(jq -r ".presets[$dri] | type" "$CONFIG_FILE")
+                if [[ "$dr_type" == "string" ]]; then
+                    local name
+                    name=$(jq -r ".presets[$dri]" "$CONFIG_FILE")
+                    local preset_dir="$PRESETS_DIR/$name"
+                    if [[ -d "$preset_dir" ]]; then
+                        echo -e "  - $name (${preset_dir})" >&2
+                        if [[ -f "$preset_dir/claude-compose.json" ]]; then
+                            local pa ps pm
+                            pa=$(jq '.resources.agents // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                            ps=$(jq '.resources.skills // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                            pm=$(jq '.resources.mcp // {} | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+                            [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
+                            [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
+                            [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                        else
+                            echo "    (no claude-compose.json)" >&2
+                        fi
+                        [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
                     else
-                        echo "    (no claude-compose.json)" >&2
+                        echo -e "  - $name ${RED}(not found)${NC}" >&2
                     fi
-                    [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
-                else
-                    echo -e "  - $name ${RED}(not found)${NC}" >&2
+                elif [[ "$dr_type" == "object" ]]; then
+                    local dr_source dr_prefix dr_locked_ver
+                    dr_source=$(jq -r ".presets[$dri].source // empty" "$CONFIG_FILE")
+                    dr_prefix=$(jq -r ".presets[$dri].prefix // empty" "$CONFIG_FILE")
+                    echo -e "  - ${dr_source}" >&2
+                    [[ -n "$dr_prefix" ]] && echo "    prefix: ${dr_prefix}" >&2
+                    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                        parse_github_source "$dr_source"
+                        local dr_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                        [[ -n "$_GH_PATH" ]] && dr_sk+="/${_GH_PATH}"
+                        dr_locked_ver=$(jq -r --arg k "$dr_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                        [[ -n "$dr_locked_ver" ]] && echo "    locked: v${dr_locked_ver}" >&2
+                        local dr_dir
+                        dr_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$dr_locked_ver" "$_GH_PATH")
+                        [[ -d "$dr_dir" ]] && echo "    path: ${dr_dir}" >&2
+                    fi
                 fi
             done
             echo "" >&2
@@ -1959,6 +3018,241 @@ cmd_config() {
     claude --system-prompt "$prompt" -p "do it"
 }
 
+# ── Update Command ─────────────────────────────────────────────────────
+cmd_update() {
+    require_jq
+    require_git
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${BOLD}Checking for updates...${NC}" >&2
+    echo "" >&2
+
+    local updated=false
+
+    # Collect github presets from config and global
+    _update_presets_from_config() {
+        local conf="$1"
+        [[ ! -f "$conf" ]] && return
+
+        local count
+        count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local entry_type
+            entry_type=$(jq -r ".presets[$i] | type" "$conf")
+            [[ "$entry_type" != "object" ]] && continue
+
+            local source
+            source=$(jq -r ".presets[$i].source // empty" "$conf")
+            [[ -z "$source" || "$source" != github:* ]] && continue
+
+            # If specific source filter is set, skip non-matching
+            if [[ -n "$UPDATE_SOURCE" && "$source" != *"$UPDATE_SOURCE"* ]]; then
+                continue
+            fi
+
+            parse_github_source "$source"
+            local owner="$_GH_OWNER" repo="$_GH_REPO" preset_path="$_GH_PATH" spec_str="$_GH_SPEC"
+
+            local source_key="github:${owner}/${repo}"
+            [[ -n "$preset_path" ]] && source_key+="/${preset_path}"
+
+            local spec_parsed
+            spec_parsed=$(parse_version_spec "$spec_str")
+            local spec_type spec_major spec_minor spec_patch
+            read -r spec_type spec_major spec_minor spec_patch <<< "$spec_parsed"
+
+            # Read current lock
+            local locked_version="" locked_tag=""
+            local lock_data
+            if lock_data=$(lock_read "$source_key"); then
+                read -r locked_version locked_tag _ <<< "$lock_data"
+            fi
+
+            echo -e "${CYAN}${source_key}${NC}" >&2
+            if [[ -n "$locked_version" ]]; then
+                echo -e "  Current: v${locked_version} (spec: ${spec_str:-latest})" >&2
+            else
+                echo -e "  Current: (not installed)" >&2
+            fi
+
+            if [[ "$spec_type" == "exact" ]]; then
+                echo -e "  ${YELLOW}Pinned at v${spec_major}.${spec_minor}.${spec_patch}${NC}" >&2
+                continue
+            fi
+
+            # Fetch remote tags
+            local remote_tags
+            if ! remote_tags=$(registry_list_remote_tags "$owner" "$repo"); then
+                echo -e "  ${RED}Failed to fetch tags${NC}" >&2
+                continue
+            fi
+
+            local best_tag
+            if ! best_tag=$(find_best_tag "$remote_tags" "$spec_type" "$spec_major" "$spec_minor" "$spec_patch"); then
+                echo -e "  ${YELLOW}No matching tags found${NC}" >&2
+                continue
+            fi
+
+            local best_parsed
+            best_parsed=$(parse_tag_version "$best_tag")
+            local best_major best_minor best_patch
+            read -r best_major best_minor best_patch <<< "$best_parsed"
+            local best_version="${best_major}.${best_minor}.${best_patch}"
+
+            if [[ "$best_version" == "$locked_version" ]]; then
+                echo -e "  ${GREEN}Already up to date (v${best_version})${NC}" >&2
+                continue
+            fi
+
+            # Clone new version
+            if ! registry_has_clone "$owner" "$repo" "$best_version"; then
+                registry_clone_version "$owner" "$repo" "$best_tag" || continue
+            fi
+
+            if [[ -n "$locked_version" ]]; then
+                if check_major_bump "$locked_version" "$best_version"; then
+                    echo -e "  ${YELLOW}Major update:${NC} v${locked_version} → v${best_version}" >&2
+                else
+                    echo -e "  ${GREEN}Updated:${NC} v${locked_version} → v${best_version}" >&2
+                fi
+            else
+                echo -e "  ${GREEN}Installed:${NC} v${best_version}" >&2
+            fi
+
+            lock_write "$source_key" "$best_version" "$best_tag" "$spec_str"
+            updated=true
+        done
+    }
+
+    _update_presets_from_config "$CONFIG_FILE"
+    _update_presets_from_config "$GLOBAL_CONFIG"
+
+    unset -f _update_presets_from_config
+
+    echo "" >&2
+    if [[ "$updated" == true ]]; then
+        # Force rebuild
+        rm -f ".compose-hash"
+        echo -e "${GREEN}Updates applied. Rebuild will happen on next launch.${NC}" >&2
+    else
+        echo -e "${GREEN}All registries are up to date.${NC}" >&2
+    fi
+}
+
+# ── Doctor Command ─────────────────────────────────────────────────────
+cmd_doctor() {
+    require_jq
+    require_claude
+    launch_doctor ""
+}
+
+# ── Start Command ──────────────────────────────────────────────────────
+cmd_start() {
+    require_claude
+
+    local root_path=""
+    if [[ -n "$START_PATH" ]]; then
+        root_path=$(expand_path "$START_PATH")
+        if [[ ! -d "$root_path" ]]; then
+            echo -e "${RED}Error: Directory not found: ${root_path}${NC}" >&2
+            exit 1
+        fi
+        root_path=$(cd "$root_path" && pwd)
+    fi
+
+    local prompt
+    prompt=$(compose_start_prompt "$root_path")
+
+    echo -e "${BOLD}claude-compose start${NC} — Onboarding wizard" >&2
+    echo "" >&2
+
+    if [[ -n "$root_path" ]]; then
+        (cd "$root_path" && claude --system-prompt "$prompt")
+    else
+        claude --system-prompt "$prompt"
+    fi
+}
+
+# ── Registries Command ─────────────────────────────────────────────────
+cmd_registries() {
+    require_jq
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${BOLD}GitHub Presets${NC}" >&2
+    echo "" >&2
+
+    local found=false
+
+    _list_presets_from_config() {
+        local conf="$1" conf_label="$2"
+        [[ ! -f "$conf" ]] && return
+
+        local count
+        count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local entry_type
+            entry_type=$(jq -r ".presets[$i] | type" "$conf")
+            [[ "$entry_type" != "object" ]] && continue
+
+            local source
+            source=$(jq -r ".presets[$i].source // empty" "$conf")
+            [[ -z "$source" || "$source" != github:* ]] && continue
+
+            found=true
+
+            local prefix rename
+            prefix=$(jq -r ".presets[$i].prefix // empty" "$conf")
+            rename=$(jq -c ".presets[$i].rename // empty" "$conf")
+
+            parse_github_source "$source"
+
+            local source_key="github:${_GH_OWNER}/${_GH_REPO}"
+            [[ -n "$_GH_PATH" ]] && source_key+="/${_GH_PATH}"
+
+            echo -e "${CYAN}${source_key}${NC} (${conf_label})" >&2
+            echo "  Source: ${source}" >&2
+            echo "  Spec: ${_GH_SPEC:-latest}" >&2
+
+            if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                local locked_ver locked_tag
+                locked_ver=$(jq -r --arg k "$source_key" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                locked_tag=$(jq -r --arg k "$source_key" '.registries[$k].tag // empty' "$LOCK_FILE" 2>/dev/null || true)
+                if [[ -n "$locked_ver" ]]; then
+                    echo "  Locked: v${locked_ver} (${locked_tag})" >&2
+                    local reg_dir
+                    reg_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$locked_ver" "$_GH_PATH")
+                    echo "  Path: ${reg_dir}" >&2
+                else
+                    echo "  Locked: (not installed)" >&2
+                fi
+            fi
+
+            [[ -n "$prefix" ]] && echo "  Prefix: ${prefix}" >&2
+            [[ -n "$rename" && "$rename" != "null" ]] && echo "  Rename: ${rename}" >&2
+            echo "" >&2
+        done
+    }
+
+    _list_presets_from_config "$CONFIG_FILE" "workspace"
+    _list_presets_from_config "$GLOBAL_CONFIG" "global"
+
+    unset -f _list_presets_from_config
+
+    if [[ "$found" != true ]]; then
+        echo -e "${YELLOW}No GitHub presets configured.${NC}" >&2
+    fi
+}
+
 # ── Embedded built-in skills ────────────────────────────────────────
 # Skills are embedded at build time and extracted to ~/.claude-compose/skills/
 # on first run or when the version changes.
@@ -2313,60 +3607,494 @@ PROMPT_EOF
     echo "$prompt"
 }
 
-compose_fix_prompt() {
+compose_doctor_prompt() {
     local config_file="$1"
-    local error_msg="$2"
+    local workspace_dir="$2"
+    local error_msg="$3"
     local prompt
     IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
-# compose-fix — Fix claude-compose config problem
+# compose-doctor — Diagnose and fix claude-compose problems
+
+<!-- Keep in sync with compose-instructions.md — content is inlined because Makefile cannot nest __PROMPT__ markers -->
 
 Config file: `__CONFIG_FILE__`
+Workspace: `__WORKSPACE_DIR__`
+Mode: __DOCTOR_MODE__
 
-## Problem detected
+## Error context
 
 ```
-__ERROR__
+__ERROR_CONTEXT__
 ```
 
-## Your task
+## Workspace summary
 
-Read the config file, understand the problem, propose a fix, confirm with the user, and apply it.
+__WORKSPACE_SUMMARY__
 
-## Steps
+---
 
-1. **Read** the current config:
+## Full compose knowledge
+
+claude-compose is a multi-project workspace launcher (like Docker Compose for Claude Code). It creates a unified working environment where you can work across multiple codebases simultaneously.
+
+### Key concepts
+
+**Workspace directory** — the current working directory. It may contain its own code, or serve purely as a launch point for working with external projects. All Claude configuration (.claude/, .mcp.json, agents, skills, permissions) lives here and is managed by claude-compose.
+
+**Projects** — external codebases added via `--add-dir`. They provide file access (read/write) and optionally their CLAUDE.md instructions. Projects are listed in `claude-compose.json` and referenced by aliases (e.g., `myapp://src/main.ts`).
+
+**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose.json` with explicit `resources` declarations (same format as workspace). Activated by name in config. Can also come from GitHub registries via `{"source": "github:owner/repo@spec"}`.
+
+**Workspaces** — other claude-compose workspaces that can share their configuration (MCP servers, agents, skills) into this one at build time.
+
+**Build** — the process of syncing resources from presets/workspaces/local config into the workspace's `.claude/` directory and `.mcp.json`. Runs automatically at launch when changes are detected.
+
+**Global config** — `~/.claude-compose/global.json` is an optional file with the same schema as `claude-compose.json`. It is auto-applied to all workspaces. Useful for presets, MCP servers, agents, or skills you always want available. **Important: global and local configs are processed independently — their arrays (presets, projects, etc.) are NOT merged. Each is iterated separately at build time.** An empty `"presets": []` in local config does NOT conflict with global presets.
+
+### Config schema (claude-compose.json)
+
+```json
+{
+  "resources": {
+    "agents": ["agents/reviewer.md"],
+    "skills": ["skills/commit"],
+    "mcp": { "server-name": { "command": "...", "args": ["..."] } },
+    "env_files": [".env.json"]
+  },
+  "projects": [
+    { "path": "~/Code/my-app", "name": "myapp" },
+    { "path": "~/Code/my-lib", "name": "mylib", "claude_md": false }
+  ],
+  "workspaces": [
+    { "path": "~/workspaces/shared", "mcp": { "rename": { "cal": "shared-cal" } } }
+  ],
+  "presets": ["my-tools", "common-agents"],
+  "update_interval": 24
+}
+```
+
+Field rules:
+- `projects[].path` — path to external project (required)
+- `projects[].name` — alias for file references (required)
+- `projects[].claude_md` — load CLAUDE.md from project (default: `true`, omit if true)
+- `presets[]` — string (local preset name) or object `{"source": "github:owner/repo@spec", "prefix": "...", "rename": {...}, "env_files": [...]}`
+- `resources.agents` — array of string paths to agent .md files
+- `resources.skills` — array of string paths to skill directories
+- `resources.mcp` — object of MCP server configs
+- `resources.env_files` — array of string paths to JSON env files
+- `update_interval` — number (hours), must be >= 0
+- `workspaces[].path` — path to source workspace (required)
+- `workspaces[].mcp.include/exclude/rename` — MCP server filters
+- `workspaces[].agents.include/exclude/rename` — agent filters
+- `workspaces[].skills.include/exclude` — skill filters
+
+GitHub preset source format: `github:owner/repo[/path][@version-spec]`
+- Version spec: `@1.2.3` (exact), `@^1.2.3` (compatible), `@~1.2.3` (patch-only), omit for latest
+- Owner/repo must be alphanumeric with hyphens/dots/underscores
+- Path segments must not contain `.` or `..`
+
+### File structure
+
+```
+workspace/
+├── claude-compose.json        # main config
+├── claude-compose.lock.json   # version lock for GitHub presets
+├── CLAUDE.md                  # workspace instructions
+├── .mcp.json                  # GENERATED — merged MCP servers
+├── .compose-manifest.json     # GENERATED — tracks synced resources
+├── .compose-hash              # GENERATED — content hash for rebuild detection
+├── .claude/
+│   ├── agents/                # GENERATED — symlinks to agent files
+│   ├── skills/                # GENERATED — symlinks to skill dirs
+│   └── settings.local.json    # permissions (user-managed)
+├── agents/                    # user-created agent source files
+├── skills/                    # user-created skill source dirs
+└── .env.json                  # env vars for MCP servers
+```
+
+Global config: `~/.claude-compose/global.json` (same schema)
+Presets dir: `~/.claude-compose/presets/<name>/`
+Registries dir: `~/.claude-compose/registries/<owner>/<repo>/<version>/`
+
+### CLI reference
+
+```
+claude-compose                        # launch workspace
+claude-compose build [--force]        # build/rebuild resources
+claude-compose config                 # create or edit config interactively
+claude-compose config -y ~/path       # quick-create config with one project
+claude-compose config --check         # validate config
+claude-compose migrate ~/project      # import config from existing project
+claude-compose copy ~/ws/src ~/ws/dst # clone workspace
+claude-compose update [source]        # check and apply GitHub preset updates
+claude-compose registries             # list GitHub presets and status
+claude-compose instructions           # show workspace management guide
+claude-compose doctor                 # diagnose and fix problems
+claude-compose start [root-path]      # onboarding wizard
+claude-compose --dry-run              # preview without mutations
+claude-compose -- -p "prompt"         # pass args through to claude
+```
+
+---
+
+## Diagnostic approach
+
+### If error context is present (auto-triggered mode)
+
+You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway or ask the user to run commands. Your goal is to leave the config in a valid, launchable state.
+
+1. **Read** the config file:
    ```bash
    cat __CONFIG_FILE__
    ```
 
-2. **Explain** the problem in plain language, referencing the specific entries that need fixing.
+2. **Analyze** the error and identify ALL problems — not just the reported one. Check:
+   - JSON syntax validity
+   - Required fields (every project needs `"name"`)
+   - Field types match schema
+   - Referenced presets exist (`ls ~/.claude-compose/presets/`)
+   - Referenced project paths exist (expand `~` to `$HOME` when checking)
+   - Global config if relevant: `~/.claude-compose/global.json`
 
-3. **Propose** the corrected JSON entries. Show the updated section.
+3. **Fix everything** in one pass. For ambiguous fixes, use sensible defaults:
+   - Missing `"name"` → use basename of path
+   - Nonexistent preset → remove it from config
+   - Nonexistent project path → warn but keep (user may create it later)
 
-4. **Confirm** with the user before writing.
-
-5. **Apply** atomically:
+4. **Apply** atomically:
    ```bash
    tmp=$(mktemp __CONFIG_FILE__.XXXXXX)
-   echo '<updated json>' | jq '.' > "$tmp" && mv "$tmp" __CONFIG_FILE__
+   jq '.' <<< '<updated json>' > "$tmp" && mv "$tmp" __CONFIG_FILE__
    ```
    If `jq` fails, remove `$tmp` and report the error.
 
-6. **Verify** by reading the file again and confirming the relevant sections look correct.
+5. **Verify** by reading the file back AND running a full validation:
+   ```bash
+   cat __CONFIG_FILE__
+   jq empty __CONFIG_FILE__
+   ```
+   If verification fails, fix again.
 
-7. **Tell** the user they can now re-run `claude-compose` to launch.
+6. **Report** what was fixed and tell the user to re-run `claude-compose`.
+
+**Key rule: the session must end with a fully valid config. Never exit leaving known problems unfixed.**
+
+### If no error context (manual `claude-compose doctor`)
+
+1. **Ask** the user what problem they're experiencing.
+
+2. **Investigate** systematically:
+   - Read config file
+   - Check JSON validity
+   - Validate semantic correctness (required fields, types, values)
+   - Check that referenced paths exist (project dirs, preset dirs, workspace dirs)
+   - Check global config
+   - Check `.mcp.json` and `.compose-manifest.json` for build state
+   - Check tool availability (jq, git, claude)
+
+3. **Report** findings and propose fixes.
+
+4. **Apply** fixes with user confirmation.
+
+---
+
+## Common problems and solutions
+
+### Invalid JSON
+- **Symptom**: `jq` parse error
+- **Cause**: Trailing commas, missing quotes, unmatched braces, bad escaping
+- **Fix**: Read the file, find the syntax error, rewrite the corrected JSON
+
+### Missing project name
+- **Symptom**: "Each project must have a name field"
+- **Fix**: Add `"name"` field to each project entry. Suggest basename of path.
+
+### Wrong field types
+- **Symptom**: "X must be an array/object, got: Y"
+- **Fix**: Convert to the correct type. Show before/after.
+
+### Preset not found
+- **Symptom**: "Preset not found: X"
+- **Cause**: Preset directory `~/.claude-compose/presets/X/` doesn't exist
+- **Fix**: List available presets (`ls ~/.claude-compose/presets/`), suggest correction or creation
+
+### GitHub preset errors
+- **Symptom**: Various source format or git clone errors
+- **Cause**: Invalid source format, network issues, private repo without auth
+- **Fix**: Verify source format, check network, suggest `git clone` manually to test
+
+### Global config errors
+- **Symptom**: "Global config error" or "Invalid JSON in global config"
+- **Cause**: Same issues as workspace config but in `~/.claude-compose/global.json`
+- **Fix**: Same approach but on the global config file
+
+### Build failures
+- **Symptom**: Errors during preset/workspace processing
+- **Cause**: Missing dependencies, broken symlinks, permission issues
+- **Fix**: Check the specific resource, verify source exists, fix paths
+
+### Missing tools
+- **Symptom**: "jq is required" / "git is required" / "claude CLI not found"
+- **Fix**: Provide install instructions:
+  - jq: `brew install jq` / `apt install jq`
+  - git: `brew install git` / `apt install git` / Xcode Command Line Tools
+  - claude: See Anthropic docs for Claude CLI installation
+
+### Project path not found
+- **Symptom**: "Warning: Project path not found, skipping"
+- **Cause**: Path in config doesn't exist on disk
+- **Fix**: Check if path is correct, if `~` needs expansion, or if directory was moved
+
+---
 
 ## Rules
 
 - Use `jq` to parse and produce all JSON — never sed or string concatenation.
 - Atomic writes only: `mktemp` + `mv`.
 - Keep `~` in paths as-is (claude-compose expands them at runtime).
-- Fix only what the problem describes. Do not change unrelated fields.
-- If the user wants additional changes, make them after fixing the reported problem.
-- If `__CONFIG_FILE__` does not exist, tell the user and suggest running `claude-compose config`.
+- Fix ALL problems found, not just the first one. The config must be fully valid when you're done.
+- If `__CONFIG_FILE__` does not exist, create a minimal valid config with an empty projects array.
+- If global config is the problem, edit `~/.claude-compose/global.json` (not the workspace config).
+- For ambiguous fixes, use sensible defaults and explain what you chose.
+- Remove references to nonexistent presets rather than leaving broken config.
+- After fixing, always verify by reading the file back and checking with `jq empty`.
 PROMPT_EOF
     prompt="${prompt//__CONFIG_FILE__/$config_file}"
-    prompt="${prompt//__ERROR__/$error_msg}"
+    prompt="${prompt//__WORKSPACE_DIR__/$workspace_dir}"
+
+    if [[ -n "$error_msg" ]]; then
+        prompt="${prompt//__ERROR_CONTEXT__/$error_msg}"
+        prompt="${prompt//__DOCTOR_MODE__/analyze and fix the error below}"
+    else
+        prompt="${prompt//__ERROR_CONTEXT__/No error — manual diagnostic session}"
+        prompt="${prompt//__DOCTOR_MODE__/interactive — ask the user what problem they are experiencing}"
+    fi
+
+    # Build workspace summary
+    local ws_summary="(no config file found)"
+    if [[ -f "$config_file" ]] && jq empty "$config_file" 2>/dev/null; then
+        local pc prc wsc ac sc mc ec
+        pc=$(jq '.projects // [] | length' "$config_file" 2>/dev/null || echo 0)
+        prc=$(jq '.presets // [] | length' "$config_file" 2>/dev/null || echo 0)
+        wsc=$(jq '.workspaces // [] | length' "$config_file" 2>/dev/null || echo 0)
+        ac=$(jq '.resources.agents // [] | length' "$config_file" 2>/dev/null || echo 0)
+        sc=$(jq '.resources.skills // [] | length' "$config_file" 2>/dev/null || echo 0)
+        mc=$(jq '.resources.mcp // {} | length' "$config_file" 2>/dev/null || echo 0)
+        ec=$(jq '.resources.env_files // [] | length' "$config_file" 2>/dev/null || echo 0)
+        ws_summary="Projects: ${pc}, Presets: ${prc}, Workspaces: ${wsc}, Resources: ${ac} agents, ${sc} skills, ${mc} MCP servers, ${ec} env files"
+    fi
+    prompt="${prompt//__WORKSPACE_SUMMARY__/$ws_summary}"
+
+    echo "$prompt"
+}
+
+compose_start_prompt() {
+    local root_path="$1"
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
+# compose-start — Onboarding wizard for claude-compose
+
+You are the claude-compose onboarding assistant. Your job is to help the user set up one or more claude-compose workspaces by scanning for projects and creating configuration interactively.
+
+Root path hint: `__START_ROOT_PATH__`
+
+---
+
+## Full compose knowledge
+
+claude-compose is a multi-project workspace launcher (like Docker Compose for Claude Code). It creates a unified working environment where you can work across multiple codebases simultaneously.
+
+### Key concepts
+
+**Workspace directory** — a directory containing `claude-compose.json` and all Claude configuration. It may contain its own code, or serve purely as a launch point.
+
+**Projects** — external codebases added to a workspace. They provide file access (read/write) and optionally their CLAUDE.md instructions. Referenced by aliases (e.g., `myapp://src/main.ts`).
+
+**Presets** — reusable sets of resources (MCP servers, agents, skills) stored at `~/.claude-compose/presets/<name>/`. Activated by name in config.
+
+**Workspaces** — other claude-compose workspaces that can share their configuration into a new workspace at build time.
+
+**Build** — the process of syncing resources from presets/workspaces/local config into the workspace. Runs automatically at launch.
+
+**Global config** — `~/.claude-compose/global.json` applies to all workspaces automatically.
+
+### Config schema (claude-compose.json)
+
+```json
+{
+  "projects": [
+    { "path": "~/Code/my-app", "name": "myapp" },
+    { "path": "~/Code/my-lib", "name": "mylib", "claude_md": false }
+  ],
+  "presets": ["my-tools"],
+  "workspaces": [
+    { "path": "~/other-workspace" }
+  ],
+  "resources": {
+    "agents": ["agents/reviewer.md"],
+    "skills": ["skills/commit"],
+    "mcp": { "server-name": { "command": "...", "args": ["..."] } },
+    "env_files": [".env.json"]
+  }
+}
+```
+
+- `projects[].path` — path to project (required). Keep `~` as-is.
+- `projects[].name` — short alias (required). Used as `name://` prefix for file references.
+- `projects[].claude_md` — load CLAUDE.md from project (default: true, omit if true)
+- Omit fields that equal defaults. Minimal entry: `{"path": "~/path", "name": "alias"}`
+
+### Workspace organization patterns
+
+1. **Single workspace** — one workspace with all projects. Best for related projects that you work on together.
+2. **Multiple workspaces** — separate workspaces for different contexts (e.g., work vs personal, frontend vs backend). Good for isolation.
+3. **Per-project workspaces** — one workspace per project. Useful when projects are independent.
+
+### CLI reference
+
+```
+claude-compose                        # launch workspace
+claude-compose build [--force]        # build/rebuild resources
+claude-compose config                 # create or edit config interactively
+claude-compose config -y ~/path       # quick-create with one project
+claude-compose migrate ~/project      # import existing Claude config from a project
+claude-compose doctor                 # diagnose and fix problems
+claude-compose --dry-run              # preview mode
+```
+
+---
+
+## 5-phase workflow
+
+### Phase 1: Confirm root directory
+
+If a root path was provided (`__START_ROOT_PATH__`), confirm it with the user:
+- "I'll scan `<path>` for projects. Sound good?"
+
+If no root path was provided (shows "not specified"):
+- Ask the user which directory to scan for projects.
+
+### Phase 2: Scan for projects
+
+Run a find command to discover Claude-enabled projects:
+```bash
+find <root> -maxdepth 3 \( -name '.claude' -o -name 'CLAUDE.md' \) \
+  -not -path '*/node_modules/*' \
+  -not -path '*/\.git/*' \
+  -not -path '*/.claude-compose/*' \
+  -not -path '*/vendor/*' \
+  -not -path '*/venv/*' \
+  -not -path '*/__pycache__/*' \
+  2>/dev/null
+```
+
+Also look for common project indicators:
+```bash
+find <root> -maxdepth 2 \( -name 'package.json' -o -name 'Cargo.toml' -o -name 'go.mod' -o -name '*.xcodeproj' -o -name 'pyproject.toml' -o -name '*.sln' -o -name 'Makefile' \) \
+  -not -path '*/node_modules/*' \
+  -not -path '*/\.git/*' \
+  2>/dev/null
+```
+
+Present findings:
+- Show discovered project directories with their indicators (has .claude/, has CLAUDE.md, language/framework)
+- Group by parent directory if useful
+- Highlight projects that already have Claude configuration
+
+### Phase 3: Discuss organization
+
+Based on the scan results, discuss workspace organization:
+
+1. Suggest a layout based on what was found:
+   - Few related projects → suggest single workspace
+   - Many projects in different domains → suggest multiple workspaces
+   - Projects already in separate contexts → suggest per-context workspaces
+
+2. Ask the user:
+   - Which projects they want to include
+   - How they'd like to organize them (single vs multiple workspaces)
+   - Where to create workspace directories
+   - If they want to name their workspace(s)
+
+3. Check for existing claude-compose workspaces:
+   ```bash
+   find <root> -maxdepth 2 -name 'claude-compose.json' 2>/dev/null
+   ```
+   If found, mention them and suggest `claude-compose migrate` for importing existing project configs.
+
+### Phase 4: Create workspaces
+
+For each workspace to create:
+
+1. **Create directory** (if it doesn't exist):
+   ```bash
+   mkdir -p <workspace-path>
+   ```
+
+2. **Write `claude-compose.json`** using jq:
+   ```bash
+   tmp=$(mktemp "<workspace-path>/claude-compose.json.XXXXXX")
+   jq -n '{
+     projects: [
+       {path: "~/Code/app", name: "app"},
+       {path: "~/Code/lib", name: "lib"}
+     ]
+   }' > "$tmp" && mv "$tmp" "<workspace-path>/claude-compose.json"
+   ```
+
+3. **Optionally create CLAUDE.md** if the user wants workspace-level instructions:
+   - Suggest a minimal starting point with cross-project context
+   - Only create if user confirms
+
+4. **Suggest migration** for projects with existing Claude config:
+   ```
+   claude-compose migrate ~/Code/app --workspace <workspace-path>
+   ```
+   This imports MCP servers, agents, skills, and permissions from the project.
+
+### Phase 5: Summary
+
+Show a summary of everything created:
+
+```
+Created workspaces:
+
+  ~/workspaces/main/
+    Projects: app, lib, shared
+    Config: claude-compose.json (3 projects)
+    Launch: cd ~/workspaces/main && claude-compose
+
+  ~/workspaces/infra/
+    Projects: deploy, monitoring
+    Config: claude-compose.json (2 projects)
+    Launch: cd ~/workspaces/infra && claude-compose
+```
+
+Suggest next steps:
+- `cd <workspace> && claude-compose` to launch
+- `claude-compose config` to edit config interactively
+- `claude-compose migrate <project>` for projects with existing Claude config
+- `claude-compose instructions` for the workspace management guide
+
+---
+
+## Rules
+
+- Keep `~` in paths as-is in config files (claude-compose expands them at runtime).
+- Use `jq` for all JSON operations — never string concatenation.
+- Atomic writes: `mktemp` + `mv`.
+- Do NOT launch claude-compose from within this session.
+- Do NOT modify any project files — only create workspace directories and configs.
+- Ask before creating anything — confirm directory locations and project selections.
+- If the user has existing `claude-compose.json` files, do not overwrite them without asking.
+- Be conversational — this is an interactive onboarding, not a batch script.
+- Suggest short, memorable project names (basename of path is usually good).
+PROMPT_EOF
+    if [[ -n "$root_path" ]]; then
+        prompt="${prompt//__START_ROOT_PATH__/$root_path}"
+    else
+        prompt="${prompt//__START_ROOT_PATH__/not specified — ask the user}"
+    fi
     echo "$prompt"
 }
 # ── Main ─────────────────────────────────────────────────────────────
@@ -2383,6 +4111,12 @@ main() {
         CONFIG_FILE="$(cd "$config_dir" && pwd)/$(basename "$CONFIG_FILE")"
     fi
 
+    # Set lock file path next to config
+    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
+    # Set up doctor trap (must be after parse_args so DOCTOR_ENABLED is correct)
+    trap '_doctor_trap' EXIT
+
     # Dispatch subcommands before validate (they have own validation)
     case "$SUBCOMMAND" in
         config) cmd_config; return ;;
@@ -2390,6 +4124,10 @@ main() {
         migrate) cmd_migrate; return ;;
         copy) cmd_copy; return ;;
         instructions) cmd_instructions; return ;;
+        update) cmd_update; return ;;
+        registries) cmd_registries; return ;;
+        doctor) cmd_doctor; return ;;
+        start) cmd_start; return ;;
     esac
 
     validate
@@ -2528,8 +4266,30 @@ main() {
 
         if [[ "$preset_count" -gt 0 ]]; then
             echo -e "${CYAN}Active presets:${NC}" >&2
-            jq -r '.presets // [] | .[]' "$CONFIG_FILE" | while read -r name; do
-                echo "  - $name" >&2
+            local dri_m
+            for dri_m in $(seq 0 $((preset_count - 1))); do
+                local drm_type
+                drm_type=$(jq -r ".presets[$dri_m] | type" "$CONFIG_FILE")
+                if [[ "$drm_type" == "string" ]]; then
+                    local drm_name
+                    drm_name=$(jq -r ".presets[$dri_m]" "$CONFIG_FILE")
+                    echo "  - $drm_name" >&2
+                elif [[ "$drm_type" == "object" ]]; then
+                    local drm_source drm_prefix
+                    drm_source=$(jq -r ".presets[$dri_m].source // empty" "$CONFIG_FILE")
+                    drm_prefix=$(jq -r ".presets[$dri_m].prefix // empty" "$CONFIG_FILE")
+                    echo -n "  - ${drm_source}" >&2
+                    [[ -n "$drm_prefix" ]] && echo -n " (prefix: ${drm_prefix})" >&2
+                    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                        parse_github_source "$drm_source"
+                        local drm_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                        [[ -n "$_GH_PATH" ]] && drm_sk+="/${_GH_PATH}"
+                        local drm_ver
+                        drm_ver=$(jq -r --arg k "$drm_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                        [[ -n "$drm_ver" ]] && echo -n " [v${drm_ver}]" >&2
+                    fi
+                    echo "" >&2
+                fi
             done
             echo "" >&2
         fi

@@ -11,6 +11,8 @@ usage() {
     echo "  claude-compose update [source]"
     echo "  claude-compose registries"
     echo "  claude-compose instructions"
+    echo "  claude-compose doctor"
+    echo "  claude-compose start [root-path]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
     echo "  build         Build workspace from presets/workspaces/resources (auto on launch)"
@@ -20,6 +22,8 @@ usage() {
     echo "  update        Check and apply updates for GitHub presets"
     echo "  registries    List configured GitHub presets and their status"
     echo "  instructions  Show instructions for managing workspace resources"
+    echo "  doctor        Diagnose and fix compose problems"
+    echo "  start         Onboarding wizard — scan for projects and create workspaces"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
@@ -39,6 +43,8 @@ usage() {
     echo "  claude-compose config -y ~/Code/app         # Quick create with defaults"
     echo "  claude-compose migrate ~/Code/app           # Import config from project"
     echo "  claude-compose copy ~/ws/main ~/ws/feature  # Clone workspace"
+    echo "  claude-compose doctor                        # Diagnose problems"
+    echo "  claude-compose start ~/Code                  # Onboarding wizard"
     echo "  claude-compose --dry-run                    # Preview mode"
     echo "  claude-compose -- -p \"explain arch\"         # Pass args to claude"
 }
@@ -100,7 +106,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions|update|registries)
+            config|build|migrate|copy|instructions|update|registries|doctor|start)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -194,6 +200,15 @@ parse_args() {
                             exit 1
                         fi
                         ;;
+                    start)
+                        if [[ -z "$START_PATH" && "$1" != -* ]]; then
+                            START_PATH="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
                     *)
                         echo -e "${RED}Unknown option: $1${NC}" >&2
                         usage >&2
@@ -238,6 +253,8 @@ require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
         echo "  Install: brew install jq" >&2
+        # shellcheck disable=SC2034
+        DOCTOR_ENABLED=false
         exit 1
     fi
 }
@@ -245,6 +262,45 @@ require_jq() {
 require_claude() {
     if ! command -v claude &>/dev/null; then
         echo -e "${RED}Error: claude CLI not found in PATH.${NC}" >&2
+        # shellcheck disable=SC2034
+        DOCTOR_ENABLED=false
         exit 1
+    fi
+}
+
+# ── Doctor helpers ──────────────────────────────────────────────────
+die_doctor() {
+    DOCTOR_ERROR_MSG="${1:-Unknown error}"
+    exit 1
+}
+
+launch_doctor() {
+    local error_msg="$1"
+    local config_file="${CONFIG_FILE:-claude-compose.json}"
+    local ws_dir
+    ws_dir="$(dirname "$config_file")"
+
+    local prompt
+    prompt=$(compose_doctor_prompt "$config_file" "$ws_dir" "$error_msg")
+
+    echo -e "${YELLOW}Launching doctor...${NC}" >&2
+
+    if [[ -n "$error_msg" ]]; then
+        (cd "$ws_dir" && claude --system-prompt "$prompt" "fix it")
+    else
+        (cd "$ws_dir" && claude --system-prompt "$prompt")
+    fi
+}
+
+_doctor_trap() {
+    local exit_code=$?
+    # Remove trap to prevent recursion
+    trap - EXIT
+    local was_enabled="$DOCTOR_ENABLED"
+    # shellcheck disable=SC2034
+    DOCTOR_ENABLED=false
+
+    if [[ "$was_enabled" == true && "$exit_code" -ne 0 && -n "$DOCTOR_ERROR_MSG" && "$DRY_RUN" != true ]]; then
+        launch_doctor "$DOCTOR_ERROR_MSG"
     fi
 }

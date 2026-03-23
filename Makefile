@@ -14,7 +14,8 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 			*__PROMPT_COMPOSE_SYSTEM__*) cat prompts/compose-system.md ;; \
 			*__PROMPT_COMPOSE_CONFIG__*) cat prompts/compose-config.md ;; \
 			*__PROMPT_COMPOSE_INSTRUCTIONS__*) cat prompts/compose-instructions.md ;; \
-			*__PROMPT_COMPOSE_FIX__*) cat prompts/compose-fix.md ;; \
+			*__PROMPT_COMPOSE_DOCTOR__*) cat prompts/compose-doctor.md ;; \
+			*__PROMPT_COMPOSE_START__*) cat prompts/compose-start.md ;; \
 			*__EMBEDDED_SKILLS__*) \
 				echo 'extract_embedded_skills() {'; \
 				echo '    local dest="$$1"'; \

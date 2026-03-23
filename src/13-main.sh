@@ -15,6 +15,9 @@ main() {
     # Set lock file path next to config
     LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
 
+    # Set up doctor trap (must be after parse_args so DOCTOR_ENABLED is correct)
+    trap '_doctor_trap' EXIT
+
     # Dispatch subcommands before validate (they have own validation)
     case "$SUBCOMMAND" in
         config) cmd_config; return ;;
@@ -24,6 +27,8 @@ main() {
         instructions) cmd_instructions; return ;;
         update) cmd_update; return ;;
         registries) cmd_registries; return ;;
+        doctor) cmd_doctor; return ;;
+        start) cmd_start; return ;;
     esac
 
     validate
