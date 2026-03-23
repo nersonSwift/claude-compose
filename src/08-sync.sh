@@ -39,7 +39,12 @@ sync_source_dir() {
 
                 local abs_agent_file
                 abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
-                ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
+                if [[ "$final_name" != "$agent_name" ]]; then
+                    # Name changed — copy and rewrite name: in frontmatter
+                    sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_agent_file" > ".claude/agents/${dest_file}"
+                else
+                    ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
+                fi
                 CURRENT_SOURCE_AGENTS+=("$dest_file")
                 if [[ "$final_name" != "$agent_name" ]]; then
                     echo -e "  ${GREEN}+agent:${NC} $agent_name → $final_name" >&2

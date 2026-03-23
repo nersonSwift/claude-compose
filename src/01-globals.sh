@@ -16,10 +16,13 @@ MIGRATE_WORKSPACE=""    # --workspace flag for migrate
 MIGRATE_PATH=""         # positional arg for migrate
 COPY_SOURCE=""          # positional arg for copy
 COPY_DEST=""            # positional arg for copy
+UPDATE_SOURCE=""        # optional positional arg for update
 PRESETS_DIR="$HOME/.claude-compose/presets"
 BUILTIN_SKILLS_DIR="$HOME/.claude-compose/skills"
 GLOBAL_CONFIG="$HOME/.claude-compose/global.json"
 GLOBAL_CONFIG_DIR="$HOME/.claude-compose"
+REGISTRIES_DIR="$HOME/.claude-compose/registries"
+LOCK_FILE=""            # Set at runtime: "${CONFIG_FILE%.json}.lock.json"
 PROCESSED_PRESETS=()    # cycle detection set
 PROCESSED_WORKSPACES=() # workspace dedup (absolute paths)
 
@@ -30,6 +33,8 @@ CURRENT_SOURCE_SKILLS=()
 CURRENT_SOURCE_MCP_SERVERS=()
 CURRENT_SOURCE_ADD_DIRS=()
 CURRENT_SOURCE_PROJECT_DIRS=()
+CURRENT_PRESET_PREFIX=""
+CURRENT_PRESET_RENAME='{}'
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'

@@ -8,6 +8,8 @@ usage() {
     echo "  claude-compose config [-y <path>] [--check] [-f <file>]"
     echo "  claude-compose migrate <project-path> [--delete] [--workspace <path>]"
     echo "  claude-compose copy <source-workspace> [dest-path]"
+    echo "  claude-compose update [source]"
+    echo "  claude-compose registries"
     echo "  claude-compose instructions"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
@@ -15,6 +17,8 @@ usage() {
     echo "  config        Create or manage claude-compose.json config"
     echo "  migrate       Copy Claude config from a project into this workspace"
     echo "  copy          Clone a workspace to a new location"
+    echo "  update        Check and apply updates for GitHub presets"
+    echo "  registries    List configured GitHub presets and their status"
     echo "  instructions  Show instructions for managing workspace resources"
     echo ""
     echo -e "${BOLD}Options:${NC}"
@@ -96,7 +100,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions)
+            config|build|migrate|copy|instructions|update|registries)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -175,6 +179,15 @@ parse_args() {
                             COPY_SOURCE="$1"
                         elif [[ -z "$COPY_DEST" && "$1" != -* ]]; then
                             COPY_DEST="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    update)
+                        if [[ -z "$UPDATE_SOURCE" && "$1" != -* ]]; then
+                            UPDATE_SOURCE="$1"
                         else
                             echo -e "${RED}Unknown option: $1${NC}" >&2
                             usage >&2

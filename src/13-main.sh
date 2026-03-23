@@ -12,6 +12,9 @@ main() {
         CONFIG_FILE="$(cd "$config_dir" && pwd)/$(basename "$CONFIG_FILE")"
     fi
 
+    # Set lock file path next to config
+    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     # Dispatch subcommands before validate (they have own validation)
     case "$SUBCOMMAND" in
         config) cmd_config; return ;;
@@ -19,6 +22,8 @@ main() {
         migrate) cmd_migrate; return ;;
         copy) cmd_copy; return ;;
         instructions) cmd_instructions; return ;;
+        update) cmd_update; return ;;
+        registries) cmd_registries; return ;;
     esac
 
     validate
@@ -157,8 +162,30 @@ main() {
 
         if [[ "$preset_count" -gt 0 ]]; then
             echo -e "${CYAN}Active presets:${NC}" >&2
-            jq -r '.presets // [] | .[]' "$CONFIG_FILE" | while read -r name; do
-                echo "  - $name" >&2
+            local dri_m
+            for dri_m in $(seq 0 $((preset_count - 1))); do
+                local drm_type
+                drm_type=$(jq -r ".presets[$dri_m] | type" "$CONFIG_FILE")
+                if [[ "$drm_type" == "string" ]]; then
+                    local drm_name
+                    drm_name=$(jq -r ".presets[$dri_m]" "$CONFIG_FILE")
+                    echo "  - $drm_name" >&2
+                elif [[ "$drm_type" == "object" ]]; then
+                    local drm_source drm_prefix
+                    drm_source=$(jq -r ".presets[$dri_m].source // empty" "$CONFIG_FILE")
+                    drm_prefix=$(jq -r ".presets[$dri_m].prefix // empty" "$CONFIG_FILE")
+                    echo -n "  - ${drm_source}" >&2
+                    [[ -n "$drm_prefix" ]] && echo -n " (prefix: ${drm_prefix})" >&2
+                    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                        parse_github_source "$drm_source"
+                        local drm_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                        [[ -n "$_GH_PATH" ]] && drm_sk+="/${_GH_PATH}"
+                        local drm_ver
+                        drm_ver=$(jq -r --arg k "$drm_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                        [[ -n "$drm_ver" ]] && echo -n " [v${drm_ver}]" >&2
+                    fi
+                    echo "" >&2
+                fi
             done
             echo "" >&2
         fi

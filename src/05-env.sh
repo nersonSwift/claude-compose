@@ -99,7 +99,13 @@ load_all_source_env_files() {
             [[ -z "$sname" ]] && continue
             local source_dir
             if [[ "$section" == "presets" ]]; then
-                source_dir="$PRESETS_DIR/$sname"
+                if [[ "$sname" == github:* ]]; then
+                    # GitHub preset: resolve dir from lock file
+                    source_dir=$(resolve_locked_preset_dir "$sname" 2>/dev/null || true)
+                    [[ -z "$source_dir" ]] && continue
+                else
+                    source_dir="$PRESETS_DIR/$sname"
+                fi
             else
                 source_dir="$sname"  # workspaces use absolute path as key
             fi

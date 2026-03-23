@@ -365,3 +365,204 @@ cmd_config() {
     prompt=$(compose_config_prompt "$CONFIG_FILE")
     claude --system-prompt "$prompt" -p "do it"
 }
+
+# ── Update Command ─────────────────────────────────────────────────────
+cmd_update() {
+    require_jq
+    require_git
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${BOLD}Checking for updates...${NC}" >&2
+    echo "" >&2
+
+    local updated=false
+
+    # Collect github presets from config and global
+    _update_presets_from_config() {
+        local conf="$1"
+        [[ ! -f "$conf" ]] && return
+
+        local count
+        count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local entry_type
+            entry_type=$(jq -r ".presets[$i] | type" "$conf")
+            [[ "$entry_type" != "object" ]] && continue
+
+            local source
+            source=$(jq -r ".presets[$i].source // empty" "$conf")
+            [[ -z "$source" || "$source" != github:* ]] && continue
+
+            # If specific source filter is set, skip non-matching
+            if [[ -n "$UPDATE_SOURCE" && "$source" != *"$UPDATE_SOURCE"* ]]; then
+                continue
+            fi
+
+            parse_github_source "$source"
+            local owner="$_GH_OWNER" repo="$_GH_REPO" preset_path="$_GH_PATH" spec_str="$_GH_SPEC"
+
+            local source_key="github:${owner}/${repo}"
+            [[ -n "$preset_path" ]] && source_key+="/${preset_path}"
+
+            local spec_parsed
+            spec_parsed=$(parse_version_spec "$spec_str")
+            local spec_type spec_major spec_minor spec_patch
+            read -r spec_type spec_major spec_minor spec_patch <<< "$spec_parsed"
+
+            # Read current lock
+            local locked_version="" locked_tag=""
+            local lock_data
+            if lock_data=$(lock_read "$source_key"); then
+                read -r locked_version locked_tag _ <<< "$lock_data"
+            fi
+
+            echo -e "${CYAN}${source_key}${NC}" >&2
+            if [[ -n "$locked_version" ]]; then
+                echo -e "  Current: v${locked_version} (spec: ${spec_str:-latest})" >&2
+            else
+                echo -e "  Current: (not installed)" >&2
+            fi
+
+            if [[ "$spec_type" == "exact" ]]; then
+                echo -e "  ${YELLOW}Pinned at v${spec_major}.${spec_minor}.${spec_patch}${NC}" >&2
+                continue
+            fi
+
+            # Fetch remote tags
+            local remote_tags
+            if ! remote_tags=$(registry_list_remote_tags "$owner" "$repo"); then
+                echo -e "  ${RED}Failed to fetch tags${NC}" >&2
+                continue
+            fi
+
+            local best_tag
+            if ! best_tag=$(find_best_tag "$remote_tags" "$spec_type" "$spec_major" "$spec_minor" "$spec_patch"); then
+                echo -e "  ${YELLOW}No matching tags found${NC}" >&2
+                continue
+            fi
+
+            local best_parsed
+            best_parsed=$(parse_tag_version "$best_tag")
+            local best_major best_minor best_patch
+            read -r best_major best_minor best_patch <<< "$best_parsed"
+            local best_version="${best_major}.${best_minor}.${best_patch}"
+
+            if [[ "$best_version" == "$locked_version" ]]; then
+                echo -e "  ${GREEN}Already up to date (v${best_version})${NC}" >&2
+                continue
+            fi
+
+            # Clone new version
+            if ! registry_has_clone "$owner" "$repo" "$best_version"; then
+                registry_clone_version "$owner" "$repo" "$best_tag" || continue
+            fi
+
+            if [[ -n "$locked_version" ]]; then
+                if check_major_bump "$locked_version" "$best_version"; then
+                    echo -e "  ${YELLOW}Major update:${NC} v${locked_version} → v${best_version}" >&2
+                else
+                    echo -e "  ${GREEN}Updated:${NC} v${locked_version} → v${best_version}" >&2
+                fi
+            else
+                echo -e "  ${GREEN}Installed:${NC} v${best_version}" >&2
+            fi
+
+            lock_write "$source_key" "$best_version" "$best_tag" "$spec_str"
+            updated=true
+        done
+    }
+
+    _update_presets_from_config "$CONFIG_FILE"
+    _update_presets_from_config "$GLOBAL_CONFIG"
+
+    unset -f _update_presets_from_config
+
+    echo "" >&2
+    if [[ "$updated" == true ]]; then
+        # Force rebuild
+        rm -f ".compose-hash"
+        echo -e "${GREEN}Updates applied. Rebuild will happen on next launch.${NC}" >&2
+    else
+        echo -e "${GREEN}All registries are up to date.${NC}" >&2
+    fi
+}
+
+# ── Registries Command ─────────────────────────────────────────────────
+cmd_registries() {
+    require_jq
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${BOLD}GitHub Presets${NC}" >&2
+    echo "" >&2
+
+    local found=false
+
+    _list_presets_from_config() {
+        local conf="$1" conf_label="$2"
+        [[ ! -f "$conf" ]] && return
+
+        local count
+        count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local entry_type
+            entry_type=$(jq -r ".presets[$i] | type" "$conf")
+            [[ "$entry_type" != "object" ]] && continue
+
+            local source
+            source=$(jq -r ".presets[$i].source // empty" "$conf")
+            [[ -z "$source" || "$source" != github:* ]] && continue
+
+            found=true
+
+            local prefix rename
+            prefix=$(jq -r ".presets[$i].prefix // empty" "$conf")
+            rename=$(jq -c ".presets[$i].rename // empty" "$conf")
+
+            parse_github_source "$source"
+
+            local source_key="github:${_GH_OWNER}/${_GH_REPO}"
+            [[ -n "$_GH_PATH" ]] && source_key+="/${_GH_PATH}"
+
+            echo -e "${CYAN}${source_key}${NC} (${conf_label})" >&2
+            echo "  Source: ${source}" >&2
+            echo "  Spec: ${_GH_SPEC:-latest}" >&2
+
+            if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                local locked_ver locked_tag
+                locked_ver=$(jq -r --arg k "$source_key" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                locked_tag=$(jq -r --arg k "$source_key" '.registries[$k].tag // empty' "$LOCK_FILE" 2>/dev/null || true)
+                if [[ -n "$locked_ver" ]]; then
+                    echo "  Locked: v${locked_ver} (${locked_tag})" >&2
+                    local reg_dir
+                    reg_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$locked_ver" "$_GH_PATH")
+                    echo "  Path: ${reg_dir}" >&2
+                else
+                    echo "  Locked: (not installed)" >&2
+                fi
+            fi
+
+            [[ -n "$prefix" ]] && echo "  Prefix: ${prefix}" >&2
+            [[ -n "$rename" && "$rename" != "null" ]] && echo "  Rename: ${rename}" >&2
+            echo "" >&2
+        done
+    }
+
+    _list_presets_from_config "$CONFIG_FILE" "workspace"
+    _list_presets_from_config "$GLOBAL_CONFIG" "global"
+
+    unset -f _list_presets_from_config
+
+    if [[ "$found" != true ]]; then
+        echo -e "${YELLOW}No GitHub presets configured.${NC}" >&2
+    fi
+}
