@@ -33,17 +33,32 @@ fi
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
+# Resolve latest release tag
+LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | jq -r '.tag_name // empty')
+if [[ -z "$LATEST_TAG" ]]; then
+    echo -e "${RED}Error: Could not determine latest release. Check https://github.com/${REPO}/releases${NC}"
+    exit 1
+fi
+
 # Download
+DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/${LATEST_TAG}/claude-compose"
 if command -v curl &>/dev/null; then
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/claude-compose" -o "${INSTALL_DIR}/${BINARY_NAME}"
+    curl -fsSL "$DOWNLOAD_URL" -o "${INSTALL_DIR}/${BINARY_NAME}"
 elif command -v wget &>/dev/null; then
-    wget -qO "${INSTALL_DIR}/${BINARY_NAME}" "https://raw.githubusercontent.com/${REPO}/main/claude-compose"
+    wget -qO "${INSTALL_DIR}/${BINARY_NAME}" "$DOWNLOAD_URL"
 else
     echo -e "${RED}Error: curl or wget required.${NC}"
     exit 1
 fi
 
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+
+# Verify download
+if ! head -1 "${INSTALL_DIR}/${BINARY_NAME}" | grep -q '^#!/usr/bin/env bash'; then
+    echo -e "${RED}Error: Downloaded file is not a valid claude-compose binary.${NC}"
+    rm -f "${INSTALL_DIR}/${BINARY_NAME}"
+    exit 1
+fi
 
 # Check PATH
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then

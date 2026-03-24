@@ -135,8 +135,8 @@ Create `claude-compose.json` in your workspace:
 ```json
 {
   "projects": [
-    {"path": "~/Code/my-app"},
-    {"path": "~/Code/my-lib", "claude_md": false}
+    {"name": "my-app", "path": "~/Code/my-app"},
+    {"name": "my-lib", "path": "~/Code/my-lib", "claude_md": false}
   ],
   "workspaces": [
     {"path": "~/workspaces/work"},
@@ -146,10 +146,13 @@ Create `claude-compose.json` in your workspace:
 }
 ```
 
+> Presets also support GitHub registry sources as objects — see [GitHub Registry Presets](#github-registry-presets) below.
+
 ### Project fields
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `name` | *required* | Alias for file references (`name://path/to/file`) |
 | `path` | *required* | Path to external project (`~` expanded) |
 | `claude_md` | `true` | Load CLAUDE.md from project |
 
@@ -234,6 +237,93 @@ claude-compose build
 The build is **idempotent** and uses content-based hashing — it only rebuilds when preset files change. A `.compose-manifest.json` tracks which resources came from which preset, so rebuilds cleanly remove old resources before adding new ones.
 
 MCP servers from presets get env var prefixing (`{name}_{hash4}_`) to prevent cross-source conflicts.
+
+## Resources
+
+Define agents, skills, MCP servers, and env files directly in your workspace config:
+
+```json
+{
+  "projects": [...],
+  "resources": {
+    "agents": ["agents/reviewer.md", "agents/planner.md"],
+    "skills": ["skills/commit", "skills/deploy"],
+    "mcp": {
+      "my-server": {"command": "npx", "args": ["my-mcp-server"]},
+      "another": {"command": "node", "args": ["server.js"]}
+    },
+    "env_files": [".env.json"]
+  }
+}
+```
+
+Resource paths are relative to the workspace directory. Env files are JSON objects (`{"KEY": "value"}`) loaded as environment variables at launch time.
+
+## Global Config
+
+Global configuration at `~/.claude-compose/global.json` applies to all workspaces. It supports the same fields as workspace config (`presets`, `workspaces`, `resources`). Workspace-level config takes precedence on conflicts.
+
+```json
+{
+  "presets": ["shared-tools"],
+  "resources": {
+    "mcp": {"global-server": {"command": "..."}},
+    "env_files": ["global-env.json"]
+  },
+  "update_interval": 24
+}
+```
+
+## GitHub Registry Presets
+
+Presets can be sourced from GitHub repositories with semver versioning:
+
+```json
+{
+  "presets": [
+    {"source": "github:owner/repo@^1.0.0"},
+    {"source": "github:owner/repo/preset-name@~2.1.0", "prefix": "custom"},
+    "local-preset"
+  ]
+}
+```
+
+### Version specs
+
+| Spec | Meaning |
+|------|---------|
+| `1.2.3` | Exact version |
+| `^1.2.3` | Compatible updates (>=1.2.3, <2.0.0) |
+| `~1.2.3` | Patch updates only (>=1.2.3, <1.3.0) |
+| *(omitted)* | Latest available version |
+
+Resolved versions are saved in `claude-compose.lock.json` next to your config. The lock file ensures reproducible builds and should be committed to version control.
+
+### Managing registries
+
+```bash
+# List configured GitHub presets and their status
+claude-compose registries
+
+# Check for and apply updates
+claude-compose update
+
+# Update a specific preset
+claude-compose update owner/repo
+```
+
+## Additional Commands
+
+```bash
+# Diagnose and fix compose problems interactively
+claude-compose doctor
+
+# Onboarding wizard — scan for projects and create workspaces
+claude-compose start ~/Code
+
+# Show instructions for managing workspace resources
+claude-compose instructions
+```
 
 ## How it works
 

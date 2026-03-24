@@ -12,7 +12,7 @@ VERSION="2.0.0"
 CONFIG_FILE=""
 DRY_RUN=false
 EXTRA_ARGS=()
-ORIGINAL_CWD="$(pwd)"
+ORIGINAL_CWD="$(pwd -P)"
 CLAUDE_ARGS=()
 NEED_CLAUDE_MD_ENV=false
 SUBCOMMAND=""           # "", "config", "build", "migrate", "copy"
@@ -49,12 +49,21 @@ CURRENT_PRESET_PREFIX=""
 CURRENT_PRESET_RENAME='{}'
 
 # ── Colors ───────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+if [[ -t 2 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    BOLD=''
+    NC=''
+fi
 # ── Usage ────────────────────────────────────────────────────────────
 usage() {
     echo -e "${BOLD}claude-compose${NC} v${VERSION} — Multi-project Claude Code launcher"
@@ -123,31 +132,26 @@ matches_filter() {
     fi
 
     local included=false
-    for i in $(seq 0 $((include_count - 1))); do
-        local pattern
-        pattern=$(echo "$include_json" | jq -r ".[$i]")
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
         # shellcheck disable=SC2053
         if [[ "$name" == $pattern ]]; then
             included=true
             break
         fi
-    done
+    done < <(echo "$include_json" | jq -r '.[]')
 
     if [[ "$included" == false ]]; then
         return 1
     fi
 
-    local exclude_count
-    exclude_count=$(echo "$exclude_json" | jq -r 'length')
-
-    for i in $(seq 0 $((exclude_count - 1))); do
-        local pattern
-        pattern=$(echo "$exclude_json" | jq -r ".[$i]")
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
         # shellcheck disable=SC2053
         if [[ "$name" == $pattern ]]; then
             return 1
         fi
-    done
+    done < <(echo "$exclude_json" | jq -r '.[]')
 
     return 0
 }
@@ -305,11 +309,31 @@ parse_args() {
     fi
 }
 
+# ── SHA tool detection (portability: macOS=shasum, Linux=sha256sum) ──
+# _SHASUM_CMD: used for file fingerprinting via xargs (SHA-1 on macOS, SHA-256 on Linux)
+# _shasum256: used for final content hash only
+if command -v shasum &>/dev/null; then
+    _SHASUM_CMD="shasum"
+    _shasum256() { shasum -a 256 "$@"; }
+elif command -v sha256sum &>/dev/null; then
+    _SHASUM_CMD="sha256sum"
+    # shellcheck disable=SC2120
+    _shasum256() { sha256sum "$@"; }
+else
+    _SHASUM_CMD="false"
+    # shellcheck disable=SC2120
+    _shasum256() { echo "error: no shasum or sha256sum found" >&2; return 1; }
+fi
+
 # ── Require tools ────────────────────────────────────────────────────
 require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
-        echo "  Install: brew install jq" >&2
+        if [[ "$(uname)" == "Darwin" ]]; then
+            echo "  Install: brew install jq" >&2
+        else
+            echo "  Install: sudo apt install jq" >&2
+        fi
         # shellcheck disable=SC2034
         DOCTOR_ENABLED=false
         exit 1
@@ -323,6 +347,15 @@ require_claude() {
         DOCTOR_ENABLED=false
         exit 1
     fi
+}
+
+# ── Builtin skills check ───────────────────────────────────────────
+has_builtin_skills() {
+    [[ ! -d "$BUILTIN_SKILLS_DIR" ]] && return 1
+    for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+        [[ -d "$_d" ]] && return 0
+    done
+    return 1
 }
 
 # ── Doctor helpers ──────────────────────────────────────────────────
@@ -361,10 +394,38 @@ _doctor_trap() {
         launch_doctor "$DOCTOR_ERROR_MSG"
     fi
 }
+
+# Atomic file write: writes content to a temp file, then moves it into place.
+# Usage: atomic_write "destination_path" "content"
+atomic_write() {
+    local dest="$1" content="$2"
+    local tmp
+    tmp=$(mktemp "${dest}.XXXXXX")
+    if printf '%s\n' "$content" > "$tmp"; then
+        mv "$tmp" "$dest"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# Rewrite name: in YAML frontmatter safely (no sed metachar injection)
+# $1 = input file, $2 = output file, $3 = new name
+rewrite_frontmatter_name() {
+    local input="$1" output="$2" new_name="$3"
+    awk -v name="$new_name" '
+        BEGIN { in_fm = 0; fm_count = 0; done = 0 }
+        /^---$/ { fm_count++; in_fm = (fm_count == 1) ? 1 : 0 }
+        in_fm && !done && /^name:/ { print "name: " name; done = 1; next }
+        { print }
+    ' "$input" > "$output"
+}
 # ── Validate workspace ──────────────────────────────────────────────
 validate() {
     require_jq
-    require_claude
+    if [[ "$DRY_RUN" != true ]]; then
+        require_claude
+    fi
 
     # Check git availability if github presets are configured
     if [[ -f "$CONFIG_FILE" ]] && has_github_presets "$CONFIG_FILE"; then
@@ -410,6 +471,17 @@ validate() {
 validate_config_semantics() {
     local config_file="$1"
 
+    # Warn on unknown top-level keys
+    local known_keys='["projects","presets","workspaces","resources","update_interval"]'
+    local unknown_keys
+    unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
+    if [[ -n "$unknown_keys" ]]; then
+        while IFS= read -r uk; do
+            [[ -z "$uk" ]] && continue
+            echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
+        done <<< "$unknown_keys"
+    fi
+
     local projects_type
     projects_type=$(jq -r 'if has("projects") then .projects | type else "null" end' "$config_file")
     if [[ "$projects_type" != "null" && "$projects_type" != "array" ]]; then
@@ -437,6 +509,16 @@ validate_config_semantics() {
             joined=$(IFS=', '; echo "${missing[*]}")
             echo "Each project must have a \"name\" field. Missing in: ${joined}"
             return
+        fi
+
+        # Check for duplicate project names
+        if [[ "$project_count" -gt 1 ]]; then
+            local dup_names
+            dup_names=$(jq -r '[.projects[].name // empty] | group_by(.) | map(select(length > 1)) | .[0][0] // empty' "$config_file")
+            if [[ -n "$dup_names" ]]; then
+                echo "Duplicate project name: \"${dup_names}\". Each project must have a unique name."
+                return
+            fi
         fi
     fi
 
@@ -530,6 +612,43 @@ validate_config_semantics() {
         fi
     fi
 
+    # ── Validate workspaces array ──
+    local workspaces_type
+    workspaces_type=$(jq -r 'if has("workspaces") then .workspaces | type else "null" end' "$config_file")
+    if [[ "$workspaces_type" != "null" && "$workspaces_type" != "array" ]]; then
+        echo "\"workspaces\" must be an array, got: ${workspaces_type}"
+        return
+    fi
+    if [[ "$workspaces_type" == "array" ]]; then
+        local ws_count_v
+        ws_count_v=$(jq '.workspaces | length' "$config_file")
+        local wi
+        for wi in $(seq 0 $((ws_count_v - 1))); do
+            local ws_entry_type
+            ws_entry_type=$(jq -r ".workspaces[$wi] | type" "$config_file")
+            if [[ "$ws_entry_type" != "object" ]]; then
+                echo "workspaces[$wi]: expected object, got: ${ws_entry_type}"
+                return
+            fi
+            local ws_path_val
+            ws_path_val=$(jq -r ".workspaces[$wi].path // empty" "$config_file")
+            if [[ -z "$ws_path_val" ]]; then
+                echo "workspaces[$wi]: must have a \"path\" field"
+                return
+            fi
+            # Validate filter fields if present
+            local filter_field
+            for filter_field in mcp agents skills; do
+                local ff_type
+                ff_type=$(jq -r "if .workspaces[$wi] | has(\"$filter_field\") then .workspaces[$wi].$filter_field | type else \"null\" end" "$config_file")
+                if [[ "$ff_type" != "null" && "$ff_type" != "object" ]]; then
+                    echo "workspaces[$wi].$filter_field must be an object, got: ${ff_type}"
+                    return
+                fi
+            done
+        done
+    fi
+
     # ── Validate presets array ──
     local presets_type
     presets_type=$(jq -r 'if has("presets") then .presets | type else "null" end' "$config_file")
@@ -591,7 +710,6 @@ validate_config_semantics() {
                                 return
                             fi
                         done
-                        unset IFS
                     fi
                     # Validate prefix format if present
                     local prefix_val
@@ -689,6 +807,9 @@ collect_all_presets() {
                 if [[ "$entry_type" == "string" ]]; then
                     local nested_name
                     nested_name=$(jq -r ".presets[$j]" "$preset_dir/claude-compose.json")
+                    if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                        continue
+                    fi
                     # For nested local presets within a github registry, resolve relative to registry root
                     if [[ "$item" == github:* ]]; then
                         parse_github_source "github:${item#github:}"
@@ -721,35 +842,36 @@ collect_all_presets() {
 }
 
 # Hash Claude config files from a workspace directory (for change detection)
+# Output goes to stdout — caller redirects to hash temp file
 hash_workspace_config_files() {
     local ws_dir="$1"
-    local result=""
     for f in "$ws_dir/.mcp.json" "$ws_dir/.claude/settings.local.json" "$ws_dir/claude-compose.json"; do
-        [[ -f "$f" ]] && result+=$(shasum "$f" 2>/dev/null || true)
+        [[ -f "$f" ]] && "$_SHASUM_CMD" "$f" 2>/dev/null || true
     done
-    [[ -d "$ws_dir/.claude/agents" ]] && result+=$(find "$ws_dir/.claude/agents" -name '*.md' -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
-    [[ -d "$ws_dir/.claude/skills" ]] && result+=$(find "$ws_dir/.claude/skills" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
-    echo "$result"
+    [[ -d "$ws_dir/.claude/agents" ]] && find "$ws_dir/.claude/agents" -name '*.md' -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true
+    [[ -d "$ws_dir/.claude/skills" ]] && find "$ws_dir/.claude/skills" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true
 }
 
 # Compute content-based hash of config + all preset/workspace source files
 compute_build_hash() {
-    local hash_input=""
-    hash_input+=$(cat "$CONFIG_FILE")
+    local hash_tmp
+    hash_tmp=$(mktemp)
+
+    cat "$CONFIG_FILE" >> "$hash_tmp"
 
     # Hash global config
     if [[ -f "$GLOBAL_CONFIG" ]]; then
-        hash_input+=$(cat "$GLOBAL_CONFIG")
+        cat "$GLOBAL_CONFIG" >> "$hash_tmp"
     fi
 
     # Hash built-in skills
     if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-        hash_input+=$(find "$BUILTIN_SKILLS_DIR" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+        find "$BUILTIN_SKILLS_DIR" -type f -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
     fi
 
     # Hash lock file
     if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-        hash_input+=$(cat "$LOCK_FILE")
+        cat "$LOCK_FILE" >> "$hash_tmp"
     fi
 
     # Hash global presets
@@ -770,7 +892,7 @@ compute_build_hash() {
                 gsource=$(jq -r ".presets[$gi].source // empty" "$GLOBAL_CONFIG")
                 if [[ -n "$gsource" && "$gsource" == github:* ]]; then
                     global_preset_list+=("github:${gsource#github:}")
-                    hash_input+=$(jq -c ".presets[$gi]" "$GLOBAL_CONFIG")
+                    jq -c ".presets[$gi]" "$GLOBAL_CONFIG" >> "$hash_tmp"
                 fi
             fi
         done
@@ -787,7 +909,7 @@ compute_build_hash() {
                 preset_dir=$(resolve_locked_preset_dir "$hp_sk" 2>/dev/null || true)
             fi
             [[ -z "$preset_dir" || ! -d "$preset_dir" ]] && continue
-            hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
+            find "$preset_dir" -type f -print0 | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
         done < <(collect_all_presets "${global_preset_list[@]+"${global_preset_list[@]}"}")
     fi
 
@@ -808,7 +930,7 @@ compute_build_hash() {
             lsource=$(jq -r ".presets[$li].source // empty" "$CONFIG_FILE")
             if [[ -n "$lsource" && "$lsource" == github:* ]]; then
                 preset_list+=("github:${lsource#github:}")
-                hash_input+=$(jq -c ".presets[$li]" "$CONFIG_FILE")
+                jq -c ".presets[$li]" "$CONFIG_FILE" >> "$hash_tmp"
             fi
         fi
     done
@@ -825,7 +947,7 @@ compute_build_hash() {
             preset_dir=$(resolve_locked_preset_dir "$hp2_sk" 2>/dev/null || true)
         fi
         [[ -z "$preset_dir" || ! -d "$preset_dir" ]] && continue
-        hash_input+=$(find "$preset_dir" -type f -print0 | sort -z | xargs -0 shasum 2>/dev/null || true)
+        find "$preset_dir" -type f -print0 | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
     done < <(collect_all_presets "${preset_list[@]+"${preset_list[@]}"}")
 
     # Hash workspace source dirs (Claude config files only)
@@ -836,7 +958,7 @@ compute_build_hash() {
         ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
         ws_path=$(expand_path "$ws_path")
         [[ -d "$ws_path" ]] || continue
-        hash_input+=$(hash_workspace_config_files "$ws_path")
+        hash_workspace_config_files "$ws_path" >> "$hash_tmp"
     done
 
     # Hash global workspaces
@@ -848,14 +970,14 @@ compute_build_hash() {
             gws_path=$(jq -r ".workspaces[$i].path" "$GLOBAL_CONFIG")
             gws_path=$(expand_path "$gws_path")
             [[ -d "$gws_path" ]] || continue
-            hash_input+=$(hash_workspace_config_files "$gws_path")
+            hash_workspace_config_files "$gws_path" >> "$hash_tmp"
         done
     fi
 
     # Hash resources section content
     local resources_mcp
     resources_mcp=$(jq -c '.resources.mcp // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    [[ -n "$resources_mcp" ]] && hash_input+="$resources_mcp"
+    [[ -n "$resources_mcp" ]] && printf '%s' "$resources_mcp" >> "$hash_tmp"
 
     # Hash referenced agent/skill files
     local res_agents
@@ -863,7 +985,7 @@ compute_build_hash() {
     while IFS= read -r agent_path; do
         [[ -z "$agent_path" ]] && continue
         local abs_agent="$ORIGINAL_CWD/$agent_path"
-        [[ -f "$abs_agent" ]] && hash_input+=$(shasum "$abs_agent" 2>/dev/null || true)
+        [[ -f "$abs_agent" ]] && "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true
     done <<< "$res_agents"
 
     local res_skills
@@ -871,7 +993,7 @@ compute_build_hash() {
     while IFS= read -r skill_path; do
         [[ -z "$skill_path" ]] && continue
         local abs_skill="$ORIGINAL_CWD/$skill_path"
-        [[ -d "$abs_skill" ]] && hash_input+=$(find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+        [[ -d "$abs_skill" ]] && find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
     done <<< "$res_skills"
 
     # Hash env files
@@ -880,21 +1002,21 @@ compute_build_hash() {
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
         local abs_env="$ORIGINAL_CWD/$env_file"
-        [[ -f "$abs_env" ]] && hash_input+=$(shasum "$abs_env" 2>/dev/null || true)
+        [[ -f "$abs_env" ]] && "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true
     done <<< "$res_env_files"
 
     # Hash global resources
     if [[ -f "$GLOBAL_CONFIG" ]]; then
         local global_mcp
         global_mcp=$(jq -c '.resources.mcp // empty' "$GLOBAL_CONFIG" 2>/dev/null || true)
-        [[ -n "$global_mcp" ]] && hash_input+="$global_mcp"
+        [[ -n "$global_mcp" ]] && printf '%s' "$global_mcp" >> "$hash_tmp"
 
         local global_agents
         global_agents=$(jq -r '.resources.agents // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
         while IFS= read -r agent_path; do
             [[ -z "$agent_path" ]] && continue
             local abs_agent="$GLOBAL_CONFIG_DIR/$agent_path"
-            [[ -f "$abs_agent" ]] && hash_input+=$(shasum "$abs_agent" 2>/dev/null || true)
+            [[ -f "$abs_agent" ]] && "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true
         done <<< "$global_agents"
 
         local global_skills
@@ -902,7 +1024,7 @@ compute_build_hash() {
         while IFS= read -r skill_path; do
             [[ -z "$skill_path" ]] && continue
             local abs_skill="$GLOBAL_CONFIG_DIR/$skill_path"
-            [[ -d "$abs_skill" ]] && hash_input+=$(find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null || true)
+            [[ -d "$abs_skill" ]] && find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
         done <<< "$global_skills"
 
         local global_env_files
@@ -910,11 +1032,14 @@ compute_build_hash() {
         while IFS= read -r env_file; do
             [[ -z "$env_file" ]] && continue
             local abs_env="$GLOBAL_CONFIG_DIR/$env_file"
-            [[ -f "$abs_env" ]] && hash_input+=$(shasum "$abs_env" 2>/dev/null || true)
+            [[ -f "$abs_env" ]] && "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true
         done <<< "$global_env_files"
     fi
 
-    printf '%s' "$hash_input" | shasum -a 256 | cut -c1-32
+    local result
+    result=$(_shasum256 < "$hash_tmp" | cut -c1-32)
+    rm -f "$hash_tmp"
+    echo "$result"
 }
 
 # Check if rebuild is needed
@@ -1201,6 +1326,9 @@ check_major_bump() {
     local old_major new_major
     old_major="${old_version%%.*}"
     new_major="${new_version%%.*}"
+    # Guard against non-numeric values
+    [[ "$old_major" =~ ^[0-9]+$ ]] || return 1
+    [[ "$new_major" =~ ^[0-9]+$ ]] || return 1
     (( new_major > old_major ))
 }
 
@@ -1223,9 +1351,47 @@ lock_read() {
     echo "$resolved" "$tag" "$spec"
 }
 
+# Acquire a directory-based lock (POSIX-portable, no flock needed)
+# $1 = lock dir path
+_acquire_lock() {
+    local lock_dir="$1"
+    local attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [[ "$attempts" -ge 25 ]]; then
+            # Check if lock holder is still alive
+            local lock_pid=""
+            [[ -f "$lock_dir/pid" ]] && lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+            if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+                echo -e "${YELLOW}Warning: Lock ${lock_dir} held by active process ${lock_pid}${NC}" >&2
+                return 1
+            fi
+            # Stale lock — force-remove and retry
+            rm -rf "$lock_dir"
+            if ! mkdir "$lock_dir" 2>/dev/null; then
+                echo -e "${YELLOW}Warning: Failed to acquire lock ${lock_dir}${NC}" >&2
+                return 1
+            fi
+            echo "$$" > "$lock_dir/pid"
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "$$" > "$lock_dir/pid"
+}
+
+# Release a directory-based lock
+# $1 = lock dir path
+_release_lock() {
+    rm -rf "$1" 2>/dev/null || true
+}
+
 # Write/update a lock entry atomically
 lock_write() {
     local source_key="$1" version="$2" tag="$3" spec="$4"
+
+    _acquire_lock "${LOCK_FILE}.lock" || return 1
+    trap '_release_lock "${LOCK_FILE}.lock"' RETURN
 
     local lock_json
     if [[ -f "$LOCK_FILE" ]]; then
@@ -1420,12 +1586,42 @@ resolve_github_version() {
         die_doctor "Cannot fetch tags from ${owner}/${repo} (network unavailable) and no locked version exists"
     fi
 }
+# Validate env key: POSIX identifier, not in blocklist
+# $1 = key, $2 = source label (for error messages)
+_validate_env_key() {
+    local key="$1" source_label="${2:-}"
+    # Reject non-POSIX identifiers (must start with letter/underscore, contain only alnum/underscore)
+    case "$key" in
+        [!a-zA-Z_]*|*[!a-zA-Z0-9_]*)
+            echo -e "${RED}Warning: invalid env key '${key}' in ${source_label} — skipped${NC}" >&2
+            return 1
+            ;;
+    esac
+    # Blocklist dangerous variables
+    case "$key" in
+        PATH|HOME|SHELL|USER|LOGNAME|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_*|IFS|CDPATH|BASH_ENV|ENV|TMPDIR|LD_AUDIT|LD_CONFIG|BASH_FUNC_*)
+            echo -e "${RED}Warning: dangerous env key '${key}' in ${source_label} — skipped${NC}" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Check if a path contains traversal sequences
+_has_path_traversal() {
+    [[ "$1" == *"/.."* || "$1" == ".."* ]]
+}
+
 # Load JSON env files from resources.env_files at launch time
 load_env_files() {
     local env_files
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: env file path contains traversal, skipping: ${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$PWD/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
@@ -1440,6 +1636,7 @@ load_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "$env_file" || continue
             export "$key=$value"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
         local var_count
@@ -1456,6 +1653,10 @@ load_global_env_files() {
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: global env file path contains traversal, skipping: ${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$GLOBAL_CONFIG_DIR/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "${YELLOW}Warning: global env file not found: ${env_file}${NC}" >&2
@@ -1470,6 +1671,7 @@ load_global_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "$env_file" || continue
             export "$key=$value"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
         local var_count
@@ -1491,6 +1693,10 @@ load_source_env_files() {
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$source_config" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: source env file path contains traversal, skipping: ${source_name}/${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$source_dir/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             continue
@@ -1504,6 +1710,7 @@ load_source_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "${source_name}/${env_file}" || continue
             export "${prefix}${key}=${value}"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
     done <<< "$env_files"
@@ -1554,6 +1761,7 @@ clean_manifest_section() {
         agents=$(echo "$source_data" | jq -r '.agents // [] | .[]' 2>/dev/null || true)
         while IFS= read -r agent; do
             [[ -z "$agent" ]] && continue
+            [[ "$agent" == */* || "$agent" == ..* ]] && continue
             if [[ -f ".claude/agents/${agent}" ]]; then
                 rm -f ".claude/agents/${agent}"
                 echo -e "  ${YELLOW}-agent:${NC} $agent" >&2
@@ -1565,6 +1773,7 @@ clean_manifest_section() {
         skills=$(echo "$source_data" | jq -r '.skills // [] | .[]' 2>/dev/null || true)
         while IFS= read -r skill; do
             [[ -z "$skill" ]] && continue
+            [[ "$skill" == */* || "$skill" == ..* ]] && continue
             if [[ -L ".claude/skills/${skill}" ]]; then
                 rm -f ".claude/skills/${skill}"
                 echo -e "  ${YELLOW}-skill:${NC} $skill" >&2
@@ -1582,7 +1791,7 @@ clean_manifest_section() {
                 [[ -z "$server" ]] && continue
                 local tmp
                 tmp=$(jq --arg s "$server" 'del(.mcpServers[$s])' ".mcp.json")
-                echo "$tmp" > ".mcp.json"
+                atomic_write ".mcp.json" "$tmp"
                 echo -e "  ${YELLOW}-mcp:${NC} $server" >&2
             done <<< "$mcp_servers"
             local server_count
@@ -1602,7 +1811,7 @@ compute_source_prefix() {
     local safe_name
     safe_name=$(printf '%s' "$name" | tr -c '[:alnum:]_' '_')
     local hash4
-    hash4=$(printf '%s' "$abs_path" | shasum -a 256 | cut -c1-4)
+    hash4=$(printf '%s' "$abs_path" | _shasum256 | cut -c1-4)
     echo "${safe_name}_${hash4}_"
 }
 
@@ -1669,7 +1878,7 @@ sync_source_dir() {
                 abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
                 if [[ "$final_name" != "$agent_name" ]]; then
                     # Name changed — copy and rewrite name: in frontmatter
-                    sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_agent_file" > ".claude/agents/${dest_file}"
+                    rewrite_frontmatter_name "$abs_agent_file" ".claude/agents/${dest_file}" "$final_name"
                 else
                     ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
                 fi
@@ -1737,6 +1946,7 @@ sync_source_dir() {
             echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
         fi
 
+        local mcp_batch='{}'
         while IFS= read -r name; do
             [[ -z "$name" ]] && continue
             if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
@@ -1751,10 +1961,7 @@ sync_source_dir() {
                     server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
                 fi
 
-                local tmp
-                tmp=$(jq --arg name "$final_name" --argjson config "$server_config" \
-                    '.mcpServers[$name] = $config' ".mcp.json")
-                echo "$tmp" > ".mcp.json"
+                mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_name" --argjson config "$server_config" '.[$name] = $config')
 
                 CURRENT_SOURCE_MCP_SERVERS+=("$final_name")
                 if [[ "$final_name" != "$name" ]]; then
@@ -1764,6 +1971,20 @@ sync_source_dir() {
                 fi
             fi
         done < <(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+
+        if [[ "$mcp_batch" != '{}' ]]; then
+            local overwrites
+            overwrites=$(jq -r --argjson batch "$mcp_batch" \
+                '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
+                ".mcp.json" 2>/dev/null || true)
+            while IFS= read -r ow; do
+                [[ -z "$ow" ]] && continue
+                echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
+            done <<< "$overwrites"
+            local tmp
+            tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
+            atomic_write ".mcp.json" "$tmp"
+        fi
     fi
 
     # ── CLAUDE.md via --add-dir ──
@@ -1884,6 +2105,10 @@ process_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
             process_preset "$nested_name"
         elif [[ "$nested_type" == "object" ]]; then
             local nested_json
@@ -2027,7 +2252,7 @@ process_resources() {
         fi
         if [[ "$final_name" != "$name_no_ext" ]]; then
             # Name changed — copy and rewrite name: in frontmatter (Claude CLI reads it)
-            sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_path" > ".claude/agents/${final_agent}"
+            rewrite_frontmatter_name "$abs_path" ".claude/agents/${final_agent}" "$final_name"
         else
             ln -sf "$abs_path" ".claude/agents/${final_agent}"
         fi
@@ -2068,7 +2293,7 @@ process_resources() {
             if [[ -f ".claude/skills/${final_skill}/SKILL.md" ]]; then
                 local tmp_skill
                 tmp_skill=$(mktemp ".claude/skills/${final_skill}/SKILL.md.XXXXXX")
-                sed "1,/^---$/s/^name:.*$/name: ${final_skill}/" ".claude/skills/${final_skill}/SKILL.md" > "$tmp_skill"
+                rewrite_frontmatter_name ".claude/skills/${final_skill}/SKILL.md" "$tmp_skill" "$final_skill"
                 mv "$tmp_skill" ".claude/skills/${final_skill}/SKILL.md"
             fi
         else
@@ -2097,6 +2322,11 @@ process_resources() {
     fi
 
     # ── Merge MCP servers ──
+    if [[ ! -f ".mcp.json" ]]; then
+        echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+    fi
+
+    local mcp_batch='{}'
     local mcp_keys
     mcp_keys=$(jq -r '.resources.mcp // {} | keys[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r server_name; do
@@ -2117,14 +2347,7 @@ process_resources() {
             final_server=$(apply_resource_prefix "$server_name" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
         fi
 
-        if [[ ! -f ".mcp.json" ]]; then
-            echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
-        fi
-
-        local tmp
-        tmp=$(jq --arg name "$final_server" --argjson config "$server_config" \
-            '.mcpServers[$name] = $config' ".mcp.json")
-        echo "$tmp" > ".mcp.json"
+        mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_server" --argjson config "$server_config" '.[$name] = $config')
 
         CURRENT_SOURCE_MCP_SERVERS+=("$final_server")
         if [[ "$final_server" != "$server_name" ]]; then
@@ -2133,6 +2356,20 @@ process_resources() {
             echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
         fi
     done <<< "$mcp_keys"
+
+    if [[ "$mcp_batch" != '{}' ]]; then
+        local overwrites
+        overwrites=$(jq -r --argjson batch "$mcp_batch" \
+            '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
+            ".mcp.json" 2>/dev/null || true)
+        while IFS= read -r ow; do
+            [[ -z "$ow" ]] && continue
+            echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
+        done <<< "$overwrites"
+        local tmp
+        tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
+        atomic_write ".mcp.json" "$tmp"
+    fi
 
     if [[ "$skip_manifest" != "true" ]]; then
         write_source_manifest "$manifest_section" "$manifest_key"
@@ -2367,6 +2604,10 @@ process_github_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
             # Local presets within a github registry resolve relative to registry root
             local reg_root
             reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
@@ -2421,17 +2662,10 @@ build() {
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
     has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-    local has_builtin_skills=false
-    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-            [[ -d "$_d" ]] && has_builtin_skills=true && break
-        done
-    fi
-
     local has_global_config=false
     [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills" != "true" && "$has_global_config" != "true" ]]; then
+    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
         echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
         return
     fi
@@ -2440,6 +2674,14 @@ build() {
         echo -e "${GREEN}Workspace is up to date. Use --force to rebuild.${NC}" >&2
         return
     fi
+
+    # Acquire build lock to prevent concurrent builds
+    if ! _acquire_lock ".compose-build.lock"; then
+        echo -e "${YELLOW}Warning: Another build is in progress, skipping.${NC}" >&2
+        return
+    fi
+    # shellcheck disable=SC2064
+    trap '_release_lock ".compose-build.lock"' RETURN
 
     echo -e "${BOLD}Building workspace...${NC}" >&2
 
@@ -2499,14 +2741,14 @@ build() {
     process_resources
 
     # Write manifest and hash
-    echo "$MANIFEST_JSON" | jq '.' > ".compose-manifest.json"
-    compute_build_hash > ".compose-hash"
+    atomic_write ".compose-manifest.json" "$(echo "$MANIFEST_JSON" | jq '.')"
+    atomic_write ".compose-hash" "$(compute_build_hash)"
 
     # Ensure _warning in .mcp.json
     if [[ -f ".mcp.json" ]]; then
         local tmp
         tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' ".mcp.json")
-        echo "$tmp" > ".mcp.json"
+        atomic_write ".mcp.json" "$tmp"
     fi
 
     echo "" >&2
@@ -2538,22 +2780,15 @@ cmd_build() {
         ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
         has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-        local has_builtin_skills_dr=false
-        if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-            for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-                [[ -d "$_d" ]] && has_builtin_skills_dr=true && break
-            done
-        fi
-
         local has_global_dr=false
         [[ -f "$GLOBAL_CONFIG" ]] && has_global_dr=true
 
-        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills_dr" != "true" && "$has_global_dr" != "true" ]]; then
+        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_dr" != "true" ]] && ! has_builtin_skills; then
             echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
             return
         fi
 
-        if [[ "$has_builtin_skills_dr" == true ]]; then
+        if has_builtin_skills; then
             echo -e "${CYAN}Built-in skills:${NC}" >&2
             for _d in "$BUILTIN_SKILLS_DIR"/*/; do
                 [[ -d "$_d" ]] || continue
@@ -2666,13 +2901,13 @@ cmd_migrate() {
         exit 1
     fi
     # Resolve to absolute path
-    project_path=$(cd "$project_path" && pwd)
+    project_path=$(cd "$project_path" && pwd -P)
 
     local workspace
     if [[ -n "$MIGRATE_WORKSPACE" ]]; then
         workspace=$(expand_path "$MIGRATE_WORKSPACE")
         mkdir -p "$workspace"
-        workspace=$(cd "$workspace" && pwd)
+        workspace=$(cd "$workspace" && pwd -P)
     else
         workspace="$ORIGINAL_CWD"
     fi
@@ -2719,7 +2954,7 @@ cmd_migrate() {
             local tmp
             tmp=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' \
                 "$workspace/.mcp.json" "$project_path/.mcp.json")
-            echo "$tmp" > "$workspace/.mcp.json"
+            atomic_write "$workspace/.mcp.json" "$tmp"
             echo -e "${GREEN}Merged:${NC} .mcp.json" >&2
         else
             cp "$project_path/.mcp.json" "$workspace/.mcp.json"
@@ -2768,7 +3003,7 @@ cmd_migrate() {
                 .[0] as $a | .[1] as $b |
                 ($a * $b) | .permissions.allow = (($a.permissions.allow // []) + ($b.permissions.allow // []) | unique)
             ' "$workspace/.claude/settings.local.json" "$project_path/.claude/settings.local.json")
-            echo "$tmp" > "$workspace/.claude/settings.local.json"
+            atomic_write "$workspace/.claude/settings.local.json" "$tmp"
             echo -e "${GREEN}Merged:${NC} .claude/settings.local.json" >&2
         else
             cp "$project_path/.claude/settings.local.json" "$workspace/.claude/settings.local.json"
@@ -2810,12 +3045,12 @@ cmd_migrate() {
             echo -e "${YELLOW}Project already in config:${NC} ${rel_path}" >&2
         else
             local tmp
-            tmp=$(jq --arg p "$rel_path" '.projects = ((.projects // []) + [{path: $p}])' "$config_path")
-            echo "$tmp" > "$config_path"
+            tmp=$(jq --arg p "$rel_path" --arg n "$project_name" '.projects = ((.projects // []) + [{path: $p, name: $n}])' "$config_path")
+            atomic_write "$config_path" "$tmp"
             echo -e "${GREEN}Added to config:${NC} ${rel_path}" >&2
         fi
     else
-        jq -n --arg p "$rel_path" '{projects: [{path: $p}]}' > "$config_path"
+        atomic_write "$config_path" "$(jq -n --arg p "$rel_path" --arg n "$project_name" '{projects: [{path: $p, name: $n}]}')"
         echo -e "${GREEN}Created:${NC} ${CONFIG_FILE}" >&2
     fi
 
@@ -2849,7 +3084,7 @@ cmd_copy() {
         echo -e "${RED}Error: Source directory not found: ${source_path}${NC}" >&2
         exit 1
     fi
-    source_path=$(cd "$source_path" && pwd)
+    source_path=$(cd "$source_path" && pwd -P)
 
     local config_name
     config_name=$(basename "$CONFIG_FILE")
@@ -2911,12 +3146,20 @@ cmd_copy() {
     echo -e "${GREEN}Workspace copied.${NC}" >&2
     echo "" >&2
 
-    # Launch Claude with compose-config for customization
-    require_claude
-    echo -e "${CYAN}Launching Claude for customization...${NC}" >&2
-    local prompt
-    prompt=$(compose_config_prompt "$dest_path/$config_name")
-    (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+    # Offer to launch Claude for customization
+    if [[ -t 0 ]]; then
+        local reply=""
+        echo -n "Launch Claude for customization? [y/N] " >&2
+        read -r reply
+        if [[ "$reply" =~ ^[Yy]$ ]]; then
+            require_claude
+            local prompt
+            prompt=$(compose_config_prompt "$dest_path/$config_name")
+            (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+        fi
+    else
+        echo -e "${CYAN}Run 'claude-compose config' in ${dest_path} to customize.${NC}" >&2
+    fi
 }
 
 # ── Instructions Command ─────────────────────────────────────────────
@@ -3162,7 +3405,7 @@ cmd_start() {
             echo -e "${RED}Error: Directory not found: ${root_path}${NC}" >&2
             exit 1
         fi
-        root_path=$(cd "$root_path" && pwd)
+        root_path=$(cd "$root_path" && pwd -P)
     fi
 
     local prompt
@@ -4108,7 +4351,7 @@ main() {
     local config_dir
     config_dir="$(dirname "$CONFIG_FILE")"
     if [[ -d "$config_dir" ]]; then
-        CONFIG_FILE="$(cd "$config_dir" && pwd)/$(basename "$CONFIG_FILE")"
+        CONFIG_FILE="$(cd "$config_dir" && pwd -P)/$(basename "$CONFIG_FILE")"
     fi
 
     # Set lock file path next to config
@@ -4156,14 +4399,7 @@ main() {
     fi
 
     # Auto-build from presets/workspaces/resources/built-in skills if needed
-    local has_builtin_skills=false
-    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-            [[ -d "$_d" ]] && has_builtin_skills=true && break
-        done
-    fi
-
-    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_builtin_skills" == "true" || "$has_global_config" == "true" ]]; then
+    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
         if needs_rebuild; then
             build "false"
         fi
@@ -4310,17 +4546,17 @@ main() {
         fi
 
         if [[ -f ".compose-manifest.json" ]]; then
-            local has_resources=false
+            local has_synced_resources=false
             local section
             for section in global presets workspaces resources; do
                 local section_keys
                 section_keys=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
                 while IFS= read -r skey; do
                     [[ -z "$skey" ]] && continue
-                    has_resources=true
+                    has_synced_resources=true
                 done <<< "$section_keys"
             done
-            if [[ "$has_resources" == true ]]; then
+            if [[ "$has_synced_resources" == true ]]; then
                 echo -e "${CYAN}Synced resources (from manifest):${NC}" >&2
                 for section in global presets workspaces resources; do
                     jq -r --arg s "$section" '.[$s] // {} | to_entries[] | (

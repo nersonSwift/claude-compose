@@ -7,7 +7,7 @@ compute_source_prefix() {
     local safe_name
     safe_name=$(printf '%s' "$name" | tr -c '[:alnum:]_' '_')
     local hash4
-    hash4=$(printf '%s' "$abs_path" | shasum -a 256 | cut -c1-4)
+    hash4=$(printf '%s' "$abs_path" | _shasum256 | cut -c1-4)
     echo "${safe_name}_${hash4}_"
 }
 
