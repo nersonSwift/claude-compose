@@ -2,3 +2,8 @@ CLAUDE.md
 .claude/
 claude-compose.json
 .DS_Store
+/claude-compose
+/claude-compose.tmp
+/claude-compose.bak
+.compose-manifest.json
+.compose-hash
