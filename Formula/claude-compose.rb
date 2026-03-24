@@ -1,7 +1,8 @@
+# Note: This is a reference copy. The official formula is in the nersonSwift/homebrew-tap repo.
 class ClaudeCompose < Formula
-  desc "Multi-project launcher for Claude Code — merge MCP, permissions, skills, agents across projects"
+  desc "Multi-project workspace launcher for Claude Code"
   homepage "https://github.com/nersonSwift/claude-compose"
-  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v1.1.1.tar.gz"
+  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v2.0.0.tar.gz"
   sha256 ""  # Updated by release workflow
   license "MIT"
 

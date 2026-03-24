@@ -263,6 +263,9 @@ check_major_bump() {
     local old_major new_major
     old_major="${old_version%%.*}"
     new_major="${new_version%%.*}"
+    # Guard against non-numeric values
+    [[ "$old_major" =~ ^[0-9]+$ ]] || return 1
+    [[ "$new_major" =~ ^[0-9]+$ ]] || return 1
     (( new_major > old_major ))
 }
 
@@ -285,9 +288,47 @@ lock_read() {
     echo "$resolved" "$tag" "$spec"
 }
 
+# Acquire a directory-based lock (POSIX-portable, no flock needed)
+# $1 = lock dir path
+_acquire_lock() {
+    local lock_dir="$1"
+    local attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [[ "$attempts" -ge 25 ]]; then
+            # Check if lock holder is still alive
+            local lock_pid=""
+            [[ -f "$lock_dir/pid" ]] && lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+            if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+                echo -e "${YELLOW}Warning: Lock ${lock_dir} held by active process ${lock_pid}${NC}" >&2
+                return 1
+            fi
+            # Stale lock — force-remove and retry
+            rm -rf "$lock_dir"
+            if ! mkdir "$lock_dir" 2>/dev/null; then
+                echo -e "${YELLOW}Warning: Failed to acquire lock ${lock_dir}${NC}" >&2
+                return 1
+            fi
+            echo "$$" > "$lock_dir/pid"
+            return 0
+        fi
+        sleep 0.2
+    done
+    echo "$$" > "$lock_dir/pid"
+}
+
+# Release a directory-based lock
+# $1 = lock dir path
+_release_lock() {
+    rm -rf "$1" 2>/dev/null || true
+}
+
 # Write/update a lock entry atomically
 lock_write() {
     local source_key="$1" version="$2" tag="$3" spec="$4"
+
+    _acquire_lock "${LOCK_FILE}.lock" || return 1
+    trap '_release_lock "${LOCK_FILE}.lock"' RETURN
 
     local lock_json
     if [[ -f "$LOCK_FILE" ]]; then

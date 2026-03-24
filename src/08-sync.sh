@@ -41,7 +41,7 @@ sync_source_dir() {
                 abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
                 if [[ "$final_name" != "$agent_name" ]]; then
                     # Name changed — copy and rewrite name: in frontmatter
-                    sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_agent_file" > ".claude/agents/${dest_file}"
+                    rewrite_frontmatter_name "$abs_agent_file" ".claude/agents/${dest_file}" "$final_name"
                 else
                     ln -sf "$abs_agent_file" ".claude/agents/${dest_file}"
                 fi
@@ -109,6 +109,7 @@ sync_source_dir() {
             echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
         fi
 
+        local mcp_batch='{}'
         while IFS= read -r name; do
             [[ -z "$name" ]] && continue
             if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
@@ -123,10 +124,7 @@ sync_source_dir() {
                     server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
                 fi
 
-                local tmp
-                tmp=$(jq --arg name "$final_name" --argjson config "$server_config" \
-                    '.mcpServers[$name] = $config' ".mcp.json")
-                echo "$tmp" > ".mcp.json"
+                mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_name" --argjson config "$server_config" '.[$name] = $config')
 
                 CURRENT_SOURCE_MCP_SERVERS+=("$final_name")
                 if [[ "$final_name" != "$name" ]]; then
@@ -136,6 +134,20 @@ sync_source_dir() {
                 fi
             fi
         done < <(jq -r '.mcpServers // {} | keys[]' "$mcp_file" 2>/dev/null || true)
+
+        if [[ "$mcp_batch" != '{}' ]]; then
+            local overwrites
+            overwrites=$(jq -r --argjson batch "$mcp_batch" \
+                '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
+                ".mcp.json" 2>/dev/null || true)
+            while IFS= read -r ow; do
+                [[ -z "$ow" ]] && continue
+                echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
+            done <<< "$overwrites"
+            local tmp
+            tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
+            atomic_write ".mcp.json" "$tmp"
+        fi
     fi
 
     # ── CLAUDE.md via --add-dir ──

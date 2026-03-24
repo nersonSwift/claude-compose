@@ -1,7 +1,9 @@
 # ── Validate workspace ──────────────────────────────────────────────
 validate() {
     require_jq
-    require_claude
+    if [[ "$DRY_RUN" != true ]]; then
+        require_claude
+    fi
 
     # Check git availability if github presets are configured
     if [[ -f "$CONFIG_FILE" ]] && has_github_presets "$CONFIG_FILE"; then
@@ -47,6 +49,17 @@ validate() {
 validate_config_semantics() {
     local config_file="$1"
 
+    # Warn on unknown top-level keys
+    local known_keys='["projects","presets","workspaces","resources","update_interval"]'
+    local unknown_keys
+    unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
+    if [[ -n "$unknown_keys" ]]; then
+        while IFS= read -r uk; do
+            [[ -z "$uk" ]] && continue
+            echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
+        done <<< "$unknown_keys"
+    fi
+
     local projects_type
     projects_type=$(jq -r 'if has("projects") then .projects | type else "null" end' "$config_file")
     if [[ "$projects_type" != "null" && "$projects_type" != "array" ]]; then
@@ -74,6 +87,16 @@ validate_config_semantics() {
             joined=$(IFS=', '; echo "${missing[*]}")
             echo "Each project must have a \"name\" field. Missing in: ${joined}"
             return
+        fi
+
+        # Check for duplicate project names
+        if [[ "$project_count" -gt 1 ]]; then
+            local dup_names
+            dup_names=$(jq -r '[.projects[].name // empty] | group_by(.) | map(select(length > 1)) | .[0][0] // empty' "$config_file")
+            if [[ -n "$dup_names" ]]; then
+                echo "Duplicate project name: \"${dup_names}\". Each project must have a unique name."
+                return
+            fi
         fi
     fi
 
@@ -167,6 +190,43 @@ validate_config_semantics() {
         fi
     fi
 
+    # ── Validate workspaces array ──
+    local workspaces_type
+    workspaces_type=$(jq -r 'if has("workspaces") then .workspaces | type else "null" end' "$config_file")
+    if [[ "$workspaces_type" != "null" && "$workspaces_type" != "array" ]]; then
+        echo "\"workspaces\" must be an array, got: ${workspaces_type}"
+        return
+    fi
+    if [[ "$workspaces_type" == "array" ]]; then
+        local ws_count_v
+        ws_count_v=$(jq '.workspaces | length' "$config_file")
+        local wi
+        for wi in $(seq 0 $((ws_count_v - 1))); do
+            local ws_entry_type
+            ws_entry_type=$(jq -r ".workspaces[$wi] | type" "$config_file")
+            if [[ "$ws_entry_type" != "object" ]]; then
+                echo "workspaces[$wi]: expected object, got: ${ws_entry_type}"
+                return
+            fi
+            local ws_path_val
+            ws_path_val=$(jq -r ".workspaces[$wi].path // empty" "$config_file")
+            if [[ -z "$ws_path_val" ]]; then
+                echo "workspaces[$wi]: must have a \"path\" field"
+                return
+            fi
+            # Validate filter fields if present
+            local filter_field
+            for filter_field in mcp agents skills; do
+                local ff_type
+                ff_type=$(jq -r "if .workspaces[$wi] | has(\"$filter_field\") then .workspaces[$wi].$filter_field | type else \"null\" end" "$config_file")
+                if [[ "$ff_type" != "null" && "$ff_type" != "object" ]]; then
+                    echo "workspaces[$wi].$filter_field must be an object, got: ${ff_type}"
+                    return
+                fi
+            done
+        done
+    fi
+
     # ── Validate presets array ──
     local presets_type
     presets_type=$(jq -r 'if has("presets") then .presets | type else "null" end' "$config_file")
@@ -228,7 +288,6 @@ validate_config_semantics() {
                                 return
                             fi
                         done
-                        unset IFS
                     fi
                     # Validate prefix format if present
                     local prefix_val

@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build binary
+        run: make
+
       - name: Build .deb package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -24,21 +27,19 @@ jobs:
           cp claude-compose "${PKG_DIR}/usr/bin/claude-compose"
           chmod +x "${PKG_DIR}/usr/bin/claude-compose"
 
-          cat > "${PKG_DIR}/DEBIAN/control" << EOF
-          Package: claude-compose
-          Version: ${VERSION}
-          Section: utils
-          Priority: optional
-          Architecture: all
-          Depends: jq
-          Maintainer: Aleksandr Senin
-          Description: Multi-project launcher for Claude Code
-           Merges MCP servers, permissions, skills, and CLAUDE.md
-           from external projects into a single Claude Code session.
-          EOF
-
-          # Remove leading spaces from control file (heredoc indentation)
-          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+          cat > "${PKG_DIR}/DEBIAN/control" <<'CONTROL'
+Package: claude-compose
+Version: VERSION_PLACEHOLDER
+Section: utils
+Priority: optional
+Architecture: all
+Depends: jq
+Maintainer: Aleksandr Senin
+Description: Multi-project workspace launcher for Claude Code
+ Merges MCP servers, permissions, skills, and CLAUDE.md
+ from external projects into a single Claude Code session.
+CONTROL
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" "${PKG_DIR}/DEBIAN/control"
 
           dpkg-deb --build "${PKG_DIR}" "claude-compose.deb"
 

@@ -1,9 +1,39 @@
+# Validate env key: POSIX identifier, not in blocklist
+# $1 = key, $2 = source label (for error messages)
+_validate_env_key() {
+    local key="$1" source_label="${2:-}"
+    # Reject non-POSIX identifiers (must start with letter/underscore, contain only alnum/underscore)
+    case "$key" in
+        [!a-zA-Z_]*|*[!a-zA-Z0-9_]*)
+            echo -e "${RED}Warning: invalid env key '${key}' in ${source_label} — skipped${NC}" >&2
+            return 1
+            ;;
+    esac
+    # Blocklist dangerous variables
+    case "$key" in
+        PATH|HOME|SHELL|USER|LOGNAME|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_*|IFS|CDPATH|BASH_ENV|ENV|TMPDIR|LD_AUDIT|LD_CONFIG|BASH_FUNC_*)
+            echo -e "${RED}Warning: dangerous env key '${key}' in ${source_label} — skipped${NC}" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Check if a path contains traversal sequences
+_has_path_traversal() {
+    [[ "$1" == *"/.."* || "$1" == ".."* ]]
+}
+
 # Load JSON env files from resources.env_files at launch time
 load_env_files() {
     local env_files
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: env file path contains traversal, skipping: ${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$PWD/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
@@ -18,6 +48,7 @@ load_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "$env_file" || continue
             export "$key=$value"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
         local var_count
@@ -34,6 +65,10 @@ load_global_env_files() {
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: global env file path contains traversal, skipping: ${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$GLOBAL_CONFIG_DIR/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "${YELLOW}Warning: global env file not found: ${env_file}${NC}" >&2
@@ -48,6 +83,7 @@ load_global_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "$env_file" || continue
             export "$key=$value"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
         local var_count
@@ -69,6 +105,10 @@ load_source_env_files() {
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$source_config" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
+        if _has_path_traversal "$env_file"; then
+            echo -e "${YELLOW}Warning: source env file path contains traversal, skipping: ${source_name}/${env_file}${NC}" >&2
+            continue
+        fi
         local abs_path="$source_dir/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             continue
@@ -82,6 +122,7 @@ load_source_env_files() {
             local key value
             key=$(echo "$line" | jq -r '.key')
             value=$(echo "$line" | jq -r '.value')
+            _validate_env_key "$key" "${source_name}/${env_file}" || continue
             export "${prefix}${key}=${value}"
         done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
     done <<< "$env_files"

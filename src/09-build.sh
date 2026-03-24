@@ -79,6 +79,10 @@ process_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
             process_preset "$nested_name"
         elif [[ "$nested_type" == "object" ]]; then
             local nested_json
@@ -222,7 +226,7 @@ process_resources() {
         fi
         if [[ "$final_name" != "$name_no_ext" ]]; then
             # Name changed — copy and rewrite name: in frontmatter (Claude CLI reads it)
-            sed "1,/^---$/s/^name:.*$/name: ${final_name}/" "$abs_path" > ".claude/agents/${final_agent}"
+            rewrite_frontmatter_name "$abs_path" ".claude/agents/${final_agent}" "$final_name"
         else
             ln -sf "$abs_path" ".claude/agents/${final_agent}"
         fi
@@ -263,7 +267,7 @@ process_resources() {
             if [[ -f ".claude/skills/${final_skill}/SKILL.md" ]]; then
                 local tmp_skill
                 tmp_skill=$(mktemp ".claude/skills/${final_skill}/SKILL.md.XXXXXX")
-                sed "1,/^---$/s/^name:.*$/name: ${final_skill}/" ".claude/skills/${final_skill}/SKILL.md" > "$tmp_skill"
+                rewrite_frontmatter_name ".claude/skills/${final_skill}/SKILL.md" "$tmp_skill" "$final_skill"
                 mv "$tmp_skill" ".claude/skills/${final_skill}/SKILL.md"
             fi
         else
@@ -292,6 +296,11 @@ process_resources() {
     fi
 
     # ── Merge MCP servers ──
+    if [[ ! -f ".mcp.json" ]]; then
+        echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+    fi
+
+    local mcp_batch='{}'
     local mcp_keys
     mcp_keys=$(jq -r '.resources.mcp // {} | keys[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r server_name; do
@@ -312,14 +321,7 @@ process_resources() {
             final_server=$(apply_resource_prefix "$server_name" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
         fi
 
-        if [[ ! -f ".mcp.json" ]]; then
-            echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
-        fi
-
-        local tmp
-        tmp=$(jq --arg name "$final_server" --argjson config "$server_config" \
-            '.mcpServers[$name] = $config' ".mcp.json")
-        echo "$tmp" > ".mcp.json"
+        mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_server" --argjson config "$server_config" '.[$name] = $config')
 
         CURRENT_SOURCE_MCP_SERVERS+=("$final_server")
         if [[ "$final_server" != "$server_name" ]]; then
@@ -328,6 +330,20 @@ process_resources() {
             echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
         fi
     done <<< "$mcp_keys"
+
+    if [[ "$mcp_batch" != '{}' ]]; then
+        local overwrites
+        overwrites=$(jq -r --argjson batch "$mcp_batch" \
+            '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
+            ".mcp.json" 2>/dev/null || true)
+        while IFS= read -r ow; do
+            [[ -z "$ow" ]] && continue
+            echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
+        done <<< "$overwrites"
+        local tmp
+        tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
+        atomic_write ".mcp.json" "$tmp"
+    fi
 
     if [[ "$skip_manifest" != "true" ]]; then
         write_source_manifest "$manifest_section" "$manifest_key"
@@ -562,6 +578,10 @@ process_github_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
             # Local presets within a github registry resolve relative to registry root
             local reg_root
             reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
@@ -616,17 +636,10 @@ build() {
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
     has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-    local has_builtin_skills=false
-    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-            [[ -d "$_d" ]] && has_builtin_skills=true && break
-        done
-    fi
-
     local has_global_config=false
     [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills" != "true" && "$has_global_config" != "true" ]]; then
+    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
         echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
         return
     fi
@@ -635,6 +648,14 @@ build() {
         echo -e "${GREEN}Workspace is up to date. Use --force to rebuild.${NC}" >&2
         return
     fi
+
+    # Acquire build lock to prevent concurrent builds
+    if ! _acquire_lock ".compose-build.lock"; then
+        echo -e "${YELLOW}Warning: Another build is in progress, skipping.${NC}" >&2
+        return
+    fi
+    # shellcheck disable=SC2064
+    trap '_release_lock ".compose-build.lock"' RETURN
 
     echo -e "${BOLD}Building workspace...${NC}" >&2
 
@@ -694,14 +715,14 @@ build() {
     process_resources
 
     # Write manifest and hash
-    echo "$MANIFEST_JSON" | jq '.' > ".compose-manifest.json"
-    compute_build_hash > ".compose-hash"
+    atomic_write ".compose-manifest.json" "$(echo "$MANIFEST_JSON" | jq '.')"
+    atomic_write ".compose-hash" "$(compute_build_hash)"
 
     # Ensure _warning in .mcp.json
     if [[ -f ".mcp.json" ]]; then
         local tmp
         tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' ".mcp.json")
-        echo "$tmp" > ".mcp.json"
+        atomic_write ".mcp.json" "$tmp"
     fi
 
     echo "" >&2
@@ -733,22 +754,15 @@ cmd_build() {
         ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
         has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-        local has_builtin_skills_dr=false
-        if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-            for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-                [[ -d "$_d" ]] && has_builtin_skills_dr=true && break
-            done
-        fi
-
         local has_global_dr=false
         [[ -f "$GLOBAL_CONFIG" ]] && has_global_dr=true
 
-        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_builtin_skills_dr" != "true" && "$has_global_dr" != "true" ]]; then
+        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_dr" != "true" ]] && ! has_builtin_skills; then
             echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
             return
         fi
 
-        if [[ "$has_builtin_skills_dr" == true ]]; then
+        if has_builtin_skills; then
             echo -e "${CYAN}Built-in skills:${NC}" >&2
             for _d in "$BUILTIN_SKILLS_DIR"/*/; do
                 [[ -d "$_d" ]] || continue

@@ -14,13 +14,13 @@ cmd_migrate() {
         exit 1
     fi
     # Resolve to absolute path
-    project_path=$(cd "$project_path" && pwd)
+    project_path=$(cd "$project_path" && pwd -P)
 
     local workspace
     if [[ -n "$MIGRATE_WORKSPACE" ]]; then
         workspace=$(expand_path "$MIGRATE_WORKSPACE")
         mkdir -p "$workspace"
-        workspace=$(cd "$workspace" && pwd)
+        workspace=$(cd "$workspace" && pwd -P)
     else
         workspace="$ORIGINAL_CWD"
     fi
@@ -67,7 +67,7 @@ cmd_migrate() {
             local tmp
             tmp=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' \
                 "$workspace/.mcp.json" "$project_path/.mcp.json")
-            echo "$tmp" > "$workspace/.mcp.json"
+            atomic_write "$workspace/.mcp.json" "$tmp"
             echo -e "${GREEN}Merged:${NC} .mcp.json" >&2
         else
             cp "$project_path/.mcp.json" "$workspace/.mcp.json"
@@ -116,7 +116,7 @@ cmd_migrate() {
                 .[0] as $a | .[1] as $b |
                 ($a * $b) | .permissions.allow = (($a.permissions.allow // []) + ($b.permissions.allow // []) | unique)
             ' "$workspace/.claude/settings.local.json" "$project_path/.claude/settings.local.json")
-            echo "$tmp" > "$workspace/.claude/settings.local.json"
+            atomic_write "$workspace/.claude/settings.local.json" "$tmp"
             echo -e "${GREEN}Merged:${NC} .claude/settings.local.json" >&2
         else
             cp "$project_path/.claude/settings.local.json" "$workspace/.claude/settings.local.json"
@@ -158,12 +158,12 @@ cmd_migrate() {
             echo -e "${YELLOW}Project already in config:${NC} ${rel_path}" >&2
         else
             local tmp
-            tmp=$(jq --arg p "$rel_path" '.projects = ((.projects // []) + [{path: $p}])' "$config_path")
-            echo "$tmp" > "$config_path"
+            tmp=$(jq --arg p "$rel_path" --arg n "$project_name" '.projects = ((.projects // []) + [{path: $p, name: $n}])' "$config_path")
+            atomic_write "$config_path" "$tmp"
             echo -e "${GREEN}Added to config:${NC} ${rel_path}" >&2
         fi
     else
-        jq -n --arg p "$rel_path" '{projects: [{path: $p}]}' > "$config_path"
+        atomic_write "$config_path" "$(jq -n --arg p "$rel_path" --arg n "$project_name" '{projects: [{path: $p, name: $n}]}')"
         echo -e "${GREEN}Created:${NC} ${CONFIG_FILE}" >&2
     fi
 
@@ -197,7 +197,7 @@ cmd_copy() {
         echo -e "${RED}Error: Source directory not found: ${source_path}${NC}" >&2
         exit 1
     fi
-    source_path=$(cd "$source_path" && pwd)
+    source_path=$(cd "$source_path" && pwd -P)
 
     local config_name
     config_name=$(basename "$CONFIG_FILE")
@@ -259,12 +259,20 @@ cmd_copy() {
     echo -e "${GREEN}Workspace copied.${NC}" >&2
     echo "" >&2
 
-    # Launch Claude with compose-config for customization
-    require_claude
-    echo -e "${CYAN}Launching Claude for customization...${NC}" >&2
-    local prompt
-    prompt=$(compose_config_prompt "$dest_path/$config_name")
-    (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+    # Offer to launch Claude for customization
+    if [[ -t 0 ]]; then
+        local reply=""
+        echo -n "Launch Claude for customization? [y/N] " >&2
+        read -r reply
+        if [[ "$reply" =~ ^[Yy]$ ]]; then
+            require_claude
+            local prompt
+            prompt=$(compose_config_prompt "$dest_path/$config_name")
+            (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+        fi
+    else
+        echo -e "${CYAN}Run 'claude-compose config' in ${dest_path} to customize.${NC}" >&2
+    fi
 }
 
 # ── Instructions Command ─────────────────────────────────────────────
@@ -510,7 +518,7 @@ cmd_start() {
             echo -e "${RED}Error: Directory not found: ${root_path}${NC}" >&2
             exit 1
         fi
-        root_path=$(cd "$root_path" && pwd)
+        root_path=$(cd "$root_path" && pwd -P)
     fi
 
     local prompt

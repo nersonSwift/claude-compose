@@ -66,31 +66,26 @@ matches_filter() {
     fi
 
     local included=false
-    for i in $(seq 0 $((include_count - 1))); do
-        local pattern
-        pattern=$(echo "$include_json" | jq -r ".[$i]")
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
         # shellcheck disable=SC2053
         if [[ "$name" == $pattern ]]; then
             included=true
             break
         fi
-    done
+    done < <(echo "$include_json" | jq -r '.[]')
 
     if [[ "$included" == false ]]; then
         return 1
     fi
 
-    local exclude_count
-    exclude_count=$(echo "$exclude_json" | jq -r 'length')
-
-    for i in $(seq 0 $((exclude_count - 1))); do
-        local pattern
-        pattern=$(echo "$exclude_json" | jq -r ".[$i]")
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
         # shellcheck disable=SC2053
         if [[ "$name" == $pattern ]]; then
             return 1
         fi
-    done
+    done < <(echo "$exclude_json" | jq -r '.[]')
 
     return 0
 }
@@ -248,11 +243,31 @@ parse_args() {
     fi
 }
 
+# ── SHA tool detection (portability: macOS=shasum, Linux=sha256sum) ──
+# _SHASUM_CMD: used for file fingerprinting via xargs (SHA-1 on macOS, SHA-256 on Linux)
+# _shasum256: used for final content hash only
+if command -v shasum &>/dev/null; then
+    _SHASUM_CMD="shasum"
+    _shasum256() { shasum -a 256 "$@"; }
+elif command -v sha256sum &>/dev/null; then
+    _SHASUM_CMD="sha256sum"
+    # shellcheck disable=SC2120
+    _shasum256() { sha256sum "$@"; }
+else
+    _SHASUM_CMD="false"
+    # shellcheck disable=SC2120
+    _shasum256() { echo "error: no shasum or sha256sum found" >&2; return 1; }
+fi
+
 # ── Require tools ────────────────────────────────────────────────────
 require_jq() {
     if ! command -v jq &>/dev/null; then
         echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
-        echo "  Install: brew install jq" >&2
+        if [[ "$(uname)" == "Darwin" ]]; then
+            echo "  Install: brew install jq" >&2
+        else
+            echo "  Install: sudo apt install jq" >&2
+        fi
         # shellcheck disable=SC2034
         DOCTOR_ENABLED=false
         exit 1
@@ -266,6 +281,15 @@ require_claude() {
         DOCTOR_ENABLED=false
         exit 1
     fi
+}
+
+# ── Builtin skills check ───────────────────────────────────────────
+has_builtin_skills() {
+    [[ ! -d "$BUILTIN_SKILLS_DIR" ]] && return 1
+    for _d in "$BUILTIN_SKILLS_DIR"/*/; do
+        [[ -d "$_d" ]] && return 0
+    done
+    return 1
 }
 
 # ── Doctor helpers ──────────────────────────────────────────────────
@@ -303,4 +327,30 @@ _doctor_trap() {
     if [[ "$was_enabled" == true && "$exit_code" -ne 0 && -n "$DOCTOR_ERROR_MSG" && "$DRY_RUN" != true ]]; then
         launch_doctor "$DOCTOR_ERROR_MSG"
     fi
+}
+
+# Atomic file write: writes content to a temp file, then moves it into place.
+# Usage: atomic_write "destination_path" "content"
+atomic_write() {
+    local dest="$1" content="$2"
+    local tmp
+    tmp=$(mktemp "${dest}.XXXXXX")
+    if printf '%s\n' "$content" > "$tmp"; then
+        mv "$tmp" "$dest"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# Rewrite name: in YAML frontmatter safely (no sed metachar injection)
+# $1 = input file, $2 = output file, $3 = new name
+rewrite_frontmatter_name() {
+    local input="$1" output="$2" new_name="$3"
+    awk -v name="$new_name" '
+        BEGIN { in_fm = 0; fm_count = 0; done = 0 }
+        /^---$/ { fm_count++; in_fm = (fm_count == 1) ? 1 : 0 }
+        in_fm && !done && /^name:/ { print "name: " name; done = 1; next }
+        { print }
+    ' "$input" > "$output"
 }

@@ -16,6 +16,7 @@ clean_manifest_section() {
         agents=$(echo "$source_data" | jq -r '.agents // [] | .[]' 2>/dev/null || true)
         while IFS= read -r agent; do
             [[ -z "$agent" ]] && continue
+            [[ "$agent" == */* || "$agent" == ..* ]] && continue
             if [[ -f ".claude/agents/${agent}" ]]; then
                 rm -f ".claude/agents/${agent}"
                 echo -e "  ${YELLOW}-agent:${NC} $agent" >&2
@@ -27,6 +28,7 @@ clean_manifest_section() {
         skills=$(echo "$source_data" | jq -r '.skills // [] | .[]' 2>/dev/null || true)
         while IFS= read -r skill; do
             [[ -z "$skill" ]] && continue
+            [[ "$skill" == */* || "$skill" == ..* ]] && continue
             if [[ -L ".claude/skills/${skill}" ]]; then
                 rm -f ".claude/skills/${skill}"
                 echo -e "  ${YELLOW}-skill:${NC} $skill" >&2
@@ -44,7 +46,7 @@ clean_manifest_section() {
                 [[ -z "$server" ]] && continue
                 local tmp
                 tmp=$(jq --arg s "$server" 'del(.mcpServers[$s])' ".mcp.json")
-                echo "$tmp" > ".mcp.json"
+                atomic_write ".mcp.json" "$tmp"
                 echo -e "  ${YELLOW}-mcp:${NC} $server" >&2
             done <<< "$mcp_servers"
             local server_count

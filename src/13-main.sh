@@ -9,7 +9,7 @@ main() {
     local config_dir
     config_dir="$(dirname "$CONFIG_FILE")"
     if [[ -d "$config_dir" ]]; then
-        CONFIG_FILE="$(cd "$config_dir" && pwd)/$(basename "$CONFIG_FILE")"
+        CONFIG_FILE="$(cd "$config_dir" && pwd -P)/$(basename "$CONFIG_FILE")"
     fi
 
     # Set lock file path next to config
@@ -57,14 +57,7 @@ main() {
     fi
 
     # Auto-build from presets/workspaces/resources/built-in skills if needed
-    local has_builtin_skills=false
-    if [[ -d "$BUILTIN_SKILLS_DIR" ]]; then
-        for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-            [[ -d "$_d" ]] && has_builtin_skills=true && break
-        done
-    fi
-
-    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_builtin_skills" == "true" || "$has_global_config" == "true" ]]; then
+    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
         if needs_rebuild; then
             build "false"
         fi
@@ -211,17 +204,17 @@ main() {
         fi
 
         if [[ -f ".compose-manifest.json" ]]; then
-            local has_resources=false
+            local has_synced_resources=false
             local section
             for section in global presets workspaces resources; do
                 local section_keys
                 section_keys=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
                 while IFS= read -r skey; do
                     [[ -z "$skey" ]] && continue
-                    has_resources=true
+                    has_synced_resources=true
                 done <<< "$section_keys"
             done
-            if [[ "$has_resources" == true ]]; then
+            if [[ "$has_synced_resources" == true ]]; then
                 echo -e "${CYAN}Synced resources (from manifest):${NC}" >&2
                 for section in global presets workspaces resources; do
                     jq -r --arg s "$section" '.[$s] // {} | to_entries[] | (

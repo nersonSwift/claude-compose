@@ -32,6 +32,10 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 	done < $@.tmp > $@
 	@rm -f $@.tmp
 	@chmod +x $@
+	@if git describe --exact-match --tags HEAD 2>/dev/null | grep -qE '^v[0-9]'; then \
+		TAG_VER=$$(git describe --exact-match --tags HEAD 2>/dev/null | sed 's/^v//'); \
+		sed -i.bak "s/^VERSION=\".*\"/VERSION=\"$$TAG_VER\"/" $@ && rm -f $@.bak; \
+	fi
 	@echo "Done: $(TARGET) ($$(wc -l < $@) lines)"
 
 clean:

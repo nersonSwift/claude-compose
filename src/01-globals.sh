@@ -3,7 +3,7 @@
 CONFIG_FILE=""
 DRY_RUN=false
 EXTRA_ARGS=()
-ORIGINAL_CWD="$(pwd)"
+ORIGINAL_CWD="$(pwd -P)"
 CLAUDE_ARGS=()
 NEED_CLAUDE_MD_ENV=false
 SUBCOMMAND=""           # "", "config", "build", "migrate", "copy"
@@ -40,9 +40,18 @@ CURRENT_PRESET_PREFIX=""
 CURRENT_PRESET_RENAME='{}'
 
 # ── Colors ───────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+if [[ -t 2 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    BOLD=''
+    NC=''
+fi
