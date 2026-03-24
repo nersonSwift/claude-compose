@@ -277,6 +277,7 @@ require_jq() {
 require_claude() {
     if ! command -v claude &>/dev/null; then
         echo -e "${RED}Error: claude CLI not found in PATH.${NC}" >&2
+        echo "  Install: https://claude.ai/code" >&2
         # shellcheck disable=SC2034
         DOCTOR_ENABLED=false
         exit 1
@@ -320,6 +321,13 @@ _doctor_trap() {
     local exit_code=$?
     # Remove trap to prevent recursion
     trap - EXIT
+
+    # Release build lock if held (RETURN trap doesn't fire on exit)
+    if [[ "${_BUILD_LOCK_HELD:-}" == true ]]; then
+        _release_lock ".compose-build.lock" 2>/dev/null || true
+        _BUILD_LOCK_HELD=false
+    fi
+
     local was_enabled="$DOCTOR_ENABLED"
     # shellcheck disable=SC2034
     DOCTOR_ENABLED=false

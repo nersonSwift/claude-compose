@@ -57,9 +57,11 @@ main() {
     fi
 
     # Auto-build from presets/workspaces/resources/built-in skills if needed
-    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
-        if needs_rebuild; then
-            build "false"
+    if [[ "$DRY_RUN" != true ]]; then
+        if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
+            if needs_rebuild; then
+                build "false"
+            fi
         fi
     fi
 
@@ -73,12 +75,13 @@ main() {
     # Collect --add-dir args from projects
     local project_aliases=""
     if [[ "$project_count" -gt 0 ]]; then
-        for i in $(seq 0 $((project_count - 1))); do
+        local mpi
+        for ((mpi = 0; mpi < project_count; mpi++)); do
             local raw_path project_path claude_md project_name
-            raw_path=$(jq -r ".projects[$i].path" "$CONFIG_FILE")
+            raw_path=$(jq -r ".projects[$mpi].path" "$CONFIG_FILE")
             project_path=$(expand_path "$raw_path")
-            claude_md=$(jq -r ".projects[$i].claude_md // true" "$CONFIG_FILE")
-            project_name=$(jq -r ".projects[$i].name // empty" "$CONFIG_FILE")
+            claude_md=$(jq -r ".projects[$mpi].claude_md // true" "$CONFIG_FILE")
+            project_name=$(jq -r ".projects[$mpi].name // empty" "$CONFIG_FILE")
 
             if [[ ! -d "$project_path" ]]; then
                 echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
@@ -161,7 +164,7 @@ main() {
         if [[ "$preset_count" -gt 0 ]]; then
             echo -e "${CYAN}Active presets:${NC}" >&2
             local dri_m
-            for dri_m in $(seq 0 $((preset_count - 1))); do
+            for ((dri_m = 0; dri_m < preset_count; dri_m++)); do
                 local drm_type
                 drm_type=$(jq -r ".presets[$dri_m] | type" "$CONFIG_FILE")
                 if [[ "$drm_type" == "string" ]]; then
@@ -190,9 +193,10 @@ main() {
 
         if [[ "$ws_count" -gt 0 ]]; then
             echo -e "${CYAN}Active workspaces:${NC}" >&2
-            for i in $(seq 0 $((ws_count - 1))); do
+            local mwi
+            for ((mwi = 0; mwi < ws_count; mwi++)); do
                 local ws_path
-                ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+                ws_path=$(jq -r ".workspaces[$mwi].path" "$CONFIG_FILE")
                 echo "  - $ws_path" >&2
             done
             echo "" >&2
@@ -284,7 +288,7 @@ main() {
         fi
 
         echo -e "${CYAN}Directories (--add-dir):${NC}" >&2
-        for arg_idx in $(seq 0 $((${#CLAUDE_ARGS[@]} - 1))); do
+        for ((arg_idx = 0; arg_idx < ${#CLAUDE_ARGS[@]}; arg_idx++)); do
             if [[ "${CLAUDE_ARGS[$arg_idx]}" == "--add-dir" && "$arg_idx" -lt $((${#CLAUDE_ARGS[@]} - 1)) ]]; then
                 local dir_val="${CLAUDE_ARGS[$((arg_idx + 1))]}"
                 echo "  - $dir_val" >&2

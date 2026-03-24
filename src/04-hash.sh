@@ -36,7 +36,7 @@ collect_all_presets() {
             local nested_count
             nested_count=$(jq '.presets // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
             local j
-            for j in $(seq 0 $((nested_count - 1))); do
+            for ((j = 0; j < nested_count; j++)); do
                 local entry_type
                 entry_type=$(jq -r ".presets[$j] | type" "$preset_dir/claude-compose.json" 2>/dev/null || echo "null")
                 if [[ "$entry_type" == "string" ]]; then
@@ -115,7 +115,7 @@ compute_build_hash() {
         local gp_count_h
         gp_count_h=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
         local gi
-        for gi in $(seq 0 $((gp_count_h - 1))); do
+        for ((gi = 0; gi < gp_count_h; gi++)); do
             local gentry_type
             gentry_type=$(jq -r ".presets[$gi] | type" "$GLOBAL_CONFIG" 2>/dev/null || echo "null")
             if [[ "$gentry_type" == "string" ]]; then
@@ -153,7 +153,7 @@ compute_build_hash() {
     local lp_count_h
     lp_count_h=$(jq '.presets // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
     local li
-    for li in $(seq 0 $((lp_count_h - 1))); do
+    for ((li = 0; li < lp_count_h; li++)); do
         local lentry_type
         lentry_type=$(jq -r ".presets[$li] | type" "$CONFIG_FILE" 2>/dev/null || echo "null")
         if [[ "$lentry_type" == "string" ]]; then
@@ -188,9 +188,10 @@ compute_build_hash() {
     # Hash workspace source dirs (Claude config files only)
     local ws_count
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    for i in $(seq 0 $((ws_count - 1))); do
+    local hwi
+    for ((hwi = 0; hwi < ws_count; hwi++)); do
         local ws_path
-        ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+        ws_path=$(jq -r ".workspaces[$hwi].path" "$CONFIG_FILE")
         ws_path=$(expand_path "$ws_path")
         [[ -d "$ws_path" ]] || continue
         hash_workspace_config_files "$ws_path" >> "$hash_tmp"
@@ -200,9 +201,10 @@ compute_build_hash() {
     if [[ -f "$GLOBAL_CONFIG" ]]; then
         local global_ws_count
         global_ws_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
-        for i in $(seq 0 $((global_ws_count - 1))); do
+        local hgwi
+        for ((hgwi = 0; hgwi < global_ws_count; hgwi++)); do
             local gws_path
-            gws_path=$(jq -r ".workspaces[$i].path" "$GLOBAL_CONFIG")
+            gws_path=$(jq -r ".workspaces[$hgwi].path" "$GLOBAL_CONFIG")
             gws_path=$(expand_path "$gws_path")
             [[ -d "$gws_path" ]] || continue
             hash_workspace_config_files "$gws_path" >> "$hash_tmp"

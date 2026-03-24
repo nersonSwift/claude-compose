@@ -16,5 +16,5 @@ ensure_builtin_skills() {
 
     mkdir -p "$BUILTIN_SKILLS_DIR"
     extract_embedded_skills "$BUILTIN_SKILLS_DIR"
-    echo "$VERSION" > "$version_file"
+    atomic_write "$version_file" "$VERSION"
 }

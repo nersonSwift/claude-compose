@@ -38,7 +38,7 @@ process_preset() {
     process_resources "$preset_config" "$preset_dir" "$preset_name" \
         "presets" "$preset_name" "$preset_name" "true"
 
-    # CLAUDE.md via --add-dir (process_resources resets arrays, so add_dirs is clean)
+    # CLAUDE.md via --add-dir (process_resources always resets arrays, even on early return)
     local claude_md
     claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
     if [[ "$claude_md" == "true" && -f "$preset_dir/CLAUDE.md" ]]; then
@@ -49,11 +49,12 @@ process_preset() {
     local preset_project_count
     preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
     if [[ "$preset_project_count" -gt 0 ]]; then
-        for i in $(seq 0 $((preset_project_count - 1))); do
+        local ppi
+        for ((ppi = 0; ppi < preset_project_count; ppi++)); do
             local proj_path proj_claude_md
-            proj_path=$(jq -r ".projects[$i].path" "$preset_config")
+            proj_path=$(jq -r ".projects[$ppi].path" "$preset_config")
             proj_path=$(expand_path "$proj_path")
-            proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$preset_config")
+            proj_claude_md=$(jq -r ".projects[$ppi].claude_md // true" "$preset_config")
 
             if [[ ! -d "$proj_path" ]]; then
                 echo -e "${YELLOW}Warning: Preset project path not found, skipping: ${proj_path}${NC}" >&2
@@ -66,13 +67,14 @@ process_preset() {
     fi
 
     # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
+    CURRENT_SOURCE_NAME="$preset_name"
     write_source_manifest "presets" "$preset_name"
 
     # Recursively process nested presets (handles mixed arrays)
     local nested_count
     nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
     local ni
-    for ni in $(seq 0 $((nested_count - 1))); do
+    for ((ni = 0; ni < nested_count; ni++)); do
         local nested_type
         nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
         if [[ "$nested_type" == "string" ]]; then
@@ -151,11 +153,12 @@ process_workspace_source() {
         local ws_project_count
         ws_project_count=$(jq '.projects // [] | length' "$ws_path/claude-compose.json" 2>/dev/null || echo 0)
         if [[ "$ws_project_count" -gt 0 ]]; then
-            for i in $(seq 0 $((ws_project_count - 1))); do
+            local wpi
+            for ((wpi = 0; wpi < ws_project_count; wpi++)); do
                 local proj_path proj_claude_md
-                proj_path=$(jq -r ".projects[$i].path" "$ws_path/claude-compose.json")
+                proj_path=$(jq -r ".projects[$wpi].path" "$ws_path/claude-compose.json")
                 proj_path=$(expand_path "$proj_path")
-                proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$ws_path/claude-compose.json")
+                proj_claude_md=$(jq -r ".projects[$wpi].claude_md // true" "$ws_path/claude-compose.json")
 
                 if [[ ! -d "$proj_path" ]]; then
                     continue
@@ -168,6 +171,7 @@ process_workspace_source() {
     fi
 
     # Write manifest — use path as key (workspaces don't have global names)
+    CURRENT_SOURCE_NAME="$(basename "$ws_path")"
     write_source_manifest "workspaces" "$ws_path"
 }
 
@@ -185,6 +189,16 @@ process_resources() {
     local source_name="${6:-}"
     local skip_manifest="${7:-false}"
 
+    # Set source_name for manifest tracking (used by env var prefixing at launch time)
+    CURRENT_SOURCE_NAME="$source_name"
+
+    # Reset tracking (must happen before early return so callers see clean arrays)
+    CURRENT_SOURCE_AGENTS=()
+    CURRENT_SOURCE_SKILLS=()
+    CURRENT_SOURCE_MCP_SERVERS=()
+    CURRENT_SOURCE_ADD_DIRS=()
+    CURRENT_SOURCE_PROJECT_DIRS=()
+
     local resources
     resources=$(jq -c '.resources // {}' "$config_file")
     if [[ "$resources" == "{}" || "$resources" == "null" ]]; then
@@ -192,13 +206,6 @@ process_resources() {
     fi
 
     echo -e "${CYAN}Processing ${label} resources${NC}" >&2
-
-    # Reset tracking
-    CURRENT_SOURCE_AGENTS=()
-    CURRENT_SOURCE_SKILLS=()
-    CURRENT_SOURCE_MCP_SERVERS=()
-    CURRENT_SOURCE_ADD_DIRS=()
-    CURRENT_SOURCE_PROJECT_DIRS=()
 
     # ── Sync agents (symlink or copy+rename) ──
     local agents
@@ -297,7 +304,7 @@ process_resources() {
 
     # ── Merge MCP servers ──
     if [[ ! -f ".mcp.json" ]]; then
-        echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+        atomic_write ".mcp.json" "$_MCP_EMPTY"
     fi
 
     local mcp_batch='{}'
@@ -389,6 +396,7 @@ process_builtin_skills() {
         echo -e "  ${GREEN}+skill:${NC} ${skill_name} (built-in)" >&2
     done
 
+    CURRENT_SOURCE_NAME=""
     write_source_manifest "builtin" "skills"
 }
 
@@ -402,7 +410,7 @@ process_global() {
     local gp_count
     gp_count=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
     local gpi
-    for gpi in $(seq 0 $((gp_count - 1))); do
+    for ((gpi = 0; gpi < gp_count; gpi++)); do
         local gp_type
         gp_type=$(jq -r ".presets[$gpi] | type" "$GLOBAL_CONFIG" 2>/dev/null || echo "null")
         if [[ "$gp_type" == "string" ]]; then
@@ -434,11 +442,12 @@ process_global() {
         CURRENT_SOURCE_ADD_DIRS=()
         CURRENT_SOURCE_PROJECT_DIRS=()
 
-        for i in $(seq 0 $((global_project_count - 1))); do
+        local gpi2
+        for ((gpi2 = 0; gpi2 < global_project_count; gpi2++)); do
             local proj_path proj_claude_md
-            proj_path=$(jq -r ".projects[$i].path" "$GLOBAL_CONFIG")
+            proj_path=$(jq -r ".projects[$gpi2].path" "$GLOBAL_CONFIG")
             proj_path=$(expand_path "$proj_path")
-            proj_claude_md=$(jq -r ".projects[$i].claude_md // true" "$GLOBAL_CONFIG")
+            proj_claude_md=$(jq -r ".projects[$gpi2].claude_md // true" "$GLOBAL_CONFIG")
 
             if [[ ! -d "$proj_path" ]]; then
                 echo -e "  ${YELLOW}Warning: Global project path not found, skipping: ${proj_path}${NC}" >&2
@@ -449,6 +458,7 @@ process_global() {
             echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (global)" >&2
         done
 
+        CURRENT_SOURCE_NAME=""
         write_source_manifest "global" "projects"
     fi
 
@@ -456,9 +466,10 @@ process_global() {
     local global_ws_count
     global_ws_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
     if [[ "$global_ws_count" -gt 0 ]]; then
-        for i in $(seq 0 $((global_ws_count - 1))); do
+        local gwi
+        for ((gwi = 0; gwi < global_ws_count; gwi++)); do
             local ws_json
-            ws_json=$(jq -c ".workspaces[$i]" "$GLOBAL_CONFIG")
+            ws_json=$(jq -c ".workspaces[$gwi]" "$GLOBAL_CONFIG")
             process_workspace_source "$ws_json"
         done
     fi
@@ -544,7 +555,7 @@ process_github_preset() {
     preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
     if [[ "$preset_project_count" -gt 0 ]]; then
         local pi
-        for pi in $(seq 0 $((preset_project_count - 1))); do
+        for ((pi = 0; pi < preset_project_count; pi++)); do
             local proj_path proj_claude_md
             proj_path=$(jq -r ".projects[$pi].path" "$preset_config")
             proj_path=$(expand_path "$proj_path")
@@ -561,6 +572,7 @@ process_github_preset() {
     fi
 
     # Write manifest entry
+    CURRENT_SOURCE_NAME="$source_name"
     write_source_manifest "presets" "$source_key"
 
     # Reset prefix/rename before nested presets (they set their own)
@@ -571,7 +583,7 @@ process_github_preset() {
     local nested_count
     nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
     local ni
-    for ni in $(seq 0 $((nested_count - 1))); do
+    for ((ni = 0; ni < nested_count; ni++)); do
         local nested_type
         nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
         if [[ "$nested_type" == "string" ]]; then
@@ -654,8 +666,10 @@ build() {
         echo -e "${YELLOW}Warning: Another build is in progress, skipping.${NC}" >&2
         return
     fi
+    # Release lock on normal return; also chain into EXIT trap for abnormal exit (die_doctor, etc.)
     # shellcheck disable=SC2064
-    trap '_release_lock ".compose-build.lock"' RETURN
+    trap '_release_lock ".compose-build.lock"; _BUILD_LOCK_HELD=false' RETURN
+    _BUILD_LOCK_HELD=true
 
     echo -e "${BOLD}Building workspace...${NC}" >&2
 
@@ -683,7 +697,7 @@ build() {
     local bp_count
     bp_count=$(jq '.presets // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
     local bpi
-    for bpi in $(seq 0 $((bp_count - 1))); do
+    for ((bpi = 0; bpi < bp_count; bpi++)); do
         local bp_type
         bp_type=$(jq -r ".presets[$bpi] | type" "$CONFIG_FILE" 2>/dev/null || echo "null")
         if [[ "$bp_type" == "string" ]]; then
@@ -704,9 +718,10 @@ build() {
 
     # Process workspaces
     if [[ "$ws_count" -gt 0 ]]; then
-        for i in $(seq 0 $((ws_count - 1))); do
+        local bwi
+        for ((bwi = 0; bwi < ws_count; bwi++)); do
             local ws_json
-            ws_json=$(jq -c ".workspaces[$i]" "$CONFIG_FILE")
+            ws_json=$(jq -c ".workspaces[$bwi]" "$CONFIG_FILE")
             process_workspace_source "$ws_json"
         done
     fi
@@ -786,7 +801,7 @@ cmd_build() {
         if [[ "$preset_count" -gt 0 ]]; then
             echo -e "${CYAN}Presets to process:${NC}" >&2
             local dri
-            for dri in $(seq 0 $((preset_count - 1))); do
+            for ((dri = 0; dri < preset_count; dri++)); do
                 local dr_type
                 dr_type=$(jq -r ".presets[$dri] | type" "$CONFIG_FILE")
                 if [[ "$dr_type" == "string" ]]; then
@@ -833,9 +848,10 @@ cmd_build() {
 
         if [[ "$ws_count" -gt 0 ]]; then
             echo -e "${CYAN}Workspaces to sync:${NC}" >&2
-            for i in $(seq 0 $((ws_count - 1))); do
+            local drwi
+            for ((drwi = 0; drwi < ws_count; drwi++)); do
                 local ws_path
-                ws_path=$(jq -r ".workspaces[$i].path" "$CONFIG_FILE")
+                ws_path=$(jq -r ".workspaces[$drwi].path" "$CONFIG_FILE")
                 local ws_expanded
                 ws_expanded=$(expand_path "$ws_path")
                 if [[ -d "$ws_expanded" ]]; then

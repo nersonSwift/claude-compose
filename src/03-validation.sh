@@ -18,6 +18,9 @@ validate() {
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}Error: Config not found: ${CONFIG_FILE}${NC}" >&2
+        if [[ "$DRY_RUN" == true ]]; then
+            exit 1
+        fi
         echo -e "${YELLOW}Launching Claude to create the config...${NC}" >&2
         local ws_dir
         ws_dir="$(dirname "$CONFIG_FILE")"
@@ -71,20 +74,30 @@ validate_config_semantics() {
     project_count=$(jq '.projects // [] | length' "$config_file")
 
     if [[ "$project_count" -gt 0 ]]; then
-        local missing=()
-        for i in $(seq 0 $((project_count - 1))); do
-            local name
+        local missing_name=()
+        local missing_path=()
+        for ((i = 0; i < project_count; i++)); do
+            local name path
             name=$(jq -r ".projects[$i].name // empty" "$config_file")
+            path=$(jq -r ".projects[$i].path // empty" "$config_file")
             if [[ -z "$name" ]]; then
-                local path
-                path=$(jq -r ".projects[$i].path // \"(unknown)\"" "$config_file")
-                missing+=("projects[$i] (${path})")
+                missing_name+=("projects[$i] (${path:-unknown})")
+            fi
+            if [[ -z "$path" ]]; then
+                missing_path+=("projects[$i] (${name:-unknown})")
             fi
         done
 
-        if [[ ${#missing[@]} -gt 0 ]]; then
+        if [[ ${#missing_path[@]} -gt 0 ]]; then
             local joined
-            joined=$(IFS=', '; echo "${missing[*]}")
+            joined=$(IFS=', '; echo "${missing_path[*]}")
+            echo "Each project must have a \"path\" field. Missing in: ${joined}"
+            return
+        fi
+
+        if [[ ${#missing_name[@]} -gt 0 ]]; then
+            local joined
+            joined=$(IFS=', '; echo "${missing_name[*]}")
             echo "Each project must have a \"name\" field. Missing in: ${joined}"
             return
         fi
@@ -201,7 +214,7 @@ validate_config_semantics() {
         local ws_count_v
         ws_count_v=$(jq '.workspaces | length' "$config_file")
         local wi
-        for wi in $(seq 0 $((ws_count_v - 1))); do
+        for ((wi = 0; wi < ws_count_v; wi++)); do
             local ws_entry_type
             ws_entry_type=$(jq -r ".workspaces[$wi] | type" "$config_file")
             if [[ "$ws_entry_type" != "object" ]]; then
@@ -239,7 +252,7 @@ validate_config_semantics() {
         preset_count_v=$(jq '.presets | length' "$config_file")
         if [[ "$preset_count_v" -gt 0 ]]; then
         local i
-        for i in $(seq 0 $((preset_count_v - 1))); do
+        for ((i = 0; i < preset_count_v; i++)); do
             local entry_type
             entry_type=$(jq -r ".presets[$i] | type" "$config_file")
             case "$entry_type" in
@@ -280,13 +293,14 @@ validate_config_semantics() {
                     # Validate path segments (no path traversal via ..)
                     local gh_path_part="${gh_rest#*/*/}"
                     if [[ "$gh_path_part" != "$gh_rest" && -n "$gh_path_part" ]]; then
-                        local IFS='/'
-                        local gh_seg
-                        for gh_seg in $gh_path_part; do
+                        local _remaining="$gh_path_part" gh_seg
+                        while [[ -n "$_remaining" ]]; do
+                            gh_seg="${_remaining%%/*}"
                             if [[ "$gh_seg" == ".." || "$gh_seg" == "." ]]; then
                                 echo "presets[$i].source: path contains invalid segment: ${gh_seg}"
                                 return
                             fi
+                            [[ "$_remaining" == */* ]] && _remaining="${_remaining#*/}" || _remaining=""
                         done
                     fi
                     # Validate prefix format if present

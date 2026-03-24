@@ -11,7 +11,7 @@ _validate_env_key() {
     esac
     # Blocklist dangerous variables
     case "$key" in
-        PATH|HOME|SHELL|USER|LOGNAME|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_*|IFS|CDPATH|BASH_ENV|ENV|TMPDIR|LD_AUDIT|LD_CONFIG|BASH_FUNC_*)
+        PATH|HOME|SHELL|USER|LOGNAME|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_*|IFS|CDPATH|BASH_ENV|ENV|TMPDIR|LD_AUDIT|LD_CONFIG|BASH_FUNC_*|PROMPT_COMMAND|GLOBIGNORE|HISTFILE|PYTHONPATH|NODE_PATH|RUBYLIB|PERL5LIB|GIT_SSH_COMMAND|GIT_EXEC_PATH|EDITOR|VISUAL|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|no_proxy|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS|ANTHROPIC_*|CLAUDE_*|XDG_CONFIG_HOME|XDG_DATA_HOME)
             echo -e "${RED}Warning: dangerous env key '${key}' in ${source_label} — skipped${NC}" >&2
             return 1
             ;;
@@ -34,7 +34,7 @@ load_env_files() {
             echo -e "${YELLOW}Warning: env file path contains traversal, skipping: ${env_file}${NC}" >&2
             continue
         fi
-        local abs_path="$PWD/$env_file"
+        local abs_path="$ORIGINAL_CWD/$env_file"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
             continue
@@ -151,7 +151,10 @@ load_all_source_env_files() {
                 source_dir="$sname"  # workspaces use absolute path as key
             fi
             [[ ! -d "$source_dir" ]] && continue
-            load_source_env_files "$source_dir" "$(basename "$source_dir")"
+            local source_name
+            source_name=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].source_name // empty' ".compose-manifest.json" 2>/dev/null || true)
+            [[ -z "$source_name" ]] && source_name="$(basename "$source_dir")"
+            load_source_env_files "$source_dir" "$source_name"
         done <<< "$source_names"
     done
 }

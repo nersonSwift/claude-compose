@@ -19,8 +19,12 @@ cmd_migrate() {
     local workspace
     if [[ -n "$MIGRATE_WORKSPACE" ]]; then
         workspace=$(expand_path "$MIGRATE_WORKSPACE")
-        mkdir -p "$workspace"
-        workspace=$(cd "$workspace" && pwd -P)
+        if [[ "$DRY_RUN" != true ]]; then
+            mkdir -p "$workspace"
+        fi
+        if [[ -d "$workspace" ]]; then
+            workspace=$(cd "$workspace" && pwd -P)
+        fi
     else
         workspace="$ORIGINAL_CWD"
     fi
@@ -225,6 +229,7 @@ cmd_copy() {
     [[ -d "$source_path/.claude/skills" ]] && echo "  .claude/skills/" >&2
     [[ -f "$source_path/.claude/settings.local.json" ]] && echo "  .claude/settings.local.json" >&2
     [[ -f "$source_path/CLAUDE.md" ]] && echo "  CLAUDE.md" >&2
+    [[ -f "$source_path/${config_name%.json}.lock.json" ]] && echo "  ${config_name%.json}.lock.json" >&2
     echo "" >&2
     echo -e "${CYAN}NOT copied (will rebuild):${NC}" >&2
     echo "  .compose-manifest.json" >&2
@@ -240,6 +245,8 @@ cmd_copy() {
     mkdir -p "$dest_path"
 
     cp "$source_path/$config_name" "$dest_path/$config_name"
+    local lock_name="${config_name%.json}.lock.json"
+    [[ -f "$source_path/$lock_name" ]] && cp "$source_path/$lock_name" "$dest_path/$lock_name"
     [[ -f "$source_path/.mcp.json" ]] && cp "$source_path/.mcp.json" "$dest_path/.mcp.json"
     [[ -f "$source_path/CLAUDE.md" ]] && cp "$source_path/CLAUDE.md" "$dest_path/CLAUDE.md"
 
@@ -301,7 +308,7 @@ cmd_instructions() {
     summary+="- Projects: $project_count"$'\n'
     if [[ "$preset_count" -gt 0 ]]; then
         local preset_names
-        preset_names=$(jq -r '.presets // [] | join(", ")' "$config_file")
+        preset_names=$(jq -r '.presets // [] | map(if type == "string" then . elif .source then .source else (. | tostring) end) | join(", ")' "$config_file")
         summary+="- Presets: $preset_names"$'\n'
     fi
     if [[ "$ws_count" -gt 0 ]]; then
@@ -397,7 +404,7 @@ cmd_update() {
         local count
         count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
         local i
-        for i in $(seq 0 $((count - 1))); do
+        for ((i = 0; i < count; i++)); do
             local entry_type
             entry_type=$(jq -r ".presets[$i] | type" "$conf")
             [[ "$entry_type" != "object" ]] && continue
@@ -485,6 +492,9 @@ cmd_update() {
         done
     }
 
+    # Ensure inner function is cleaned up even on abnormal exit
+    trap 'unset -f _update_presets_from_config 2>/dev/null' RETURN
+
     _update_presets_from_config "$CONFIG_FILE"
     _update_presets_from_config "$GLOBAL_CONFIG"
 
@@ -555,7 +565,7 @@ cmd_registries() {
         local count
         count=$(jq '.presets // [] | length' "$conf" 2>/dev/null || echo 0)
         local i
-        for i in $(seq 0 $((count - 1))); do
+        for ((i = 0; i < count; i++)); do
             local entry_type
             entry_type=$(jq -r ".presets[$i] | type" "$conf")
             [[ "$entry_type" != "object" ]] && continue
@@ -598,6 +608,9 @@ cmd_registries() {
             echo "" >&2
         done
     }
+
+    # Ensure inner function is cleaned up even on abnormal exit
+    trap 'unset -f _list_presets_from_config 2>/dev/null' RETURN
 
     _list_presets_from_config "$CONFIG_FILE" "workspace"
     _list_presets_from_config "$GLOBAL_CONFIG" "global"

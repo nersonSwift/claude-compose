@@ -17,7 +17,7 @@ clean_manifest_section() {
         while IFS= read -r agent; do
             [[ -z "$agent" ]] && continue
             [[ "$agent" == */* || "$agent" == ..* ]] && continue
-            if [[ -f ".claude/agents/${agent}" ]]; then
+            if [[ -L ".claude/agents/${agent}" || -f ".claude/agents/${agent}" ]]; then
                 rm -f ".claude/agents/${agent}"
                 echo -e "  ${YELLOW}-agent:${NC} $agent" >&2
             fi

@@ -106,7 +106,7 @@ sync_source_dir() {
         mcp_rename=$(echo "$filter_json" | jq -c '.mcp.rename // {}')
 
         if [[ ! -f ".mcp.json" ]]; then
-            echo '{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}' > ".mcp.json"
+            atomic_write ".mcp.json" "$_MCP_EMPTY"
         fi
 
         local mcp_batch='{}'
@@ -173,17 +173,18 @@ write_source_manifest() {
     for entry in "${CURRENT_SOURCE_PROJECT_DIRS[@]+"${CURRENT_SOURCE_PROJECT_DIRS[@]}"}"; do
         [[ -z "$entry" ]] && continue
         local p="${entry%|*}"
-        local cmd="${entry#*|}"
+        local cmd="${entry##*|}"
         proj_dirs_json=$(echo "$proj_dirs_json" | jq --arg p "$p" --arg c "$cmd" '. + [{path: $p, claude_md: ($c == "true")}]')
     done
 
     MANIFEST_JSON=$(echo "$MANIFEST_JSON" | jq \
         --arg section "$section" \
         --arg name "$entry_name" \
+        --arg sname "$CURRENT_SOURCE_NAME" \
         --argjson agents "$agents_json" \
         --argjson skills "$skills_json" \
         --argjson mcp "$mcp_json" \
         --argjson dirs "$dirs_json" \
         --argjson pdirs "$proj_dirs_json" \
-        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs}')
+        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs, source_name: $sname}')
 }

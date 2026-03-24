@@ -38,6 +38,9 @@ CURRENT_SOURCE_ADD_DIRS=()
 CURRENT_SOURCE_PROJECT_DIRS=()
 CURRENT_PRESET_PREFIX=""
 CURRENT_PRESET_RENAME='{}'
+CURRENT_SOURCE_NAME=""
+_BUILD_LOCK_HELD=false
+_MCP_EMPTY='{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}'
 
 # ── Colors ───────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
