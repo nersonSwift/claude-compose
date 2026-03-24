@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/nersonSwift/claude-compose/main/ins
 ### Manual
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nersonSwift/claude-compose/main/claude-compose -o ~/.local/bin/claude-compose
+curl -fsSL https://github.com/nersonSwift/claude-compose/releases/latest/download/claude-compose -o ~/.local/bin/claude-compose
 chmod +x ~/.local/bin/claude-compose
 ```
 

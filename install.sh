@@ -33,23 +33,28 @@ fi
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
+# Detect downloader
+if command -v curl &>/dev/null; then
+    _download() { curl -fsSL "$1"; }
+    _download_to() { curl -fsSL "$1" -o "$2"; }
+elif command -v wget &>/dev/null; then
+    _download() { wget -qO- "$1"; }
+    _download_to() { wget -qO "$2" "$1"; }
+else
+    echo -e "${RED}Error: curl or wget required.${NC}"
+    exit 1
+fi
+
 # Resolve latest release tag
-LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | jq -r '.tag_name // empty')
+LATEST_TAG=$(_download "https://api.github.com/repos/${REPO}/releases/latest" | jq -r '.tag_name // empty')
 if [[ -z "$LATEST_TAG" ]]; then
     echo -e "${RED}Error: Could not determine latest release. Check https://github.com/${REPO}/releases${NC}"
     exit 1
 fi
 
 # Download
-DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/${LATEST_TAG}/claude-compose"
-if command -v curl &>/dev/null; then
-    curl -fsSL "$DOWNLOAD_URL" -o "${INSTALL_DIR}/${BINARY_NAME}"
-elif command -v wget &>/dev/null; then
-    wget -qO "${INSTALL_DIR}/${BINARY_NAME}" "$DOWNLOAD_URL"
-else
-    echo -e "${RED}Error: curl or wget required.${NC}"
-    exit 1
-fi
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/claude-compose"
+_download_to "$DOWNLOAD_URL" "${INSTALL_DIR}/${BINARY_NAME}"
 
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
