@@ -65,10 +65,13 @@ collect_all_presets() {
                     fi
                     queue+=("local:$nested_name")
                 elif [[ "$entry_type" == "object" ]]; then
-                    local nested_source
+                    local nested_source nested_name_h
                     nested_source=$(jq -r ".presets[$j].source // empty" "$preset_dir/claude-compose.json")
+                    nested_name_h=$(jq -r ".presets[$j].name // empty" "$preset_dir/claude-compose.json")
                     if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
                         queue+=("github:${nested_source#github:}")
+                    elif [[ -n "$nested_name_h" ]]; then
+                        queue+=("local:$nested_name_h")
                     fi
                 fi
             done
@@ -81,16 +84,17 @@ collect_all_presets() {
 hash_workspace_config_files() {
     local ws_dir="$1"
     for f in "$ws_dir/.mcp.json" "$ws_dir/.claude/settings.local.json" "$ws_dir/claude-compose.json"; do
-        [[ -f "$f" ]] && "$_SHASUM_CMD" "$f" 2>/dev/null || true
+        if [[ -f "$f" ]]; then "$_SHASUM_CMD" "$f" 2>/dev/null || true; fi
     done
-    [[ -d "$ws_dir/.claude/agents" ]] && find "$ws_dir/.claude/agents" -name '*.md' -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true
-    [[ -d "$ws_dir/.claude/skills" ]] && find "$ws_dir/.claude/skills" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true
+    if [[ -d "$ws_dir/.claude/agents" ]]; then find "$ws_dir/.claude/agents" -name '*.md' -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true; fi
+    if [[ -d "$ws_dir/.claude/skills" ]]; then find "$ws_dir/.claude/skills" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null || true; fi
 }
 
 # Compute content-based hash of config + all preset/workspace source files
 compute_build_hash() {
     local hash_tmp
     hash_tmp=$(mktemp)
+    trap 'rm -f "$hash_tmp"' RETURN
 
     cat "$CONFIG_FILE" >> "$hash_tmp"
 
@@ -123,11 +127,15 @@ compute_build_hash() {
                 gname=$(jq -r ".presets[$gi]" "$GLOBAL_CONFIG")
                 global_preset_list+=("local:$gname")
             elif [[ "$gentry_type" == "object" ]]; then
-                local gsource
+                # Always hash full object (captures filters, prefix, rename)
+                jq -c ".presets[$gi]" "$GLOBAL_CONFIG" >> "$hash_tmp"
+                local gsource gname_h
                 gsource=$(jq -r ".presets[$gi].source // empty" "$GLOBAL_CONFIG")
+                gname_h=$(jq -r ".presets[$gi].name // empty" "$GLOBAL_CONFIG")
                 if [[ -n "$gsource" && "$gsource" == github:* ]]; then
                     global_preset_list+=("github:${gsource#github:}")
-                    jq -c ".presets[$gi]" "$GLOBAL_CONFIG" >> "$hash_tmp"
+                elif [[ -n "$gname_h" ]]; then
+                    global_preset_list+=("local:$gname_h")
                 fi
             fi
         done
@@ -161,11 +169,15 @@ compute_build_hash() {
             lname=$(jq -r ".presets[$li]" "$CONFIG_FILE")
             preset_list+=("local:$lname")
         elif [[ "$lentry_type" == "object" ]]; then
-            local lsource
+            # Always hash full object (captures filters, prefix, rename)
+            jq -c ".presets[$li]" "$CONFIG_FILE" >> "$hash_tmp"
+            local lsource lname_h
             lsource=$(jq -r ".presets[$li].source // empty" "$CONFIG_FILE")
+            lname_h=$(jq -r ".presets[$li].name // empty" "$CONFIG_FILE")
             if [[ -n "$lsource" && "$lsource" == github:* ]]; then
                 preset_list+=("github:${lsource#github:}")
-                jq -c ".presets[$li]" "$CONFIG_FILE" >> "$hash_tmp"
+            elif [[ -n "$lname_h" ]]; then
+                preset_list+=("local:$lname_h")
             fi
         fi
     done
@@ -222,7 +234,7 @@ compute_build_hash() {
     while IFS= read -r agent_path; do
         [[ -z "$agent_path" ]] && continue
         local abs_agent="$ORIGINAL_CWD/$agent_path"
-        [[ -f "$abs_agent" ]] && "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true
+        if [[ -f "$abs_agent" ]]; then "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true; fi
     done <<< "$res_agents"
 
     local res_skills
@@ -230,7 +242,7 @@ compute_build_hash() {
     while IFS= read -r skill_path; do
         [[ -z "$skill_path" ]] && continue
         local abs_skill="$ORIGINAL_CWD/$skill_path"
-        [[ -d "$abs_skill" ]] && find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
+        if [[ -d "$abs_skill" ]]; then find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true; fi
     done <<< "$res_skills"
 
     # Hash env files
@@ -239,7 +251,7 @@ compute_build_hash() {
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
         local abs_env="$ORIGINAL_CWD/$env_file"
-        [[ -f "$abs_env" ]] && "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true
+        if [[ -f "$abs_env" ]]; then "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true; fi
     done <<< "$res_env_files"
 
     # Hash global resources
@@ -253,7 +265,7 @@ compute_build_hash() {
         while IFS= read -r agent_path; do
             [[ -z "$agent_path" ]] && continue
             local abs_agent="$GLOBAL_CONFIG_DIR/$agent_path"
-            [[ -f "$abs_agent" ]] && "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true
+            if [[ -f "$abs_agent" ]]; then "$_SHASUM_CMD" "$abs_agent" 2>/dev/null >> "$hash_tmp" || true; fi
         done <<< "$global_agents"
 
         local global_skills
@@ -261,7 +273,7 @@ compute_build_hash() {
         while IFS= read -r skill_path; do
             [[ -z "$skill_path" ]] && continue
             local abs_skill="$GLOBAL_CONFIG_DIR/$skill_path"
-            [[ -d "$abs_skill" ]] && find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
+            if [[ -d "$abs_skill" ]]; then find "$abs_skill" \( -type f -o -type l \) -print0 2>/dev/null | sort -z | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true; fi
         done <<< "$global_skills"
 
         local global_env_files
@@ -269,13 +281,12 @@ compute_build_hash() {
         while IFS= read -r env_file; do
             [[ -z "$env_file" ]] && continue
             local abs_env="$GLOBAL_CONFIG_DIR/$env_file"
-            [[ -f "$abs_env" ]] && "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true
+            if [[ -f "$abs_env" ]]; then "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true; fi
         done <<< "$global_env_files"
     fi
 
     local result
     result=$(_shasum256 < "$hash_tmp" | cut -c1-32)
-    rm -f "$hash_tmp"
     echo "$result"
 }
 

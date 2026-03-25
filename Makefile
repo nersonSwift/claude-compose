@@ -24,7 +24,7 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 					skill_name=$$(basename $$(dirname "$$skill_md")); \
 					skill_b64=$$(base64 < "$$skill_md" | tr -d '\n'); \
 					echo "    mkdir -p \"\$$dest/$$skill_name\""; \
-					echo "    printf '%s' \"$$skill_b64\" | base64 --decode > \"\$$dest/$$skill_name/SKILL.md\""; \
+					echo "    printf '%s' \"$$skill_b64\" | base64 -d > \"\$$dest/$$skill_name/SKILL.md\""; \
 				done; \
 				echo '}' ;; \
 			*) printf '%s\n' "$$line" ;; \

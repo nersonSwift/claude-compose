@@ -90,6 +90,28 @@ matches_filter() {
     return 0
 }
 
+# Merge parent and child preset filter JSON for recursive inheritance.
+# exclude: union (accumulates down the tree)
+# include: child overrides parent if child specifies; otherwise inherits parent's
+# $1 = parent filter JSON, $2 = child filter JSON
+# Prints: merged filter JSON
+merge_preset_filters() {
+    local parent="$1" child="$2"
+    jq -n --argjson p "$parent" --argjson c "$child" '
+        def merge_section($p; $c):
+            {
+                include: (if ($c | has("include")) then $c.include
+                         elif ($p | has("include")) then $p.include
+                         else null end),
+                exclude: ([$p.exclude // [] | .[], $c.exclude // [] | .[]] | unique)
+            } | with_entries(select(.value != null));
+        {
+            agents: merge_section($p.agents // {}; $c.agents // {}),
+            skills: merge_section($p.skills // {}; $c.skills // {}),
+            mcp: merge_section($p.mcp // {}; $c.mcp // {})
+        } | with_entries(select(.value != {}))'
+}
+
 # ── Expand ~ safely ─────────────────────────────────────────────────
 expand_path() {
     local path="$1"
@@ -287,6 +309,7 @@ require_claude() {
 # ── Builtin skills check ───────────────────────────────────────────
 has_builtin_skills() {
     [[ ! -d "$BUILTIN_SKILLS_DIR" ]] && return 1
+    local _d
     for _d in "$BUILTIN_SKILLS_DIR"/*/; do
         [[ -d "$_d" ]] && return 0
     done
