@@ -8,7 +8,7 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
 
 **Projects** — external codebases added via `--add-dir`. They provide file access (read/write) and optionally their CLAUDE.md instructions. Projects are listed in `claude-compose.json` and referenced by aliases (e.g., `myapp://src/main.ts`).
 
-**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose.json` with explicit `resources` declarations (same format as workspace). Activated by name in config.
+**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/` or referenced by filesystem path. Each preset has a `claude-compose-preset.json` with explicit `resources` declarations (same format as workspace). Activated by name or path in config.
 
 **Workspaces** — other claude-compose workspaces that can share their configuration (MCP servers, agents, skills) into this one at build time.
 

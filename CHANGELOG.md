@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.2.0] - 2026-03-25
+
+### Breaking Changes
+
+- **Preset config renamed**: Preset config file renamed from `claude-compose.json` to `claude-compose-preset.json`. Existing presets using the old name will show a migration error. Workspace config remains `claude-compose.json`.
+
+### Added
+
+- **Preset path support**: Presets can now be referenced by filesystem path (relative or absolute) in addition to name. Use a string containing `/` or `~` (e.g., `"./my-preset"`, `"~/presets/custom"`) or an object with a `"path"` field. Path presets resolve relative to the config file that references them.
+
+## [2.1.0] - 2026-03-25
+
+### Security
+
+- **Env blocklist hardened**: `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, and `_JAVA_OPTIONS` added to the dangerous env key blocklist — these allow arbitrary code execution in Node.js/JVM processes (MCP servers are often Node.js).
+- **Path traversal protection for agent/skill paths**: `process_resources()` now validates agent and skill paths from config against directory traversal (`../`) before creating symlinks. Prevents malicious presets from targeting files outside their directory.
+
+### Fixed
+
+- **Hash operator precedence**: 9 instances of `[[ cond ]] && cmd || true` replaced with proper `if/then` blocks in hash functions. The old pattern silently swallowed command failures when the condition was true, potentially causing missed hash entries and false cache-hits.
+- **Temp file cleanup**: `compute_build_hash()` now uses a `RETURN` trap for temp file removal instead of an explicit `rm` that could be skipped on early exit.
+- **base64 portability**: Changed `base64 --decode` to `base64 -d` in the Makefile build output — `--decode` is a GNU long option not supported on all platforms.
+- **Batch MCP cleanup**: `clean_manifest_section()` now removes MCP servers in a single `jq reduce` + `atomic_write` instead of one file write per server.
+- **Variable scope leak**: `_d` loop variable in `has_builtin_skills()` and `cmd_build()` dry-run now declared `local`.
+
+### Improved
+
+- **`iterate_presets()` helper**: Common preset iteration logic (mixed string/object array normalization) extracted into a shared function with callback pattern, eliminating 4 duplicated for-loops across `build()`, `process_global()`, `cmd_update()`, and `cmd_registries()`.
+- **Validation decomposed**: `validate_config_semantics()` (320 lines) split into 5 focused sub-functions: `_validate_projects()`, `_validate_resources()`, `_validate_update_interval()`, `_validate_workspaces()`, `_validate_presets()`.
+- **`process_resources()` documented**: All 4 call sites now have inline comments listing the 8 positional parameters.
+
 ## [2.0.0] - 2026-03-24
 
 ### Breaking Changes

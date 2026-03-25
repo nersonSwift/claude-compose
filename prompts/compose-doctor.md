@@ -28,7 +28,7 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
 
 **Projects** — external codebases added via `--add-dir`. They provide file access (read/write) and optionally their CLAUDE.md instructions. Projects are listed in `claude-compose.json` and referenced by aliases (e.g., `myapp://src/main.ts`).
 
-**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose.json` with explicit `resources` declarations (same format as workspace). Activated by name in config. Can also come from GitHub registries via `{"source": "github:owner/repo@spec"}`.
+**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose-preset.json` with explicit `resources` declarations (same format as workspace). Activated by name in config. Can also come from GitHub registries via `{"source": "github:owner/repo@spec"}`.
 
 **Workspaces** — other claude-compose workspaces that can share their configuration (MCP servers, agents, skills) into this one at build time.
 
@@ -62,7 +62,7 @@ Field rules:
 - `projects[].path` — path to external project (required)
 - `projects[].name` — alias for file references (required)
 - `projects[].claude_md` — load CLAUDE.md from project (default: `true`, omit if true)
-- `presets[]` — string (local preset name) or object `{"source": "github:owner/repo@spec", "prefix": "...", "rename": {...}, "env_files": [...]}`
+- `presets[]` — string (local preset name or path) or object `{"source": "github:owner/repo@spec", ...}`, `{"name": "preset-name", ...}`, or `{"path": "./local-preset", ...}`
 - `resources.agents` — array of string paths to agent .md files
 - `resources.skills` — array of string paths to skill directories
 - `resources.mcp` — object of MCP server configs

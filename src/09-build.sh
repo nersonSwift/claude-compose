@@ -20,34 +20,45 @@ extract_preset_filters() {
 process_preset() {
     local preset_name="$1"
     local filter_json="${2:-{}}"
+    local preset_dir="${3:-}"  # optional resolved absolute path
 
-    # Cycle detection
+    # Resolve directory
+    if [[ -z "$preset_dir" ]]; then
+        preset_dir="$PRESETS_DIR/$preset_name"
+    fi
+
+    # Cycle detection — use preset_dir for path presets, preset_name for name presets
+    local cycle_key="${3:+$preset_dir}"
+    cycle_key="${cycle_key:-$preset_name}"
     for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
-        if [[ "$processed" == "$preset_name" ]]; then
-            echo -e "${YELLOW}Warning: Preset already processed, skipping: ${preset_name}${NC}" >&2
+        if [[ "$processed" == "$cycle_key" ]]; then
+            echo -e "${YELLOW}Warning: Preset already processed, skipping: ${cycle_key}${NC}" >&2
             return
         fi
     done
-    PROCESSED_PRESETS+=("$preset_name")
+    PROCESSED_PRESETS+=("$cycle_key")
 
-    local preset_dir="$PRESETS_DIR/$preset_name"
     if [[ ! -d "$preset_dir" ]]; then
-        echo -e "${RED}Error: Preset not found: ${preset_name} (~/.claude-compose/presets/${preset_name}/)${NC}" >&2
-        die_doctor "Preset not found: ${preset_name} (expected at ~/.claude-compose/presets/${preset_name}/)"
+        echo -e "${RED}Error: Preset not found: ${preset_dir}${NC}" >&2
+        die_doctor "Preset not found: ${preset_dir}"
     fi
 
-    local preset_config="$preset_dir/claude-compose.json"
+    local preset_config="$preset_dir/$PRESET_CONFIG_FILE"
     if [[ ! -f "$preset_config" ]]; then
-        if [[ -f "$preset_dir/preset.json" || -d "$preset_dir/.claude" ]]; then
-            echo -e "${RED}Error: Preset '${preset_name}' uses old format (preset.json / .claude/ structure).${NC}" >&2
-            echo -e "${RED}Migrate to claude-compose.json with explicit resources. See: claude-compose instructions${NC}" >&2
+        if [[ -f "$preset_dir/preset.json" || -f "$preset_dir/claude-compose.json" || -d "$preset_dir/.claude" ]]; then
+            echo -e "${RED}Error: Preset '${preset_dir}' uses old format. Rename to $PRESET_CONFIG_FILE${NC}" >&2
         else
-            echo -e "${YELLOW}Warning: No claude-compose.json in preset: ${preset_name}${NC}" >&2
+            echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in preset: ${preset_dir}${NC}" >&2
         fi
         return
     fi
 
-    echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
+    # Display label
+    if [[ -n "${3:-}" ]]; then
+        echo -e "${CYAN}Processing path preset:${NC} ${preset_dir}" >&2
+    else
+        echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
+    fi
 
     # Local presets don't use prefix/rename
     CURRENT_PRESET_PREFIX=""
@@ -64,26 +75,36 @@ process_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
-            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
-                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                continue
+            if _is_preset_path "$nested_name"; then
+                local nested_resolved
+                nested_resolved=$(resolve_preset_path "$nested_name" "$preset_dir")
+                process_preset "$(basename "$nested_resolved")" "$filter_json" "$nested_resolved"
+            else
+                if [[ "$nested_name" == *..* ]]; then
+                    echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                    continue
+                fi
+                # String entry inherits parent's filter unchanged
+                process_preset "$nested_name" "$filter_json"
             fi
-            # String entry inherits parent's filter unchanged
-            process_preset "$nested_name" "$filter_json"
         elif [[ "$nested_type" == "object" ]]; then
             local nested_json
             nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source
+            local nested_source nested_name_field nested_path_val
             nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            local nested_name_field
             nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
+            nested_path_val=$(echo "$nested_json" | jq -r '.path // empty')
 
             # Extract child filters and merge with inherited
             local child_filter merged_filter
             child_filter=$(extract_preset_filters "$nested_json")
             merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
 
-            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+            if [[ -n "$nested_path_val" ]]; then
+                local nested_resolved
+                nested_resolved=$(resolve_preset_path "$nested_path_val" "$preset_dir")
+                process_preset "$(basename "$nested_resolved")" "$merged_filter" "$nested_resolved"
+            elif [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
                 # Rebuild entry_json with merged filters for process_github_preset
                 local patched_entry
                 patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
@@ -103,9 +124,21 @@ process_preset() {
     CURRENT_PRESET_PREFIX=""
     CURRENT_PRESET_RENAME='{}'
 
+    # Manifest key: path presets use "path:<dir>", name presets use name
+    local manifest_key
+    if [[ -n "${3:-}" ]]; then
+        manifest_key="path:$preset_dir"
+    else
+        manifest_key="$preset_name"
+    fi
+
+    # Display label
+    local label="${3:+$preset_dir}"
+    label="${label:-$preset_name}"
+
     # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
-    process_resources "$preset_config" "$preset_dir" "$preset_name" \
-        "presets" "$preset_name" "$preset_name" "true" "$filter_json"
+    process_resources "$preset_config" "$preset_dir" "$label" \
+        "presets" "$manifest_key" "$preset_name" "true" "$filter_json"
 
     # CLAUDE.md via --add-dir (process_resources always resets arrays, even on early return)
     local claude_md
@@ -137,7 +170,7 @@ process_preset() {
 
     # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
     CURRENT_SOURCE_NAME="$preset_name"
-    write_source_manifest "presets" "$preset_name"
+    write_source_manifest "presets" "$manifest_key"
 }
 
 # ── Process a single workspace source ───────────────────────────────
@@ -473,8 +506,14 @@ process_global() {
     # ── Global presets (handles mixed arrays) ──
     # shellcheck disable=SC2329
     _global_preset_cb() {
-        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6"
-        if [[ "$etype" == "string" ]]; then
+        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="$7" path_val="${8:-}"
+        if [[ -n "$path_val" ]]; then
+            local resolved
+            resolved=$(resolve_preset_path "$path_val" "$GLOBAL_CONFIG_DIR")
+            local filter='{}'
+            [[ "$etype" == "object" ]] && filter=$(extract_preset_filters "$ejson")
+            process_preset "$(basename "$resolved")" "$filter" "$resolved"
+        elif [[ "$etype" == "string" ]]; then
             process_preset "$name"
         elif [[ "$is_gh" == "true" ]]; then
             process_github_preset "$ejson"
@@ -576,9 +615,9 @@ process_github_preset() {
         die_doctor "Preset directory not found in registry: ${preset_dir}. Try running: claude-compose update"
     fi
 
-    local preset_config="$preset_dir/claude-compose.json"
+    local preset_config="$preset_dir/$PRESET_CONFIG_FILE"
     if [[ ! -f "$preset_config" ]]; then
-        echo -e "${YELLOW}Warning: No claude-compose.json in GitHub preset: ${source_key}${NC}" >&2
+        echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in GitHub preset: ${source_key}${NC}" >&2
         return
     fi
 
@@ -614,40 +653,50 @@ process_github_preset() {
             local nested_name
             nested_name=$(jq -r ".presets[$ni]" "$preset_config")
             [[ -z "$nested_name" ]] && continue
-            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
-                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                continue
-            fi
-            # Local presets within a github registry resolve relative to registry root
-            local reg_root
-            reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
-            if [[ -d "$reg_root/$nested_name" ]]; then
-                # Treat as another github preset from same repo — inherit filter
-                local nested_entry
-                nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" \
-                    --argjson f "$filter_json" \
-                    '{source: $s} +
-                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
-                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
-                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
-                process_github_preset "$nested_entry"
+            if _is_preset_path "$nested_name"; then
+                local nested_resolved
+                nested_resolved=$(resolve_preset_path "$nested_name" "$preset_dir")
+                process_preset "$(basename "$nested_resolved")" "$filter_json" "$nested_resolved"
             else
-                process_preset "$nested_name" "$filter_json"
+                if [[ "$nested_name" == *..* ]]; then
+                    echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                    continue
+                fi
+                # Local presets within a github registry resolve relative to registry root
+                local reg_root
+                reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
+                if [[ -d "$reg_root/$nested_name" ]]; then
+                    # Treat as another github preset from same repo — inherit filter
+                    local nested_entry
+                    nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" \
+                        --argjson f "$filter_json" \
+                        '{source: $s} +
+                        (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
+                        (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
+                        (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
+                    process_github_preset "$nested_entry"
+                else
+                    process_preset "$nested_name" "$filter_json"
+                fi
             fi
         elif [[ "$nested_type" == "object" ]]; then
             local nested_json
             nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source
+            local nested_source nested_name_field nested_path_val
             nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            local nested_name_field
             nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
+            nested_path_val=$(echo "$nested_json" | jq -r '.path // empty')
 
             # Extract child filters and merge with inherited
             local child_filter merged_filter
             child_filter=$(extract_preset_filters "$nested_json")
             merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
 
-            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+            if [[ -n "$nested_path_val" ]]; then
+                local nested_resolved
+                nested_resolved=$(resolve_preset_path "$nested_path_val" "$preset_dir")
+                process_preset "$(basename "$nested_resolved")" "$merged_filter" "$nested_resolved"
+            elif [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
                 # Rebuild entry_json with merged filters for process_github_preset
                 local patched_entry
                 patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
@@ -733,7 +782,7 @@ apply_resource_prefix() {
 # Iterate over a presets array in a config file, calling a callback for each entry.
 # $1 = config file path
 # $2 = callback function name
-# Callback receives: entry_type index name source is_github entry_json config_file
+# Callback receives: entry_type index name source is_github entry_json config_file path_val
 # shellcheck disable=SC2329
 iterate_presets() {
     local config_file="$1" callback="$2"
@@ -748,14 +797,19 @@ iterate_presets() {
             local name
             name=$(jq -r ".presets[$i]" "$config_file")
             [[ -z "$name" ]] && continue
-            "$callback" "string" "$i" "$name" "" "false" '{}' "$config_file"
+            if _is_preset_path "$name"; then
+                "$callback" "string" "$i" "" "" "false" '{}' "$config_file" "$name"
+            else
+                "$callback" "string" "$i" "$name" "" "false" '{}' "$config_file" ""
+            fi
         elif [[ "$entry_type" == "object" ]]; then
-            local entry_json source_val name_val is_github="false"
+            local entry_json source_val name_val path_val is_github="false"
             entry_json=$(jq -c ".presets[$i]" "$config_file")
             source_val=$(echo "$entry_json" | jq -r '.source // empty')
             name_val=$(echo "$entry_json" | jq -r '.name // empty')
+            path_val=$(echo "$entry_json" | jq -r '.path // empty')
             [[ -n "$source_val" && "$source_val" == github:* ]] && is_github="true"
-            "$callback" "object" "$i" "$name_val" "$source_val" "$is_github" "$entry_json" "$config_file"
+            "$callback" "object" "$i" "$name_val" "$source_val" "$is_github" "$entry_json" "$config_file" "$path_val"
         fi
     done
 }
@@ -817,8 +871,14 @@ build() {
     # Process presets (handles mixed arrays)
     # shellcheck disable=SC2329
     _build_preset_cb() {
-        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6"
-        if [[ "$etype" == "string" ]]; then
+        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="$7" path_val="${8:-}"
+        if [[ -n "$path_val" ]]; then
+            local resolved
+            resolved=$(resolve_preset_path "$path_val" "$ORIGINAL_CWD")
+            local filter='{}'
+            [[ "$etype" == "object" ]] && filter=$(extract_preset_filters "$ejson")
+            process_preset "$(basename "$resolved")" "$filter" "$resolved"
+        elif [[ "$etype" == "string" ]]; then
             process_preset "$name"
         elif [[ "$is_gh" == "true" ]]; then
             process_github_preset "$ejson"
@@ -922,39 +982,85 @@ cmd_build() {
                 if [[ "$dr_type" == "string" ]]; then
                     local name
                     name=$(jq -r ".presets[$dri]" "$CONFIG_FILE")
-                    local preset_dir="$PRESETS_DIR/$name"
-                    if [[ -d "$preset_dir" ]]; then
-                        echo -e "  - $name (${preset_dir})" >&2
-                        if [[ -f "$preset_dir/claude-compose.json" ]]; then
-                            local pa ps pm
-                            pa=$(jq '.resources.agents // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                            ps=$(jq '.resources.skills // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                            pm=$(jq '.resources.mcp // {} | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
-                            [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
-                            [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
-                            [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                    if _is_preset_path "$name"; then
+                        local resolved
+                        resolved=$(resolve_preset_path "$name" "$ORIGINAL_CWD")
+                        if [[ -d "$resolved" ]]; then
+                            echo -e "  - path: $resolved" >&2
+                            if [[ -f "$resolved/$PRESET_CONFIG_FILE" ]]; then
+                                local pa ps pm
+                                pa=$(jq '.resources.agents // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                ps=$(jq '.resources.skills // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                pm=$(jq '.resources.mcp // {} | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
+                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
+                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                            else
+                                echo "    (no $PRESET_CONFIG_FILE)" >&2
+                            fi
+                            [[ -f "$resolved/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
                         else
-                            echo "    (no claude-compose.json)" >&2
+                            echo -e "  - $name ${RED}(not found)${NC}" >&2
                         fi
-                        [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
                     else
-                        echo -e "  - $name ${RED}(not found)${NC}" >&2
+                        local preset_dir="$PRESETS_DIR/$name"
+                        if [[ -d "$preset_dir" ]]; then
+                            echo -e "  - $name (${preset_dir})" >&2
+                            if [[ -f "$preset_dir/$PRESET_CONFIG_FILE" ]]; then
+                                local pa ps pm
+                                pa=$(jq '.resources.agents // [] | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                ps=$(jq '.resources.skills // [] | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                pm=$(jq '.resources.mcp // {} | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
+                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
+                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                            else
+                                echo "    (no $PRESET_CONFIG_FILE)" >&2
+                            fi
+                            [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
+                        else
+                            echo -e "  - $name ${RED}(not found)${NC}" >&2
+                        fi
                     fi
                 elif [[ "$dr_type" == "object" ]]; then
-                    local dr_source dr_prefix dr_locked_ver
-                    dr_source=$(jq -r ".presets[$dri].source // empty" "$CONFIG_FILE")
-                    dr_prefix=$(jq -r ".presets[$dri].prefix // empty" "$CONFIG_FILE")
-                    echo -e "  - ${dr_source}" >&2
-                    [[ -n "$dr_prefix" ]] && echo "    prefix: ${dr_prefix}" >&2
-                    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-                        parse_github_source "$dr_source"
-                        local dr_sk="github:${_GH_OWNER}/${_GH_REPO}"
-                        [[ -n "$_GH_PATH" ]] && dr_sk+="/${_GH_PATH}"
-                        dr_locked_ver=$(jq -r --arg k "$dr_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
-                        [[ -n "$dr_locked_ver" ]] && echo "    locked: v${dr_locked_ver}" >&2
-                        local dr_dir
-                        dr_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$dr_locked_ver" "$_GH_PATH")
-                        [[ -d "$dr_dir" ]] && echo "    path: ${dr_dir}" >&2
+                    local dr_path
+                    dr_path=$(jq -r ".presets[$dri].path // empty" "$CONFIG_FILE")
+                    if [[ -n "$dr_path" ]]; then
+                        local resolved
+                        resolved=$(resolve_preset_path "$dr_path" "$ORIGINAL_CWD")
+                        if [[ -d "$resolved" ]]; then
+                            echo -e "  - path: ${resolved}" >&2
+                            if [[ -f "$resolved/$PRESET_CONFIG_FILE" ]]; then
+                                local pa ps pm
+                                pa=$(jq '.resources.agents // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                ps=$(jq '.resources.skills // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                pm=$(jq '.resources.mcp // {} | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
+                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
+                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
+                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
+                            else
+                                echo "    (no $PRESET_CONFIG_FILE)" >&2
+                            fi
+                            [[ -f "$resolved/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
+                        else
+                            echo -e "  - $dr_path ${RED}(not found)${NC}" >&2
+                        fi
+                    else
+                        local dr_source dr_prefix dr_locked_ver
+                        dr_source=$(jq -r ".presets[$dri].source // empty" "$CONFIG_FILE")
+                        dr_prefix=$(jq -r ".presets[$dri].prefix // empty" "$CONFIG_FILE")
+                        echo -e "  - ${dr_source}" >&2
+                        [[ -n "$dr_prefix" ]] && echo "    prefix: ${dr_prefix}" >&2
+                        if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                            parse_github_source "$dr_source"
+                            local dr_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                            [[ -n "$_GH_PATH" ]] && dr_sk+="/${_GH_PATH}"
+                            dr_locked_ver=$(jq -r --arg k "$dr_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                            [[ -n "$dr_locked_ver" ]] && echo "    locked: v${dr_locked_ver}" >&2
+                            local dr_dir
+                            dr_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$dr_locked_ver" "$_GH_PATH")
+                            [[ -d "$dr_dir" ]] && echo "    path: ${dr_dir}" >&2
+                        fi
                     fi
                 fi
             done

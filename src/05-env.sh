@@ -94,8 +94,8 @@ load_global_env_files() {
 
 # Load env files from a source directory with prefixed keys (launch-time)
 load_source_env_files() {
-    local source_dir="$1" source_name="$2"
-    local source_config="$source_dir/claude-compose.json"
+    local source_dir="$1" source_name="$2" config_filename="${3:-claude-compose.json}"
+    local source_config="$source_dir/$config_filename"
     [[ ! -f "$source_config" ]] && return
 
     local prefix
@@ -144,6 +144,8 @@ load_all_source_env_files() {
                     # GitHub preset: resolve dir from lock file
                     source_dir=$(resolve_locked_preset_dir "$sname" 2>/dev/null || true)
                     [[ -z "$source_dir" ]] && continue
+                elif [[ "$sname" == path:* ]]; then
+                    source_dir="${sname#path:}"
                 else
                     source_dir="$PRESETS_DIR/$sname"
                 fi
@@ -154,7 +156,11 @@ load_all_source_env_files() {
             local source_name
             source_name=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].source_name // empty' ".compose-manifest.json" 2>/dev/null || true)
             [[ -z "$source_name" ]] && source_name="$(basename "$source_dir")"
-            load_source_env_files "$source_dir" "$source_name"
+            if [[ "$section" == "presets" ]]; then
+                load_source_env_files "$source_dir" "$source_name" "$PRESET_CONFIG_FILE"
+            else
+                load_source_env_files "$source_dir" "$source_name"
+            fi
         done <<< "$source_names"
     done
 }

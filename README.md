@@ -193,18 +193,18 @@ Source workspace's own projects (from its `claude-compose.json`) are transitivel
 
 ## Presets
 
-Presets are reusable sets of Claude resources stored at `~/.claude-compose/presets/<name>/`. Each preset uses a `claude-compose.json` file with explicit resource declarations (same format as workspace config).
+Presets are reusable sets of Claude resources stored at `~/.claude-compose/presets/<name>/`. Each preset uses a `claude-compose-preset.json` file with explicit resource declarations (same format as workspace config).
 
 ```
 ~/.claude-compose/presets/my-tools/
-├── claude-compose.json          # Resource declarations (required)
+├── claude-compose-preset.json   # Resource declarations (required)
 ├── agents/*.md                  # Agent files
 ├── skills/*/                    # Skill directories
 ├── CLAUDE.md                    # Instructions (loaded via --add-dir)
 └── .env.json                    # Optional: env vars for MCP prefixing
 ```
 
-Example `claude-compose.json` for a preset:
+Example `claude-compose-preset.json` for a preset:
 
 ```json
 {
@@ -219,11 +219,16 @@ Example `claude-compose.json` for a preset:
 }
 ```
 
-Reference presets in config:
+Reference presets in config by name, path, or object:
 
 ```json
 {
-  "presets": ["my-tools", "common-agents"],
+  "presets": [
+    "my-tools",
+    "./local-preset",
+    "~/presets/shared",
+    {"path": "../other-preset", "agents": {"include": ["reviewer"]}}
+  ],
   "projects": [...]
 }
 ```
@@ -338,6 +343,9 @@ claude-compose instructions
 - `--dry-run` performs zero mutations
 - No `eval` — tilde expansion uses safe string substitution
 - Preset resources tracked via manifest — rebuilds are clean
+- Path traversal protection on agent, skill, and env file paths
+- Env variable blocklist prevents injection via `PATH`, `LD_PRELOAD`, `NODE_OPTIONS`, `ANTHROPIC_*`, and 40+ other dangerous keys
+- MCP env var prefixing isolates cross-source variables
 
 ## License
 

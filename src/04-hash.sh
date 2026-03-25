@@ -1,7 +1,7 @@
 # ── Build System ─────────────────────────────────────────────────────
 
 # Collect all preset identifiers recursively (for hashing)
-# Items are prefixed: "local:name" or "github:source"
+# Items are prefixed: "local:name", "github:source", or "path:dir"
 collect_all_presets() {
     local -a visited=()
     local -a queue=("$@")
@@ -23,6 +23,8 @@ collect_all_presets() {
         local preset_dir=""
         if [[ "$item" == local:* ]]; then
             preset_dir="$PRESETS_DIR/${item#local:}"
+        elif [[ "$item" == path:* ]]; then
+            preset_dir="${item#path:}"
         elif [[ "$item" == github:* ]]; then
             # For github presets, resolve from lock file if available
             parse_github_source "github:${item#github:}"
@@ -31,44 +33,54 @@ collect_all_presets() {
             preset_dir=$(resolve_locked_preset_dir "$source_key" 2>/dev/null || true)
         fi
 
-        if [[ -n "$preset_dir" && -f "$preset_dir/claude-compose.json" ]]; then
+        if [[ -n "$preset_dir" && -f "$preset_dir/$PRESET_CONFIG_FILE" ]]; then
             # Discover nested presets (mixed array)
             local nested_count
-            nested_count=$(jq '.presets // [] | length' "$preset_dir/claude-compose.json" 2>/dev/null || echo 0)
+            nested_count=$(jq '.presets // [] | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
             local j
             for ((j = 0; j < nested_count; j++)); do
                 local entry_type
-                entry_type=$(jq -r ".presets[$j] | type" "$preset_dir/claude-compose.json" 2>/dev/null || echo "null")
+                entry_type=$(jq -r ".presets[$j] | type" "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo "null")
                 if [[ "$entry_type" == "string" ]]; then
                     local nested_name
-                    nested_name=$(jq -r ".presets[$j]" "$preset_dir/claude-compose.json")
-                    if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                    nested_name=$(jq -r ".presets[$j]" "$preset_dir/$PRESET_CONFIG_FILE")
+                    if _is_preset_path "$nested_name"; then
+                        local nested_resolved
+                        nested_resolved=$(resolve_preset_path "$nested_name" "$preset_dir")
+                        queue+=("path:$nested_resolved")
+                    elif [[ "$nested_name" == *..* ]]; then
                         continue
-                    fi
-                    # For nested local presets within a github registry, resolve relative to registry root
-                    if [[ "$item" == github:* ]]; then
-                        parse_github_source "github:${item#github:}"
-                        if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-                            local reg_sk="github:${_GH_OWNER}/${_GH_REPO}"
-                            [[ -n "$_GH_PATH" ]] && reg_sk+="/${_GH_PATH}"
-                            local reg_ver
-                            reg_ver=$(jq -r --arg k "$reg_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
-                            if [[ -n "$reg_ver" ]]; then
-                                local reg_base
-                                reg_base=$(registry_version_dir "$_GH_OWNER" "$_GH_REPO" "$reg_ver")
-                                if [[ -d "$reg_base/$nested_name" ]]; then
-                                    queue+=("github:${_GH_OWNER}/${_GH_REPO}/${nested_name}")
-                                    continue
+                    else
+                        # For nested local presets within a github registry, resolve relative to registry root
+                        if [[ "$item" == github:* ]]; then
+                            parse_github_source "github:${item#github:}"
+                            if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+                                local reg_sk="github:${_GH_OWNER}/${_GH_REPO}"
+                                [[ -n "$_GH_PATH" ]] && reg_sk+="/${_GH_PATH}"
+                                local reg_ver
+                                reg_ver=$(jq -r --arg k "$reg_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
+                                if [[ -n "$reg_ver" ]]; then
+                                    local reg_base
+                                    reg_base=$(registry_version_dir "$_GH_OWNER" "$_GH_REPO" "$reg_ver")
+                                    if [[ -d "$reg_base/$nested_name" ]]; then
+                                        queue+=("github:${_GH_OWNER}/${_GH_REPO}/${nested_name}")
+                                        continue
+                                    fi
                                 fi
                             fi
                         fi
+                        queue+=("local:$nested_name")
                     fi
-                    queue+=("local:$nested_name")
                 elif [[ "$entry_type" == "object" ]]; then
-                    local nested_source nested_name_h
-                    nested_source=$(jq -r ".presets[$j].source // empty" "$preset_dir/claude-compose.json")
-                    nested_name_h=$(jq -r ".presets[$j].name // empty" "$preset_dir/claude-compose.json")
-                    if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                    local nested_source nested_name_h nested_path_h
+                    nested_source=$(jq -r ".presets[$j].source // empty" "$preset_dir/$PRESET_CONFIG_FILE")
+                    nested_name_h=$(jq -r ".presets[$j].name // empty" "$preset_dir/$PRESET_CONFIG_FILE")
+                    nested_path_h=$(jq -r ".presets[$j].path // empty" "$preset_dir/$PRESET_CONFIG_FILE")
+                    if [[ -n "$nested_path_h" ]]; then
+                        local nested_resolved
+                        nested_resolved=$(resolve_preset_path "$nested_path_h" "$preset_dir")
+                        queue+=("path:$nested_resolved")
+                    elif [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
                         queue+=("github:${nested_source#github:}")
                     elif [[ -n "$nested_name_h" ]]; then
                         queue+=("local:$nested_name_h")
@@ -125,14 +137,25 @@ compute_build_hash() {
             if [[ "$gentry_type" == "string" ]]; then
                 local gname
                 gname=$(jq -r ".presets[$gi]" "$GLOBAL_CONFIG")
-                global_preset_list+=("local:$gname")
+                if _is_preset_path "$gname"; then
+                    local gresolved
+                    gresolved=$(resolve_preset_path "$gname" "$GLOBAL_CONFIG_DIR")
+                    global_preset_list+=("path:$gresolved")
+                else
+                    global_preset_list+=("local:$gname")
+                fi
             elif [[ "$gentry_type" == "object" ]]; then
                 # Always hash full object (captures filters, prefix, rename)
                 jq -c ".presets[$gi]" "$GLOBAL_CONFIG" >> "$hash_tmp"
-                local gsource gname_h
+                local gsource gname_h gpath_h
                 gsource=$(jq -r ".presets[$gi].source // empty" "$GLOBAL_CONFIG")
                 gname_h=$(jq -r ".presets[$gi].name // empty" "$GLOBAL_CONFIG")
-                if [[ -n "$gsource" && "$gsource" == github:* ]]; then
+                gpath_h=$(jq -r ".presets[$gi].path // empty" "$GLOBAL_CONFIG")
+                if [[ -n "$gpath_h" ]]; then
+                    local gresolved
+                    gresolved=$(resolve_preset_path "$gpath_h" "$GLOBAL_CONFIG_DIR")
+                    global_preset_list+=("path:$gresolved")
+                elif [[ -n "$gsource" && "$gsource" == github:* ]]; then
                     global_preset_list+=("github:${gsource#github:}")
                 elif [[ -n "$gname_h" ]]; then
                     global_preset_list+=("local:$gname_h")
@@ -145,6 +168,8 @@ compute_build_hash() {
             local preset_dir=""
             if [[ "$item" == local:* ]]; then
                 preset_dir="$PRESETS_DIR/${item#local:}"
+            elif [[ "$item" == path:* ]]; then
+                preset_dir="${item#path:}"
             elif [[ "$item" == github:* ]]; then
                 parse_github_source "github:${item#github:}"
                 local hp_sk="github:${_GH_OWNER}/${_GH_REPO}"
@@ -167,14 +192,25 @@ compute_build_hash() {
         if [[ "$lentry_type" == "string" ]]; then
             local lname
             lname=$(jq -r ".presets[$li]" "$CONFIG_FILE")
-            preset_list+=("local:$lname")
+            if _is_preset_path "$lname"; then
+                local lresolved
+                lresolved=$(resolve_preset_path "$lname" "$ORIGINAL_CWD")
+                preset_list+=("path:$lresolved")
+            else
+                preset_list+=("local:$lname")
+            fi
         elif [[ "$lentry_type" == "object" ]]; then
             # Always hash full object (captures filters, prefix, rename)
             jq -c ".presets[$li]" "$CONFIG_FILE" >> "$hash_tmp"
-            local lsource lname_h
+            local lsource lname_h lpath_h
             lsource=$(jq -r ".presets[$li].source // empty" "$CONFIG_FILE")
             lname_h=$(jq -r ".presets[$li].name // empty" "$CONFIG_FILE")
-            if [[ -n "$lsource" && "$lsource" == github:* ]]; then
+            lpath_h=$(jq -r ".presets[$li].path // empty" "$CONFIG_FILE")
+            if [[ -n "$lpath_h" ]]; then
+                local lresolved
+                lresolved=$(resolve_preset_path "$lpath_h" "$ORIGINAL_CWD")
+                preset_list+=("path:$lresolved")
+            elif [[ -n "$lsource" && "$lsource" == github:* ]]; then
                 preset_list+=("github:${lsource#github:}")
             elif [[ -n "$lname_h" ]]; then
                 preset_list+=("local:$lname_h")
@@ -187,6 +223,8 @@ compute_build_hash() {
         local preset_dir=""
         if [[ "$item" == local:* ]]; then
             preset_dir="$PRESETS_DIR/${item#local:}"
+        elif [[ "$item" == path:* ]]; then
+            preset_dir="${item#path:}"
         elif [[ "$item" == github:* ]]; then
             parse_github_source "github:${item#github:}"
             local hp2_sk="github:${_GH_OWNER}/${_GH_REPO}"

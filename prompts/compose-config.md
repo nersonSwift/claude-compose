@@ -47,20 +47,25 @@ Source workspace's own projects (from its `claude-compose.json`) are transitivel
 
 ## Presets
 
-Presets are reusable sets of Claude resources stored globally at `~/.claude-compose/presets/<name>/`. Each preset uses a `claude-compose.json` file with the same format as a workspace config — resources are declared explicitly via paths.
+Presets are reusable sets of Claude resources stored globally at `~/.claude-compose/presets/<name>/` or referenced by filesystem path. Each preset uses a `claude-compose-preset.json` file with the same format as a workspace config — resources are declared explicitly via paths.
+
+Presets can be referenced three ways:
+- **By name** (string): `"my-tools"` → resolves to `~/.claude-compose/presets/my-tools/`
+- **By path** (string containing `/` or `~`): `"./local-preset"`, `"~/presets/custom"` → resolves relative to config file
+- **By object with `path` field**: `{"path": "./local-preset"}` → same resolution, supports filters
 
 ### Preset directory structure
 
 ```
 ~/.claude-compose/presets/<name>/
-├── claude-compose.json    # required — resource declarations
+├── claude-compose-preset.json    # required — resource declarations
 ├── agents/                # agent .md files
 ├── skills/                # skill directories
 ├── CLAUDE.md              # optional — loaded via --add-dir
 └── .env.json              # optional — env vars for MCP prefixing
 ```
 
-### Preset claude-compose.json schema
+### Preset claude-compose-preset.json schema
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -76,10 +81,10 @@ MCP servers from presets get env var prefixing to prevent cross-source conflicts
 
 ### Preset management operations
 
-- **Create preset**: Set up `claude-compose.json` and resource files in `~/.claude-compose/presets/<name>/`
+- **Create preset**: Set up `claude-compose-preset.json` and resource files in `~/.claude-compose/presets/<name>/`
 - **List presets**: Scan `~/.claude-compose/presets/` and show contents summary
 - **Delete preset**: Remove the preset directory
-- **Edit preset**: Modify `claude-compose.json` or resource files in the preset directory
+- **Edit preset**: Modify `claude-compose-preset.json` or resource files in the preset directory
 
 ## Simplification rules — IMPORTANT
 

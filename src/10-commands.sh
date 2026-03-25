@@ -399,7 +399,7 @@ cmd_update() {
     # Collect github presets from config and global
     # shellcheck disable=SC2329
     _update_preset_cb() {
-        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" _ejson="$6"
+        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" _ejson="$6" _cfg="${7:-}" _path_val="${8:-}"
         [[ "$etype" != "object" || "$is_gh" != "true" ]] && return 0
         [[ -z "$source" || "$source" != github:* ]] && return 0
 
@@ -546,7 +546,7 @@ cmd_registries() {
 
     # shellcheck disable=SC2329
     _list_preset_cb() {
-        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" ejson="$6"
+        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="${7:-}" _path_val="${8:-}"
         [[ "$etype" != "object" || "$is_gh" != "true" ]] && return 0
         [[ -z "$source" || "$source" != github:* ]] && return 0
 

@@ -118,6 +118,26 @@ expand_path() {
     echo "${path/#\~/$HOME}"
 }
 
+# Check if a preset string should be treated as a path (not a name)
+_is_preset_path() {
+    [[ "$1" == */* || "$1" == ~* ]]
+}
+
+# Resolve a preset path to an absolute directory
+# $1 = raw path string, $2 = base directory for relative resolution
+resolve_preset_path() {
+    local raw="$1" base_dir="$2"
+    local expanded
+    expanded=$(expand_path "$raw")
+    if [[ "$expanded" != /* ]]; then
+        expanded="$base_dir/$expanded"
+    fi
+    if [[ -d "$expanded" ]]; then
+        expanded=$(cd "$expanded" && pwd -P)
+    fi
+    echo "$expanded"
+}
+
 # ── Parse CLI args ───────────────────────────────────────────────────
 parse_args() {
     # Detect subcommand as first positional argument

@@ -20,6 +20,7 @@ UPDATE_SOURCE=""        # optional positional arg for update
 START_PATH=""            # positional arg for start
 DOCTOR_ERROR_MSG=""      # Error message for doctor mode
 DOCTOR_ENABLED=true      # false prevents doctor trap (when claude/jq missing)
+PRESET_CONFIG_FILE="claude-compose-preset.json"
 PRESETS_DIR="$HOME/.claude-compose/presets"
 BUILTIN_SKILLS_DIR="$HOME/.claude-compose/skills"
 GLOBAL_CONFIG="$HOME/.claude-compose/global.json"

@@ -258,20 +258,34 @@ _validate_presets() {
             entry_type=$(jq -r ".presets[$i] | type" "$config_file")
             case "$entry_type" in
                 string)
-                    # Local preset name — valid
+                    # Local preset name or path — validate names, allow paths
+                    local str_val
+                    str_val=$(jq -r ".presets[$i]" "$config_file")
+                    if ! _is_preset_path "$str_val"; then
+                        if [[ "$str_val" == *..* || "$str_val" == */* ]]; then
+                            echo "presets[$i]: invalid preset name: ${str_val}"
+                            return
+                        fi
+                    fi
                     ;;
                 object)
-                    # Preset object — validate fields (GitHub source or local name)
-                    local source_val name_val
+                    # Preset object — validate fields (GitHub source, local name, or path)
+                    local source_val name_val path_val
                     source_val=$(jq -r ".presets[$i].source // empty" "$config_file")
                     name_val=$(jq -r ".presets[$i].name // empty" "$config_file")
+                    path_val=$(jq -r ".presets[$i].path // empty" "$config_file")
 
-                    if [[ -z "$source_val" && -z "$name_val" ]]; then
-                        echo "presets[$i]: object entry must have either \"source\" or \"name\" field"
+                    local field_count=0
+                    [[ -n "$source_val" ]] && ((field_count++)) || true
+                    [[ -n "$name_val" ]] && ((field_count++)) || true
+                    [[ -n "$path_val" ]] && ((field_count++)) || true
+
+                    if [[ "$field_count" -eq 0 ]]; then
+                        echo "presets[$i]: object entry must have \"source\", \"name\", or \"path\" field"
                         return
                     fi
-                    if [[ -n "$source_val" && -n "$name_val" ]]; then
-                        echo "presets[$i]: cannot have both \"source\" and \"name\" fields"
+                    if [[ "$field_count" -gt 1 ]]; then
+                        echo "presets[$i]: \"source\", \"name\", and \"path\" are mutually exclusive"
                         return
                     fi
 
@@ -335,6 +349,9 @@ _validate_presets() {
                             echo "presets[$i].rename must be an object, got: ${rename_type}"
                             return
                         fi
+                    elif [[ -n "$path_val" ]]; then
+                        # Path preset — no additional validation needed
+                        :
                     elif [[ -n "$name_val" ]]; then
                         if [[ "$name_val" == *..* || "$name_val" == */* ]]; then
                             echo "presets[$i].name: invalid preset name: ${name_val}"
