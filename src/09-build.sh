@@ -1,6 +1,25 @@
+# Extract filter JSON from a preset entry (object with optional agents/skills/mcp fields)
+# $1 = preset entry JSON
+# Prints: filter JSON (or '{}' if no filters)
+extract_preset_filters() {
+    local entry="$1"
+    local result
+    result=$(echo "$entry" | jq -c '{
+        agents: (if has("agents") then .agents else null end),
+        skills: (if has("skills") then .skills else null end),
+        mcp: (if has("mcp") then .mcp else null end)
+    } | with_entries(select(.value != null))')
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo '{}'
+    else
+        echo "$result"
+    fi
+}
+
 # ── Process a single preset ─────────────────────────────────────────
 process_preset() {
     local preset_name="$1"
+    local filter_json="${2:-{}}"
 
     # Cycle detection
     for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
@@ -34,9 +53,59 @@ process_preset() {
     CURRENT_PRESET_PREFIX=""
     CURRENT_PRESET_RENAME='{}'
 
-    # Process resources with MCP prefixing, skip manifest (we write it below)
+    # Recursively process nested presets FIRST (so own resources override nested ones)
+    local nested_count
+    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    local ni
+    for ((ni = 0; ni < nested_count; ni++)); do
+        local nested_type
+        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
+        if [[ "$nested_type" == "string" ]]; then
+            local nested_name
+            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
+            [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
+            # String entry inherits parent's filter unchanged
+            process_preset "$nested_name" "$filter_json"
+        elif [[ "$nested_type" == "object" ]]; then
+            local nested_json
+            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
+            local nested_source
+            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
+            local nested_name_field
+            nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
+
+            # Extract child filters and merge with inherited
+            local child_filter merged_filter
+            child_filter=$(extract_preset_filters "$nested_json")
+            merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
+
+            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                # Rebuild entry_json with merged filters for process_github_preset
+                local patched_entry
+                patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
+                    del(.agents, .skills, .mcp) +
+                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
+                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
+                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
+                process_github_preset "$patched_entry"
+            elif [[ -n "$nested_name_field" ]]; then
+                # Local preset with filters
+                process_preset "$nested_name_field" "$merged_filter"
+            fi
+        fi
+    done
+
+    # Reset prefix/rename after nested recursion (may have been clobbered by nested github presets)
+    CURRENT_PRESET_PREFIX=""
+    CURRENT_PRESET_RENAME='{}'
+
+    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
     process_resources "$preset_config" "$preset_dir" "$preset_name" \
-        "presets" "$preset_name" "$preset_name" "true"
+        "presets" "$preset_name" "$preset_name" "true" "$filter_json"
 
     # CLAUDE.md via --add-dir (process_resources always resets arrays, even on early return)
     local claude_md
@@ -69,33 +138,6 @@ process_preset() {
     # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
     CURRENT_SOURCE_NAME="$preset_name"
     write_source_manifest "presets" "$preset_name"
-
-    # Recursively process nested presets (handles mixed arrays)
-    local nested_count
-    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    local ni
-    for ((ni = 0; ni < nested_count; ni++)); do
-        local nested_type
-        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
-        if [[ "$nested_type" == "string" ]]; then
-            local nested_name
-            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
-            [[ -z "$nested_name" ]] && continue
-            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
-                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                continue
-            fi
-            process_preset "$nested_name"
-        elif [[ "$nested_type" == "object" ]]; then
-            local nested_json
-            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source
-            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
-                process_github_preset "$nested_json"
-            fi
-        fi
-    done
 }
 
 # ── Process a single workspace source ───────────────────────────────
@@ -176,10 +218,11 @@ process_workspace_source() {
 }
 
 # ── Process resources from a config file ───────────────────────────
-# Args: [config_file] [base_dir] [label] [manifest_section] [manifest_key] [source_name] [skip_manifest]
+# Args: [config_file] [base_dir] [label] [manifest_section] [manifest_key] [source_name] [skip_manifest] [filter_json]
 # Defaults preserve backward compatibility for local resources.
 # source_name: if set, enables env var prefixing for MCP servers (used by presets)
 # skip_manifest: if "true", caller handles write_source_manifest (used by presets)
+# filter_json: preset filter JSON with agents/skills/mcp include/exclude (default '{}')
 process_resources() {
     local config_file="${1:-$CONFIG_FILE}"
     local base_dir="${2:-$PWD}"
@@ -188,6 +231,7 @@ process_resources() {
     local manifest_key="${5:-local}"
     local source_name="${6:-}"
     local skip_manifest="${7:-false}"
+    local filter_json="${8:-{}}"
 
     # Set source_name for manifest tracking (used by env var prefixing at launch time)
     CURRENT_SOURCE_NAME="$source_name"
@@ -207,11 +251,24 @@ process_resources() {
 
     echo -e "${CYAN}Processing ${label} resources${NC}" >&2
 
+    # Parse filter JSON for include/exclude lists
+    local pr_agents_include pr_agents_exclude pr_skills_include pr_skills_exclude pr_mcp_include pr_mcp_exclude
+    pr_agents_include=$(echo "$filter_json" | jq -c '.agents.include // ["*"]')
+    pr_agents_exclude=$(echo "$filter_json" | jq -c '.agents.exclude // []')
+    pr_skills_include=$(echo "$filter_json" | jq -c '.skills.include // ["*"]')
+    pr_skills_exclude=$(echo "$filter_json" | jq -c '.skills.exclude // []')
+    pr_mcp_include=$(echo "$filter_json" | jq -c '.mcp.include // ["*"]')
+    pr_mcp_exclude=$(echo "$filter_json" | jq -c '.mcp.exclude // []')
+
     # ── Sync agents (symlink or copy+rename) ──
     local agents
     agents=$(jq -r '.resources.agents // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r agent_path; do
         [[ -z "$agent_path" ]] && continue
+        if _has_path_traversal "$agent_path"; then
+            echo -e "  ${YELLOW}Warning: agent path contains traversal, skipping: ${agent_path}${NC}" >&2
+            continue
+        fi
         local abs_path="$base_dir/$agent_path"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "  ${YELLOW}Warning: agent not found: ${agent_path}${NC}" >&2
@@ -221,6 +278,7 @@ process_resources() {
         local agent_basename
         agent_basename=$(basename "$agent_path")
         local name_no_ext="${agent_basename%.md}"
+        if ! matches_filter "$name_no_ext" "$pr_agents_include" "$pr_agents_exclude"; then continue; fi
         # Apply prefix/rename if active
         local final_name="$name_no_ext"
         if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
@@ -250,6 +308,10 @@ process_resources() {
     skills=$(jq -r '.resources.skills // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r skill_path; do
         [[ -z "$skill_path" ]] && continue
+        if _has_path_traversal "$skill_path"; then
+            echo -e "  ${YELLOW}Warning: skill path contains traversal, skipping: ${skill_path}${NC}" >&2
+            continue
+        fi
         local abs_path="$base_dir/$skill_path"
         if [[ ! -d "$abs_path" ]]; then
             echo -e "  ${YELLOW}Warning: skill not found: ${skill_path}${NC}" >&2
@@ -258,6 +320,7 @@ process_resources() {
         abs_path=$(cd "$abs_path" && pwd -P)
         local skill_basename
         skill_basename=$(basename "$skill_path")
+        if ! matches_filter "$skill_basename" "$pr_skills_include" "$pr_skills_exclude"; then continue; fi
         # Apply prefix/rename if active
         local final_skill="$skill_basename"
         if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
@@ -312,6 +375,7 @@ process_resources() {
     mcp_keys=$(jq -r '.resources.mcp // {} | keys[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r server_name; do
         [[ -z "$server_name" ]] && continue
+        if ! matches_filter "$server_name" "$pr_mcp_include" "$pr_mcp_exclude"; then continue; fi
         local server_config
         server_config=$(jq -c --arg n "$server_name" '.resources.mcp[$n]' "$config_file")
 
@@ -407,29 +471,21 @@ process_global() {
     echo -e "${CYAN}Processing global config${NC}" >&2
 
     # ── Global presets (handles mixed arrays) ──
-    local gp_count
-    gp_count=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
-    local gpi
-    for ((gpi = 0; gpi < gp_count; gpi++)); do
-        local gp_type
-        gp_type=$(jq -r ".presets[$gpi] | type" "$GLOBAL_CONFIG" 2>/dev/null || echo "null")
-        if [[ "$gp_type" == "string" ]]; then
-            local gp_name
-            gp_name=$(jq -r ".presets[$gpi]" "$GLOBAL_CONFIG")
-            [[ -z "$gp_name" ]] && continue
-            process_preset "$gp_name"
-        elif [[ "$gp_type" == "object" ]]; then
-            local gp_json
-            gp_json=$(jq -c ".presets[$gpi]" "$GLOBAL_CONFIG")
-            local gp_source
-            gp_source=$(echo "$gp_json" | jq -r '.source // empty')
-            if [[ -n "$gp_source" && "$gp_source" == github:* ]]; then
-                process_github_preset "$gp_json"
-            fi
+    # shellcheck disable=SC2329
+    _global_preset_cb() {
+        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6"
+        if [[ "$etype" == "string" ]]; then
+            process_preset "$name"
+        elif [[ "$is_gh" == "true" ]]; then
+            process_github_preset "$ejson"
+        elif [[ -n "$name" ]]; then
+            local filter; filter=$(extract_preset_filters "$ejson")
+            process_preset "$name" "$filter"
         fi
-    done
+    }
+    iterate_presets "$GLOBAL_CONFIG" _global_preset_cb
 
-    # ── Global direct resources (agents, skills, MCP) ──
+    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
     process_resources "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "global" "global" "resources"
 
     # ── Global projects (top-level, not inside resources) ──
@@ -526,10 +582,6 @@ process_github_preset() {
         return
     fi
 
-    # Set prefix/rename for resource processing
-    CURRENT_PRESET_PREFIX="$prefix"
-    CURRENT_PRESET_RENAME="$rename_json"
-
     # Compute stable source_name (without version) for env var prefixing
     local source_name
     source_name="${owner}_${repo}"
@@ -539,9 +591,85 @@ process_github_preset() {
         source_name="$prefix"
     fi
 
-    # Process resources
+    # Extract filters from entry_json
+    local filter_json
+    filter_json=$(extract_preset_filters "$entry_json")
+
+    # Save prefix/rename to locals for later use by process_resources
+    local my_prefix="$prefix"
+    local my_rename="$rename_json"
+
+    # Reset globals before nested recursion (nested presets manage their own)
+    CURRENT_PRESET_PREFIX=""
+    CURRENT_PRESET_RENAME='{}'
+
+    # Recursively process nested presets FIRST (so own resources override nested ones)
+    local nested_count
+    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
+    local ni
+    for ((ni = 0; ni < nested_count; ni++)); do
+        local nested_type
+        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
+        if [[ "$nested_type" == "string" ]]; then
+            local nested_name
+            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
+            [[ -z "$nested_name" ]] && continue
+            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
+                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
+                continue
+            fi
+            # Local presets within a github registry resolve relative to registry root
+            local reg_root
+            reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
+            if [[ -d "$reg_root/$nested_name" ]]; then
+                # Treat as another github preset from same repo — inherit filter
+                local nested_entry
+                nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" \
+                    --argjson f "$filter_json" \
+                    '{source: $s} +
+                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
+                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
+                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
+                process_github_preset "$nested_entry"
+            else
+                process_preset "$nested_name" "$filter_json"
+            fi
+        elif [[ "$nested_type" == "object" ]]; then
+            local nested_json
+            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
+            local nested_source
+            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
+            local nested_name_field
+            nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
+
+            # Extract child filters and merge with inherited
+            local child_filter merged_filter
+            child_filter=$(extract_preset_filters "$nested_json")
+            merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
+
+            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
+                # Rebuild entry_json with merged filters for process_github_preset
+                local patched_entry
+                patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
+                    del(.agents, .skills, .mcp) +
+                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
+                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
+                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
+                process_github_preset "$patched_entry"
+            elif [[ -n "$nested_name_field" ]]; then
+                # Local preset with filters
+                process_preset "$nested_name_field" "$merged_filter"
+            fi
+        fi
+    done
+
+    # Restore prefix/rename for own resource processing
+    CURRENT_PRESET_PREFIX="$my_prefix"
+    CURRENT_PRESET_RENAME="$my_rename"
+
+    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
     process_resources "$preset_config" "$preset_dir" "$source_key" \
-        "presets" "$source_key" "$source_name" "true"
+        "presets" "$source_key" "$source_name" "true" "$filter_json"
 
     # CLAUDE.md via --add-dir
     local claude_md
@@ -575,46 +703,9 @@ process_github_preset() {
     CURRENT_SOURCE_NAME="$source_name"
     write_source_manifest "presets" "$source_key"
 
-    # Reset prefix/rename before nested presets (they set their own)
+    # Reset prefix/rename to prevent leaking to caller
     CURRENT_PRESET_PREFIX=""
     CURRENT_PRESET_RENAME='{}'
-
-    # Recursively process nested presets
-    local nested_count
-    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    local ni
-    for ((ni = 0; ni < nested_count; ni++)); do
-        local nested_type
-        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
-        if [[ "$nested_type" == "string" ]]; then
-            local nested_name
-            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
-            [[ -z "$nested_name" ]] && continue
-            if [[ "$nested_name" == *..* || "$nested_name" == */* ]]; then
-                echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                continue
-            fi
-            # Local presets within a github registry resolve relative to registry root
-            local reg_root
-            reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
-            if [[ -d "$reg_root/$nested_name" ]]; then
-                # Treat as another github preset from same repo
-                local nested_entry
-                nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" '{source: $s}')
-                process_github_preset "$nested_entry"
-            else
-                process_preset "$nested_name"
-            fi
-        elif [[ "$nested_type" == "object" ]]; then
-            local nested_json
-            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source
-            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            if [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
-                process_github_preset "$nested_json"
-            fi
-        fi
-    done
 }
 
 # ── Apply resource prefix/rename ──────────────────────────────────────
@@ -637,6 +728,36 @@ apply_resource_prefix() {
     else
         echo "$name"
     fi
+}
+
+# Iterate over a presets array in a config file, calling a callback for each entry.
+# $1 = config file path
+# $2 = callback function name
+# Callback receives: entry_type index name source is_github entry_json config_file
+# shellcheck disable=SC2329
+iterate_presets() {
+    local config_file="$1" callback="$2"
+    [[ ! -f "$config_file" ]] && return
+    local count
+    count=$(jq '.presets // [] | length' "$config_file" 2>/dev/null || echo 0)
+    local i
+    for ((i = 0; i < count; i++)); do
+        local entry_type
+        entry_type=$(jq -r ".presets[$i] | type" "$config_file" 2>/dev/null || echo "null")
+        if [[ "$entry_type" == "string" ]]; then
+            local name
+            name=$(jq -r ".presets[$i]" "$config_file")
+            [[ -z "$name" ]] && continue
+            "$callback" "string" "$i" "$name" "" "false" '{}' "$config_file"
+        elif [[ "$entry_type" == "object" ]]; then
+            local entry_json source_val name_val is_github="false"
+            entry_json=$(jq -c ".presets[$i]" "$config_file")
+            source_val=$(echo "$entry_json" | jq -r '.source // empty')
+            name_val=$(echo "$entry_json" | jq -r '.name // empty')
+            [[ -n "$source_val" && "$source_val" == github:* ]] && is_github="true"
+            "$callback" "object" "$i" "$name_val" "$source_val" "$is_github" "$entry_json" "$config_file"
+        fi
+    done
 }
 
 # Build orchestrator
@@ -694,27 +815,19 @@ build() {
     process_global
 
     # Process presets (handles mixed arrays)
-    local bp_count
-    bp_count=$(jq '.presets // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    local bpi
-    for ((bpi = 0; bpi < bp_count; bpi++)); do
-        local bp_type
-        bp_type=$(jq -r ".presets[$bpi] | type" "$CONFIG_FILE" 2>/dev/null || echo "null")
-        if [[ "$bp_type" == "string" ]]; then
-            local bp_name
-            bp_name=$(jq -r ".presets[$bpi]" "$CONFIG_FILE")
-            [[ -z "$bp_name" ]] && continue
-            process_preset "$bp_name"
-        elif [[ "$bp_type" == "object" ]]; then
-            local bp_json
-            bp_json=$(jq -c ".presets[$bpi]" "$CONFIG_FILE")
-            local bp_source
-            bp_source=$(echo "$bp_json" | jq -r '.source // empty')
-            if [[ -n "$bp_source" && "$bp_source" == github:* ]]; then
-                process_github_preset "$bp_json"
-            fi
+    # shellcheck disable=SC2329
+    _build_preset_cb() {
+        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6"
+        if [[ "$etype" == "string" ]]; then
+            process_preset "$name"
+        elif [[ "$is_gh" == "true" ]]; then
+            process_github_preset "$ejson"
+        elif [[ -n "$name" ]]; then
+            local filter; filter=$(extract_preset_filters "$ejson")
+            process_preset "$name" "$filter"
         fi
-    done
+    }
+    iterate_presets "$CONFIG_FILE" _build_preset_cb
 
     # Process workspaces
     if [[ "$ws_count" -gt 0 ]]; then
@@ -726,7 +839,8 @@ build() {
         done
     fi
 
-    # Process local resources (last — wins on conflict)
+    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
+    # (all defaults: CONFIG_FILE, PWD, "local", "resources", "local", "", "false", "{}")
     process_resources
 
     # Write manifest and hash
@@ -779,6 +893,7 @@ cmd_build() {
 
         if has_builtin_skills; then
             echo -e "${CYAN}Built-in skills:${NC}" >&2
+            local _d
             for _d in "$BUILTIN_SKILLS_DIR"/*/; do
                 [[ -d "$_d" ]] || continue
                 echo -e "  - $(basename "$_d")" >&2

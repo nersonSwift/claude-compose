@@ -6,4 +6,4 @@ set -euo pipefail
 # (MCP, agents, skills, permissions) lives in the workspace directory.
 # Presets contribute shared resources at build time.
 
-VERSION="2.0.0"
+VERSION="2.1.0"

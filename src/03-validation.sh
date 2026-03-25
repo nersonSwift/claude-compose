@@ -49,19 +49,8 @@ validate() {
     fi
 }
 
-validate_config_semantics() {
+_validate_projects() {
     local config_file="$1"
-
-    # Warn on unknown top-level keys
-    local known_keys='["projects","presets","workspaces","resources","update_interval"]'
-    local unknown_keys
-    unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
-    if [[ -n "$unknown_keys" ]]; then
-        while IFS= read -r uk; do
-            [[ -z "$uk" ]] && continue
-            echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
-        done <<< "$unknown_keys"
-    fi
 
     local projects_type
     projects_type=$(jq -r 'if has("projects") then .projects | type else "null" end' "$config_file")
@@ -112,8 +101,11 @@ validate_config_semantics() {
             fi
         fi
     fi
+}
 
-    # ── Validate resources section ──
+_validate_resources() {
+    local config_file="$1"
+
     local resources_type
     resources_type=$(jq -r 'if has("resources") then .resources | type else "null" end' "$config_file")
     if [[ "$resources_type" != "null" && "$resources_type" != "object" ]]; then
@@ -186,8 +178,11 @@ validate_config_semantics() {
             fi
         fi
     fi
+}
 
-    # ── Validate update_interval ──
+_validate_update_interval() {
+    local config_file="$1"
+
     local ui_type
     ui_type=$(jq -r 'if has("update_interval") then .update_interval | type else "null" end' "$config_file")
     if [[ "$ui_type" != "null" && "$ui_type" != "number" ]]; then
@@ -202,8 +197,11 @@ validate_config_semantics() {
             return
         fi
     fi
+}
 
-    # ── Validate workspaces array ──
+_validate_workspaces() {
+    local config_file="$1"
+
     local workspaces_type
     workspaces_type=$(jq -r 'if has("workspaces") then .workspaces | type else "null" end' "$config_file")
     if [[ "$workspaces_type" != "null" && "$workspaces_type" != "array" ]]; then
@@ -239,8 +237,11 @@ validate_config_semantics() {
             done
         done
     fi
+}
 
-    # ── Validate presets array ──
+_validate_presets() {
+    local config_file="$1"
+
     local presets_type
     presets_type=$(jq -r 'if has("presets") then .presets | type else "null" end' "$config_file")
     if [[ "$presets_type" != "null" && "$presets_type" != "array" ]]; then
@@ -260,72 +261,108 @@ validate_config_semantics() {
                     # Local preset name — valid
                     ;;
                 object)
-                    # GitHub preset object — validate fields
-                    local source_val
+                    # Preset object — validate fields (GitHub source or local name)
+                    local source_val name_val
                     source_val=$(jq -r ".presets[$i].source // empty" "$config_file")
-                    if [[ -z "$source_val" ]]; then
-                        echo "presets[$i]: object entry must have a \"source\" field"
+                    name_val=$(jq -r ".presets[$i].name // empty" "$config_file")
+
+                    if [[ -z "$source_val" && -z "$name_val" ]]; then
+                        echo "presets[$i]: object entry must have either \"source\" or \"name\" field"
                         return
                     fi
-                    if [[ "$source_val" != github:* ]]; then
-                        echo "presets[$i].source must start with \"github:\", got: ${source_val}"
+                    if [[ -n "$source_val" && -n "$name_val" ]]; then
+                        echo "presets[$i]: cannot have both \"source\" and \"name\" fields"
                         return
                     fi
-                    # Validate github source has at least owner/repo with safe characters
-                    local gh_rest="${source_val#github:}"
-                    gh_rest="${gh_rest%%@*}"
-                    if [[ "$gh_rest" != */* ]]; then
-                        echo "presets[$i].source must contain at least owner/repo, got: ${source_val}"
-                        return
-                    fi
-                    # Validate owner and repo contain only safe characters (no path traversal)
-                    local gh_owner="${gh_rest%%/*}"
-                    local gh_after="${gh_rest#*/}"
-                    local gh_repo="${gh_after%%/*}"
-                    if [[ ! "$gh_owner" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_owner" == "." ]] || [[ "$gh_owner" == ".." ]]; then
-                        echo "presets[$i].source: invalid owner name: ${gh_owner}"
-                        return
-                    fi
-                    if [[ ! "$gh_repo" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_repo" == "." ]] || [[ "$gh_repo" == ".." ]]; then
-                        echo "presets[$i].source: invalid repo name: ${gh_repo}"
-                        return
-                    fi
-                    # Validate path segments (no path traversal via ..)
-                    local gh_path_part="${gh_rest#*/*/}"
-                    if [[ "$gh_path_part" != "$gh_rest" && -n "$gh_path_part" ]]; then
-                        local _remaining="$gh_path_part" gh_seg
-                        while [[ -n "$_remaining" ]]; do
-                            gh_seg="${_remaining%%/*}"
-                            if [[ "$gh_seg" == ".." || "$gh_seg" == "." ]]; then
-                                echo "presets[$i].source: path contains invalid segment: ${gh_seg}"
+
+                    if [[ -n "$source_val" ]]; then
+                        if [[ "$source_val" != github:* ]]; then
+                            echo "presets[$i].source must start with \"github:\", got: ${source_val}"
+                            return
+                        fi
+                        # Validate github source has at least owner/repo with safe characters
+                        local gh_rest="${source_val#github:}"
+                        gh_rest="${gh_rest%%@*}"
+                        if [[ "$gh_rest" != */* ]]; then
+                            echo "presets[$i].source must contain at least owner/repo, got: ${source_val}"
+                            return
+                        fi
+                        # Validate owner and repo contain only safe characters (no path traversal)
+                        local gh_owner="${gh_rest%%/*}"
+                        local gh_after="${gh_rest#*/}"
+                        local gh_repo="${gh_after%%/*}"
+                        if [[ ! "$gh_owner" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_owner" == "." ]] || [[ "$gh_owner" == ".." ]]; then
+                            echo "presets[$i].source: invalid owner name: ${gh_owner}"
+                            return
+                        fi
+                        if [[ ! "$gh_repo" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_repo" == "." ]] || [[ "$gh_repo" == ".." ]]; then
+                            echo "presets[$i].source: invalid repo name: ${gh_repo}"
+                            return
+                        fi
+                        # Validate path segments (no path traversal via ..)
+                        local gh_path_part="${gh_rest#*/*/}"
+                        if [[ "$gh_path_part" != "$gh_rest" && -n "$gh_path_part" ]]; then
+                            local _remaining="$gh_path_part" gh_seg
+                            while [[ -n "$_remaining" ]]; do
+                                gh_seg="${_remaining%%/*}"
+                                if [[ "$gh_seg" == ".." || "$gh_seg" == "." ]]; then
+                                    echo "presets[$i].source: path contains invalid segment: ${gh_seg}"
+                                    return
+                                fi
+                                [[ "$_remaining" == */* ]] && _remaining="${_remaining#*/}" || _remaining=""
+                            done
+                        fi
+                        # Validate prefix format if present
+                        local prefix_val
+                        prefix_val=$(jq -r ".presets[$i].prefix // empty" "$config_file")
+                        if [[ -n "$prefix_val" ]]; then
+                            if [[ ! "$prefix_val" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                                echo "presets[$i].prefix must be lowercase alphanumeric with optional hyphens (no leading/trailing hyphens), got: ${prefix_val}"
                                 return
                             fi
-                            [[ "$_remaining" == */* ]] && _remaining="${_remaining#*/}" || _remaining=""
-                        done
-                    fi
-                    # Validate prefix format if present
-                    local prefix_val
-                    prefix_val=$(jq -r ".presets[$i].prefix // empty" "$config_file")
-                    if [[ -n "$prefix_val" ]]; then
-                        if [[ ! "$prefix_val" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
-                            echo "presets[$i].prefix must be lowercase alphanumeric with optional hyphens (no leading/trailing hyphens), got: ${prefix_val}"
+                        fi
+                        # Validate env_files if present
+                        local ef_type
+                        ef_type=$(jq -r "if .presets[$i] | has(\"env_files\") then .presets[$i].env_files | type else \"null\" end" "$config_file")
+                        if [[ "$ef_type" != "null" && "$ef_type" != "array" ]]; then
+                            echo "presets[$i].env_files must be an array, got: ${ef_type}"
+                            return
+                        fi
+                        # Validate rename if present
+                        local rename_type
+                        rename_type=$(jq -r "if .presets[$i] | has(\"rename\") then .presets[$i].rename | type else \"null\" end" "$config_file")
+                        if [[ "$rename_type" != "null" && "$rename_type" != "object" ]]; then
+                            echo "presets[$i].rename must be an object, got: ${rename_type}"
+                            return
+                        fi
+                    elif [[ -n "$name_val" ]]; then
+                        if [[ "$name_val" == *..* || "$name_val" == */* ]]; then
+                            echo "presets[$i].name: invalid preset name: ${name_val}"
                             return
                         fi
                     fi
-                    # Validate env_files if present
-                    local ef_type
-                    ef_type=$(jq -r "if .presets[$i] | has(\"env_files\") then .presets[$i].env_files | type else \"null\" end" "$config_file")
-                    if [[ "$ef_type" != "null" && "$ef_type" != "array" ]]; then
-                        echo "presets[$i].env_files must be an array, got: ${ef_type}"
-                        return
-                    fi
-                    # Validate rename if present
-                    local rename_type
-                    rename_type=$(jq -r "if .presets[$i] | has(\"rename\") then .presets[$i].rename | type else \"null\" end" "$config_file")
-                    if [[ "$rename_type" != "null" && "$rename_type" != "object" ]]; then
-                        echo "presets[$i].rename must be an object, got: ${rename_type}"
-                        return
-                    fi
+
+                    # Validate filter fields (common to both source and name objects)
+                    local filter_type
+                    for filter_type in agents skills mcp; do
+                        local ft
+                        ft=$(jq -r "if .presets[$i] | has(\"$filter_type\") then .presets[$i].${filter_type} | type else \"null\" end" "$config_file")
+                        if [[ "$ft" != "null" && "$ft" != "object" ]]; then
+                            echo "presets[$i].${filter_type} must be an object, got: ${ft}"
+                            return
+                        fi
+                        if [[ "$ft" == "object" ]]; then
+                            local arr_field
+                            for arr_field in include exclude; do
+                                local af
+                                af=$(jq -r "if .presets[$i].${filter_type} | has(\"$arr_field\") then .presets[$i].${filter_type}.${arr_field} | type else \"null\" end" "$config_file")
+                                if [[ "$af" != "null" && "$af" != "array" ]]; then
+                                    echo "presets[$i].${filter_type}.${arr_field} must be an array, got: ${af}"
+                                    return
+                                fi
+                            done
+                        fi
+                    done
                     ;;
                 *)
                     echo "presets[$i]: expected string or object, got: ${entry_type}"
@@ -335,6 +372,28 @@ validate_config_semantics() {
         done
         fi
     fi
+}
+
+validate_config_semantics() {
+    local config_file="$1"
+
+    # Warn on unknown top-level keys
+    local known_keys='["projects","presets","workspaces","resources","update_interval"]'
+    local unknown_keys
+    unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
+    if [[ -n "$unknown_keys" ]]; then
+        while IFS= read -r uk; do
+            [[ -z "$uk" ]] && continue
+            echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
+        done <<< "$unknown_keys"
+    fi
+
+    local err
+    err=$(_validate_projects "$config_file"); [[ -n "$err" ]] && echo "$err" && return
+    err=$(_validate_resources "$config_file"); [[ -n "$err" ]] && echo "$err" && return
+    err=$(_validate_update_interval "$config_file"); [[ -n "$err" ]] && echo "$err" && return
+    err=$(_validate_workspaces "$config_file"); [[ -n "$err" ]] && echo "$err" && return
+    err=$(_validate_presets "$config_file"); [[ -n "$err" ]] && echo "$err" && return
 }
 
 validate_global_config() {
