@@ -50,7 +50,9 @@ PROMPT_EOF
     prompt="${prompt//__WORKSPACE_DIR__/$workspace_dir}"
 
     if [[ -n "$error_msg" ]]; then
-        prompt="${prompt//__ERROR_CONTEXT__/$error_msg}"
+        # Sanitize: remove backticks to prevent code fence breakout in prompt
+        local sanitized_msg="${error_msg//\`/}"
+        prompt="${prompt//__ERROR_CONTEXT__/$sanitized_msg}"
         prompt="${prompt//__DOCTOR_MODE__/analyze and fix the error below}"
     else
         prompt="${prompt//__ERROR_CONTEXT__/No error — manual diagnostic session}"

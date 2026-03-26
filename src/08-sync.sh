@@ -122,6 +122,10 @@ sync_source_dir() {
         while IFS= read -r _ef; do
             [[ -z "$_ef" ]] && continue
             local _ef_abs="$source_dir/$_ef"
+            if ! _is_within_dir "$_ef_abs" "$source_dir"; then
+                echo -e "  ${YELLOW}skip env file:${NC} $_ef (escapes source directory)" >&2
+                continue
+            fi
             [[ -f "$_ef_abs" ]] || continue
             _source_known_vars+=$(jq -r 'keys[]' "$_ef_abs" 2>/dev/null || true)
             _source_known_vars+=$'\n'
