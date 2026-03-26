@@ -7,3 +7,4 @@ claude-compose.json
 /claude-compose.bak
 .compose-manifest.json
 .compose-hash
+tests/test_helper/claude-compose-functions.sh

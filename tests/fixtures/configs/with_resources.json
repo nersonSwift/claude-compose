@@ -1,0 +1,14 @@
+{
+    "projects": [{"name": "app", "path": "/tmp/app"}],
+    "resources": {
+        "agents": ["custom-agent.md"],
+        "skills": ["custom-skill"],
+        "mcp": {
+            "test-server": {
+                "command": "echo",
+                "args": ["hello"]
+            }
+        },
+        "env_files": ["env/dev.json"]
+    }
+}

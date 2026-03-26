@@ -1,0 +1,4 @@
+{
+    "projects": [{"name": "app", "path": "/tmp/app"}],
+    "presets": ["test-preset", {"name": "another-preset"}]
+}

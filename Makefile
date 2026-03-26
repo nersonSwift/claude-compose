@@ -38,8 +38,34 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 	fi
 	@echo "Done: $(TARGET) ($$(wc -l < $@) lines)"
 
+TEST_LIB := tests/test_helper/claude-compose-functions.sh
+
+$(TEST_LIB): $(SOURCES) $(PROMPTS) $(SKILLS)
+	@echo "Building test library..."
+	@mkdir -p tests/test_helper
+	@cat $(SOURCES) > $@.tmp
+	@while IFS= read -r line; do \
+		case "$$line" in \
+			*__PROMPT_*__*|*__EMBEDDED_SKILLS__*) ;; \
+			'main "$$@"') ;; \
+			*) printf '%s\n' "$$line" ;; \
+		esac; \
+	done < $@.tmp > $@
+	@rm -f $@.tmp
+
+.PHONY: test test-unit test-integration
+
+test: $(TARGET) $(TEST_LIB)
+	@tests/lib/bats-core/bin/bats tests/unit/ tests/integration/
+
+test-unit: $(TARGET) $(TEST_LIB)
+	@tests/lib/bats-core/bin/bats tests/unit/
+
+test-integration: $(TARGET) $(TEST_LIB)
+	@tests/lib/bats-core/bin/bats tests/integration/
+
 clean:
-	rm -f $(TARGET) $(TARGET).tmp
+	rm -f $(TARGET) $(TARGET).tmp $(TEST_LIB)
 
 lint: $(TARGET)
 	shellcheck $(TARGET)
