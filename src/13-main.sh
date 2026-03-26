@@ -15,7 +15,9 @@ main() {
     # Set lock file path next to config
     LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
 
-    # Set up doctor trap (must be after parse_args so DOCTOR_ENABLED is correct)
+    # Set up doctor traps (must be after parse_args so DOCTOR_ENABLED is correct)
+    # ERR trap captures context (command, line, function) for unexpected set -e failures
+    trap '_doctor_err_trap' ERR
     trap '_doctor_trap' EXIT
 
     # Dispatch subcommands before validate (they have own validation)
@@ -91,8 +93,9 @@ main() {
             CLAUDE_ARGS+=("--add-dir" "$project_path")
             echo -e "${CYAN}Project:${NC} $(basename "$project_path") (${project_path})" >&2
 
-            if [[ "$claude_md" == "true" ]]; then
-                NEED_CLAUDE_MD_ENV=true
+            HAS_ANY_ADD_DIR=true
+            if [[ "$claude_md" != "true" ]]; then
+                COMPOSE_CLAUDE_MD_EXCLUDES+=("$project_path")
             fi
 
             if [[ -n "$project_name" ]]; then
@@ -110,7 +113,8 @@ main() {
         system_prompt+=$'\n'"Use name:// to reference files in a project (e.g. project://path/to/file)."
     fi
 
-    CLAUDE_ARGS+=("--append-system-prompt" "$system_prompt")
+    # Settings accumulator (preset/workspace settings merged first, then global/local)
+    local compose_settings='{}'
 
     # Add --add-dir from manifest (global + presets + workspaces + resources: add_dirs and project_dirs)
     if [[ -f ".compose-manifest.json" ]]; then
@@ -121,14 +125,28 @@ main() {
             while IFS= read -r sname; do
                 [[ -z "$sname" ]] && continue
 
-                # add_dirs: preset/workspace dirs for CLAUDE.md
-                local add_dirs
-                add_dirs=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].add_dirs // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
-                while IFS= read -r dir; do
-                    [[ -z "$dir" ]] && continue
+                # add_dirs: new format is [{path, claude_md}], old format was ["path"]
+                local add_dir_entries
+                add_dir_entries=$(jq -c --arg s "$section" --arg n "$sname" '.[$s][$n].add_dirs // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r entry; do
+                    [[ -z "$entry" ]] && continue
+                    local dir cm_flag
+                    if echo "$entry" | jq -e '.path' >/dev/null 2>&1; then
+                        # New object format
+                        dir=$(echo "$entry" | jq -r '.path')
+                        cm_flag=$(echo "$entry" | jq -r '.claude_md // true')
+                    else
+                        # Old string format (backward compat)
+                        dir=$(echo "$entry" | jq -r '.')
+                        cm_flag="true"
+                    fi
+                    [[ -z "$dir" || ! -d "$dir" ]] && continue
                     CLAUDE_ARGS+=("--add-dir" "$dir")
-                    NEED_CLAUDE_MD_ENV=true
-                done <<< "$add_dirs"
+                    HAS_ANY_ADD_DIR=true
+                    if [[ "$cm_flag" != "true" ]]; then
+                        COMPOSE_CLAUDE_MD_EXCLUDES+=("$dir")
+                    fi
+                done <<< "$add_dir_entries"
 
                 # project_dirs: transitive projects
                 local proj_dirs
@@ -140,13 +158,106 @@ main() {
                     proj_cmd=$(echo "$proj_entry" | jq -r '.claude_md')
                     if [[ -d "$proj_path" ]]; then
                         CLAUDE_ARGS+=("--add-dir" "$proj_path")
-                        if [[ "$proj_cmd" == "true" ]]; then
-                            NEED_CLAUDE_MD_ENV=true
+                        HAS_ANY_ADD_DIR=true
+                        if [[ "$proj_cmd" != "true" ]]; then
+                            COMPOSE_CLAUDE_MD_EXCLUDES+=("$proj_path")
                         fi
                     fi
                 done <<< "$proj_dirs"
+
+                # system_prompt_files from manifest (presets/workspaces only)
+                local spf_list
+                spf_list=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].system_prompt_files // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r spf; do
+                    [[ -z "$spf" || ! -f "$spf" ]] && continue
+                    system_prompt+=$'\n\n'"$(cat "$spf")"
+                done <<< "$spf_list"
+
+                # settings_files from manifest (presets/workspaces only)
+                local sf_list
+                sf_list=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].settings_files // [] | .[]' ".compose-manifest.json" 2>/dev/null || true)
+                while IFS= read -r sf; do
+                    [[ -z "$sf" || ! -f "$sf" ]] && continue
+                    if jq empty "$sf" 2>/dev/null; then
+                        compose_settings=$(merge_compose_settings "$compose_settings" "$(cat "$sf")")
+                    fi
+                done <<< "$sf_list"
             done <<< "$source_names"
         done
+    fi
+
+    # Append contents from resources.append_system_prompt_files (global first, then local)
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        local global_aspf
+        global_aspf=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        while IFS= read -r aspf; do
+            [[ -z "$aspf" ]] && continue
+            local abs_aspf="$GLOBAL_CONFIG_DIR/$aspf"
+            if [[ -f "$abs_aspf" ]]; then
+                system_prompt+=$'\n\n'"$(cat "$abs_aspf")"
+            else
+                echo -e "${YELLOW}Warning: global system prompt file not found: ${aspf}${NC}" >&2
+            fi
+        done <<< "$global_aspf"
+    fi
+
+    local local_aspf
+    local_aspf=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r aspf; do
+        [[ -z "$aspf" ]] && continue
+        local abs_aspf="$ORIGINAL_CWD/$aspf"
+        if [[ -f "$abs_aspf" ]]; then
+            system_prompt+=$'\n\n'"$(cat "$abs_aspf")"
+        else
+            echo -e "${YELLOW}Warning: system prompt file not found: ${aspf}${NC}" >&2
+        fi
+    done <<< "$local_aspf"
+
+    CLAUDE_ARGS+=("--append-system-prompt" "$system_prompt")
+
+    # Build claudeMdExcludes from collected paths
+    if [[ ${#COMPOSE_CLAUDE_MD_EXCLUDES[@]} -gt 0 ]]; then
+        local excludes_json="[]"
+        for exc_path in "${COMPOSE_CLAUDE_MD_EXCLUDES[@]}"; do
+            excludes_json=$(echo "$excludes_json" | jq --arg p "$exc_path" '. + [$p + "/CLAUDE.md", $p + "/.claude/CLAUDE.md", $p + "/.claude/rules/*.md"]')
+        done
+        compose_settings=$(echo "$compose_settings" | jq --argjson exc "$excludes_json" '.claudeMdExcludes = $exc')
+    fi
+
+    # Merge with user settings (global → local → compose-generated)
+    if [[ -f "$GLOBAL_CONFIG" ]]; then
+        local global_sp
+        global_sp=$(jq -r '.resources.settings // empty' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        if [[ -n "$global_sp" ]]; then
+            local abs_gs="$GLOBAL_CONFIG_DIR/$global_sp"
+            if [[ -f "$abs_gs" ]] && jq empty "$abs_gs" 2>/dev/null; then
+                compose_settings=$(merge_compose_settings "$compose_settings" "$(cat "$abs_gs")")
+            else
+                echo -e "${YELLOW}Warning: global settings file not found or invalid: ${global_sp}${NC}" >&2
+            fi
+        fi
+    fi
+
+    local local_sp
+    local_sp=$(jq -r '.resources.settings // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$local_sp" ]]; then
+        local abs_ls="$ORIGINAL_CWD/$local_sp"
+        if [[ -f "$abs_ls" ]] && jq empty "$abs_ls" 2>/dev/null; then
+            compose_settings=$(merge_compose_settings "$compose_settings" "$(cat "$abs_ls")")
+        else
+            echo -e "${YELLOW}Warning: settings file not found or invalid: ${local_sp}${NC}" >&2
+        fi
+    fi
+
+    # Write and pass --settings if non-empty
+    if [[ "$compose_settings" != '{}' ]]; then
+        if [[ "$DRY_RUN" != true ]]; then
+            atomic_write ".compose-settings.json" "$(echo "$compose_settings" | jq '.')"
+        fi
+        CLAUDE_ARGS+=("--settings" ".compose-settings.json")
+    else
+        # Clean up stale file if no longer needed
+        rm -f ".compose-settings.json" 2>/dev/null || true
     fi
 
     # Extra args
@@ -225,7 +336,7 @@ main() {
                         (.value.agents // [] | map("  agent: " + .)),
                         (.value.skills // [] | map("  skill: " + .)),
                         (.value.mcp_servers // [] | map("  mcp: " + .)),
-                        (.value.add_dirs // [] | map("  add_dir: " + .))
+                        (.value.add_dirs // [] | map(if type == "object" then "  add_dir: " + .path + (if .claude_md then "" else " (claude_md: false)" end) else "  add_dir: " + . end))
                     ) | .[]' ".compose-manifest.json" 2>/dev/null | while read -r line; do
                         echo "  $line" >&2
                     done
@@ -281,9 +392,15 @@ main() {
             fi
         fi
 
-        if [[ "$NEED_CLAUDE_MD_ENV" == true ]]; then
+        if [[ "$HAS_ANY_ADD_DIR" == true ]]; then
             echo -e "${CYAN}Environment:${NC}" >&2
             echo "  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1" >&2
+            echo "" >&2
+        fi
+
+        if [[ "$compose_settings" != '{}' ]]; then
+            echo -e "${CYAN}Settings (--settings .compose-settings.json):${NC}" >&2
+            echo "$compose_settings" | jq '.' >&2
             echo "" >&2
         fi
 
@@ -313,7 +430,7 @@ main() {
     echo -e "${BOLD}Launching claude...${NC}" >&2
     echo "" >&2
 
-    if [[ "$NEED_CLAUDE_MD_ENV" == true ]]; then
+    if [[ "$HAS_ANY_ADD_DIR" == true ]]; then
         export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
     fi
 

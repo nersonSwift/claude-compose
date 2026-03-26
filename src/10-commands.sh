@@ -275,7 +275,7 @@ cmd_copy() {
             require_claude
             local prompt
             prompt=$(compose_config_prompt "$dest_path/$config_name")
-            (cd "$dest_path" && claude --system-prompt "$prompt" -p "do it")
+            (cd "$dest_path" && claude --system-prompt "$prompt" "do it")
         fi
     else
         echo -e "${CYAN}Run 'claude-compose config' in ${dest_path} to customize.${NC}" >&2
@@ -314,7 +314,16 @@ cmd_instructions() {
     if [[ "$ws_count" -gt 0 ]]; then
         summary+="- Workspaces: $ws_count"$'\n'
     fi
+    local aspf_count settings_val
+    aspf_count=$(jq '.resources.append_system_prompt_files // [] | length' "$config_file")
+    settings_val=$(jq -r '.resources.settings // empty' "$config_file")
     summary+="- Local resources: $agent_count agents, $skill_count skills, $mcp_count MCP servers, $env_count env files"
+    if [[ "$aspf_count" -gt 0 ]]; then
+        summary+=", $aspf_count system prompt files"
+    fi
+    if [[ -n "$settings_val" ]]; then
+        summary+=", settings: $settings_val"
+    fi
 
     if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 ]]; then
         summary+=$'\n'$'\n'"External resources are synced from presets/workspaces. Agents and skills"
@@ -378,7 +387,7 @@ cmd_config() {
 
     local prompt
     prompt=$(compose_config_prompt "$CONFIG_FILE")
-    claude --system-prompt "$prompt" -p "do it"
+    claude --system-prompt "$prompt" "do it"
 }
 
 # ── Update Command ─────────────────────────────────────────────────────
@@ -522,9 +531,9 @@ cmd_start() {
     echo "" >&2
 
     if [[ -n "$root_path" ]]; then
-        (cd "$root_path" && claude --system-prompt "$prompt")
+        (cd "$root_path" && claude --system-prompt "$prompt" "do it")
     else
-        claude --system-prompt "$prompt"
+        claude --system-prompt "$prompt" "do it"
     fi
 }
 

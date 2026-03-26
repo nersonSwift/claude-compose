@@ -292,6 +292,23 @@ compute_build_hash() {
         if [[ -f "$abs_env" ]]; then "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true; fi
     done <<< "$res_env_files"
 
+    # Hash append_system_prompt_files
+    local res_aspf
+    res_aspf=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    while IFS= read -r aspf; do
+        [[ -z "$aspf" ]] && continue
+        local abs_aspf="$ORIGINAL_CWD/$aspf"
+        if [[ -f "$abs_aspf" ]]; then "$_SHASUM_CMD" "$abs_aspf" 2>/dev/null >> "$hash_tmp" || true; fi
+    done <<< "$res_aspf"
+
+    # Hash settings file
+    local res_settings
+    res_settings=$(jq -r '.resources.settings // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$res_settings" ]]; then
+        local abs_settings="$ORIGINAL_CWD/$res_settings"
+        if [[ -f "$abs_settings" ]]; then "$_SHASUM_CMD" "$abs_settings" 2>/dev/null >> "$hash_tmp" || true; fi
+    fi
+
     # Hash global resources
     if [[ -f "$GLOBAL_CONFIG" ]]; then
         local global_mcp
@@ -321,6 +338,23 @@ compute_build_hash() {
             local abs_env="$GLOBAL_CONFIG_DIR/$env_file"
             if [[ -f "$abs_env" ]]; then "$_SHASUM_CMD" "$abs_env" 2>/dev/null >> "$hash_tmp" || true; fi
         done <<< "$global_env_files"
+
+        # Hash global append_system_prompt_files
+        local global_aspf
+        global_aspf=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        while IFS= read -r aspf; do
+            [[ -z "$aspf" ]] && continue
+            local abs_aspf="$GLOBAL_CONFIG_DIR/$aspf"
+            if [[ -f "$abs_aspf" ]]; then "$_SHASUM_CMD" "$abs_aspf" 2>/dev/null >> "$hash_tmp" || true; fi
+        done <<< "$global_aspf"
+
+        # Hash global settings file
+        local global_settings
+        global_settings=$(jq -r '.resources.settings // empty' "$GLOBAL_CONFIG" 2>/dev/null || true)
+        if [[ -n "$global_settings" ]]; then
+            local abs_gs="$GLOBAL_CONFIG_DIR/$global_settings"
+            if [[ -f "$abs_gs" ]]; then "$_SHASUM_CMD" "$abs_gs" 2>/dev/null >> "$hash_tmp" || true; fi
+        fi
     fi
 
     local result

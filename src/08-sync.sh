@@ -13,6 +13,8 @@ sync_source_dir() {
     CURRENT_SOURCE_MCP_SERVERS=()
     CURRENT_SOURCE_ADD_DIRS=()
     CURRENT_SOURCE_PROJECT_DIRS=()
+    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
+    CURRENT_SOURCE_SETTINGS_FILES=()
 
     # ── Copy agents ──
     local agents_dir="$source_dir/.claude/agents"
@@ -39,6 +41,26 @@ sync_source_dir() {
 
                 local abs_agent_file
                 abs_agent_file=$(cd "$(dirname "$agent_file")" && pwd -P)/$(basename "$agent_file")
+                # Security: reject symlinks pointing outside the source directory
+                if [[ -L "$agent_file" ]]; then
+                    local _link_val _real_target _real_source
+                    _link_val=$(readlink "$agent_file")
+                    # Resolve relative symlinks against the symlink's directory
+                    if [[ "$_link_val" != /* ]]; then
+                        _link_val="$(cd "$(dirname "$agent_file")" && pwd -P)/$_link_val"
+                    fi
+                    local _target_dir
+                    _target_dir=$(cd "$(dirname "$_link_val")" 2>/dev/null && pwd -P) || {
+                        echo -e "  ${YELLOW}skip agent:${NC} $agent_name (broken symlink)" >&2
+                        continue
+                    }
+                    _real_target="${_target_dir}/$(basename "$_link_val")"
+                    _real_source=$(cd "$source_dir" && pwd -P)
+                    if [[ "$_real_target" != "$_real_source"/* ]]; then
+                        echo -e "  ${YELLOW}skip agent:${NC} $agent_name (symlink escapes source directory)" >&2
+                        continue
+                    fi
+                fi
                 if [[ "$final_name" != "$agent_name" ]]; then
                     # Name changed — copy and rewrite name: in frontmatter
                     rewrite_frontmatter_name "$abs_agent_file" ".claude/agents/${dest_file}" "$final_name"
@@ -76,6 +98,15 @@ sync_source_dir() {
 
                 local abs_skill_path
                 abs_skill_path=$(cd "$skill_path" && pwd -P)
+                # Security: reject symlinks pointing outside the source directory
+                if [[ -L "${skill_path%/}" ]]; then
+                    local _real_source
+                    _real_source=$(cd "$source_dir" && pwd -P)
+                    if [[ "$abs_skill_path" != "$_real_source"/* ]]; then
+                        echo -e "  ${YELLOW}skip skill:${NC} $skill_name (symlink escapes source directory)" >&2
+                        continue
+                    fi
+                fi
                 ln -sf "$abs_skill_path" ".claude/skills/${skill_name}"
                 CURRENT_SOURCE_SKILLS+=("$skill_name")
                 echo -e "  ${GREEN}+skill:${NC} $skill_name" >&2
@@ -153,8 +184,8 @@ sync_source_dir() {
     # ── CLAUDE.md via --add-dir ──
     local claude_md
     claude_md=$(echo "$filter_json" | jq -r 'if has("claude_md") then .claude_md else true end')
-    if [[ "$claude_md" == "true" ]]; then
-        CURRENT_SOURCE_ADD_DIRS+=("$source_dir")
+    if [[ -f "$source_dir/CLAUDE.md" || -d "$source_dir/.claude" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("${source_dir}|${claude_md}")
     fi
 }
 
@@ -164,11 +195,21 @@ write_source_manifest() {
     local section="$1"
     local entry_name="$2"
 
-    local agents_json skills_json mcp_json dirs_json
+    local agents_json skills_json mcp_json
     agents_json=$(printf '%s\n' "${CURRENT_SOURCE_AGENTS[@]+"${CURRENT_SOURCE_AGENTS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
     skills_json=$(printf '%s\n' "${CURRENT_SOURCE_SKILLS[@]+"${CURRENT_SOURCE_SKILLS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
     mcp_json=$(printf '%s\n' "${CURRENT_SOURCE_MCP_SERVERS[@]+"${CURRENT_SOURCE_MCP_SERVERS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
-    dirs_json=$(printf '%s\n' "${CURRENT_SOURCE_ADD_DIRS[@]+"${CURRENT_SOURCE_ADD_DIRS[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+
+    # add_dirs: array of {path, claude_md} objects
+    local dirs_json="[]"
+    for entry in "${CURRENT_SOURCE_ADD_DIRS[@]+"${CURRENT_SOURCE_ADD_DIRS[@]}"}"; do
+        [[ -z "$entry" ]] && continue
+        local d="${entry%|*}"
+        local cmd="${entry##*|}"
+        dirs_json=$(echo "$dirs_json" | jq --arg d "$d" --arg c "$cmd" '. + [{path: $d, claude_md: ($c == "true")}]')
+    done
+
+    # project_dirs: array of {path, claude_md} objects
     local proj_dirs_json="[]"
     for entry in "${CURRENT_SOURCE_PROJECT_DIRS[@]+"${CURRENT_SOURCE_PROJECT_DIRS[@]}"}"; do
         [[ -z "$entry" ]] && continue
@@ -176,6 +217,14 @@ write_source_manifest() {
         local cmd="${entry##*|}"
         proj_dirs_json=$(echo "$proj_dirs_json" | jq --arg p "$p" --arg c "$cmd" '. + [{path: $p, claude_md: ($c == "true")}]')
     done
+
+    # system_prompt_files: array of absolute paths
+    local spf_json
+    spf_json=$(printf '%s\n' "${CURRENT_SOURCE_SYSTEM_PROMPT_FILES[@]+"${CURRENT_SOURCE_SYSTEM_PROMPT_FILES[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
+
+    # settings_files: array of absolute paths
+    local sf_json
+    sf_json=$(printf '%s\n' "${CURRENT_SOURCE_SETTINGS_FILES[@]+"${CURRENT_SOURCE_SETTINGS_FILES[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
 
     MANIFEST_JSON=$(echo "$MANIFEST_JSON" | jq \
         --arg section "$section" \
@@ -186,5 +235,7 @@ write_source_manifest() {
         --argjson mcp "$mcp_json" \
         --argjson dirs "$dirs_json" \
         --argjson pdirs "$proj_dirs_json" \
-        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs, source_name: $sname}')
+        --argjson spfiles "$spf_json" \
+        --argjson sfiles "$sf_json" \
+        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs, system_prompt_files: $spfiles, settings_files: $sfiles, source_name: $sname}')
 }

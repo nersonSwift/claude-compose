@@ -177,6 +177,30 @@ _validate_resources() {
                 return
             fi
         fi
+
+        # resources.append_system_prompt_files — array of strings
+        local aspf_type
+        aspf_type=$(jq -r 'if .resources | has("append_system_prompt_files") then .resources.append_system_prompt_files | type else "null" end' "$config_file")
+        if [[ "$aspf_type" != "null" && "$aspf_type" != "array" ]]; then
+            echo "\"resources.append_system_prompt_files\" must be an array, got: ${aspf_type}"
+            return
+        fi
+        if [[ "$aspf_type" == "array" ]]; then
+            local bad_aspf
+            bad_aspf=$(jq -r '.resources.append_system_prompt_files | to_entries[] | select((.value | type) != "string") | "resources.append_system_prompt_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+            if [[ -n "$bad_aspf" ]]; then
+                echo "$bad_aspf"
+                return
+            fi
+        fi
+
+        # resources.settings — string
+        local settings_type
+        settings_type=$(jq -r 'if .resources | has("settings") then .resources.settings | type else "null" end' "$config_file")
+        if [[ "$settings_type" != "null" && "$settings_type" != "string" ]]; then
+            echo "\"resources.settings\" must be a string, got: ${settings_type}"
+            return
+        fi
     fi
 }
 
@@ -406,11 +430,12 @@ validate_config_semantics() {
     fi
 
     local err
-    err=$(_validate_projects "$config_file"); [[ -n "$err" ]] && echo "$err" && return
-    err=$(_validate_resources "$config_file"); [[ -n "$err" ]] && echo "$err" && return
-    err=$(_validate_update_interval "$config_file"); [[ -n "$err" ]] && echo "$err" && return
-    err=$(_validate_workspaces "$config_file"); [[ -n "$err" ]] && echo "$err" && return
-    err=$(_validate_presets "$config_file"); [[ -n "$err" ]] && echo "$err" && return
+    err=$(_validate_projects "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_resources "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_update_interval "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_workspaces "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_presets "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    return 0
 }
 
 validate_global_config() {

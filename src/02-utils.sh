@@ -285,6 +285,22 @@ parse_args() {
     fi
 }
 
+# ── Merge compose settings ──────────────────────────────────────────
+# Merge compose-generated settings with user settings.
+# User settings take precedence; array keys (claudeMdExcludes) are concatenated.
+# $1 = compose JSON, $2 = user JSON
+merge_compose_settings() {
+    local base="$1" overlay="$2"
+    jq -n --argjson base "$base" --argjson overlay "$overlay" '
+        $base * $overlay +
+        (if ($base.claudeMdExcludes // null) != null and ($overlay.claudeMdExcludes // null) != null
+         then {claudeMdExcludes: (($base.claudeMdExcludes + $overlay.claudeMdExcludes) | unique)}
+         elif ($base.claudeMdExcludes // null) != null
+         then {claudeMdExcludes: $base.claudeMdExcludes}
+         else {} end)
+    '
+}
+
 # ── SHA tool detection (portability: macOS=shasum, Linux=sha256sum) ──
 # _SHASUM_CMD: used for file fingerprinting via xargs (SHA-1 on macOS, SHA-256 on Linux)
 # _shasum256: used for final content hash only
@@ -360,10 +376,38 @@ launch_doctor() {
     fi
 }
 
+# ERR trap: capture context of unexpected failures for doctor.
+# Saves failing command, line number, stack trace into DOCTOR_ERROR_MSG.
+_doctor_err_trap() {
+    # Capture BASH_COMMAND/LINENO immediately — they change on any statement
+    local _err_cmd=${BASH_COMMAND} _err_line=${BASH_LINENO[0]}
+    local _err_func=${FUNCNAME[1]:-main} _err_script=${BASH_SOURCE[0]:-$0}
+
+    # Skip if already captured (die_doctor or previous ERR)
+    case "${DOCTOR_ERROR_MSG:-}" in ?*) return 0 ;; esac
+
+    # Build stack trace
+    local _trace="" _i
+    for (( _i=1; _i < ${#FUNCNAME[@]}; _i++ )); do
+        _trace+="  ${FUNCNAME[$_i]}() at line ${BASH_LINENO[$((_i-1))]}"$'\n'
+    done
+
+    # Read the failing source line from the script
+    local _src_line=""
+    _src_line=$(sed -n "${_err_line}p" "$_err_script" 2>/dev/null) || true
+
+    DOCTOR_ERROR_MSG="Unexpected error in ${_err_func}() at line ${_err_line}
+Command: ${_err_cmd}
+Source:  ${_src_line:-(unable to read)}
+
+Stack trace:
+${_trace}"
+}
+
 _doctor_trap() {
     local exit_code=$?
-    # Remove trap to prevent recursion
-    trap - EXIT
+    # Remove traps to prevent recursion
+    trap - EXIT ERR
 
     # Release build lock if held (RETURN trap doesn't fire on exit)
     if [[ "${_BUILD_LOCK_HELD:-}" == true ]]; then
@@ -375,8 +419,8 @@ _doctor_trap() {
     # shellcheck disable=SC2034
     DOCTOR_ENABLED=false
 
-    if [[ "$was_enabled" == true && "$exit_code" -ne 0 && -n "$DOCTOR_ERROR_MSG" && "$DRY_RUN" != true ]]; then
-        launch_doctor "$DOCTOR_ERROR_MSG"
+    if [[ "$was_enabled" == true && "$exit_code" -ne 0 && "$DRY_RUN" != true ]]; then
+        launch_doctor "${DOCTOR_ERROR_MSG:-Unknown error (exit code $exit_code)}"
     fi
 }
 
@@ -398,10 +442,11 @@ atomic_write() {
 # $1 = input file, $2 = output file, $3 = new name
 rewrite_frontmatter_name() {
     local input="$1" output="$2" new_name="$3"
-    awk -v name="$new_name" '
+    # Pass name via environment to avoid awk -v interpreting backslash escapes
+    _AWK_NEW_NAME="$new_name" awk '
         BEGIN { in_fm = 0; fm_count = 0; done = 0 }
         /^---$/ { fm_count++; in_fm = (fm_count == 1) ? 1 : 0 }
-        in_fm && !done && /^name:/ { print "name: " name; done = 1; next }
+        in_fm && !done && /^name:/ { print "name: " ENVIRON["_AWK_NEW_NAME"]; done = 1; next }
         { print }
     ' "$input" > "$output"
 }

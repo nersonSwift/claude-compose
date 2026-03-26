@@ -19,7 +19,8 @@ extract_preset_filters() {
 # ── Process a single preset ─────────────────────────────────────────
 process_preset() {
     local preset_name="$1"
-    local filter_json="${2:-{}}"
+    local _empty_json='{}'
+    local filter_json="${2:-$_empty_json}"
     local preset_dir="${3:-}"  # optional resolved absolute path
 
     # Resolve directory
@@ -47,6 +48,7 @@ process_preset() {
     if [[ ! -f "$preset_config" ]]; then
         if [[ -f "$preset_dir/preset.json" || -f "$preset_dir/claude-compose.json" || -d "$preset_dir/.claude" ]]; then
             echo -e "${RED}Error: Preset '${preset_dir}' uses old format. Rename to $PRESET_CONFIG_FILE${NC}" >&2
+            die_doctor "Preset '$(basename "$preset_dir")' uses old config format. Rename claude-compose.json to $PRESET_CONFIG_FILE in ${preset_dir}"
         else
             echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in preset: ${preset_dir}${NC}" >&2
         fi
@@ -143,8 +145,8 @@ process_preset() {
     # CLAUDE.md via --add-dir (process_resources always resets arrays, even on early return)
     local claude_md
     claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
-    if [[ "$claude_md" == "true" && -f "$preset_dir/CLAUDE.md" ]]; then
-        CURRENT_SOURCE_ADD_DIRS+=("$preset_dir")
+    if [[ -f "$preset_dir/CLAUDE.md" || -d "$preset_dir/.claude" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("${preset_dir}|${claude_md}")
     fi
 
     # Collect preset's projects
@@ -264,7 +266,8 @@ process_resources() {
     local manifest_key="${5:-local}"
     local source_name="${6:-}"
     local skip_manifest="${7:-false}"
-    local filter_json="${8:-{}}"
+    local _empty_json='{}'
+    local filter_json="${8:-$_empty_json}"
 
     # Set source_name for manifest tracking (used by env var prefixing at launch time)
     CURRENT_SOURCE_NAME="$source_name"
@@ -275,6 +278,8 @@ process_resources() {
     CURRENT_SOURCE_MCP_SERVERS=()
     CURRENT_SOURCE_ADD_DIRS=()
     CURRENT_SOURCE_PROJECT_DIRS=()
+    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
+    CURRENT_SOURCE_SETTINGS_FILES=()
 
     local resources
     resources=$(jq -c '.resources // {}' "$config_file")
@@ -449,6 +454,28 @@ process_resources() {
         atomic_write ".mcp.json" "$tmp"
     fi
 
+    # Collect system_prompt_files and settings (only for preset/workspace sources — local/global are read directly at launch)
+    if [[ -n "$source_name" ]]; then
+        local aspf_list
+        aspf_list=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$config_file" 2>/dev/null || true)
+        while IFS= read -r aspf; do
+            [[ -z "$aspf" ]] && continue
+            local abs_aspf="$base_dir/$aspf"
+            if [[ -f "$abs_aspf" ]]; then
+                CURRENT_SOURCE_SYSTEM_PROMPT_FILES+=("$(cd "$(dirname "$abs_aspf")" && pwd -P)/$(basename "$abs_aspf")")
+            fi
+        done <<< "$aspf_list"
+
+        local settings_path
+        settings_path=$(jq -r '.resources.settings // empty' "$config_file" 2>/dev/null || true)
+        if [[ -n "$settings_path" ]]; then
+            local abs_sp="$base_dir/$settings_path"
+            if [[ -f "$abs_sp" ]]; then
+                CURRENT_SOURCE_SETTINGS_FILES+=("$(cd "$(dirname "$abs_sp")" && pwd -P)/$(basename "$abs_sp")")
+            fi
+        fi
+    fi
+
     if [[ "$skip_manifest" != "true" ]]; then
         write_source_manifest "$manifest_section" "$manifest_key"
     fi
@@ -475,6 +502,8 @@ process_builtin_skills() {
     CURRENT_SOURCE_MCP_SERVERS=()
     CURRENT_SOURCE_ADD_DIRS=()
     CURRENT_SOURCE_PROJECT_DIRS=()
+    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
+    CURRENT_SOURCE_SETTINGS_FILES=()
 
     mkdir -p ".claude/skills"
     for skill_path in "$BUILTIN_SKILLS_DIR"/*/; do
@@ -536,6 +565,8 @@ process_global() {
         CURRENT_SOURCE_MCP_SERVERS=()
         CURRENT_SOURCE_ADD_DIRS=()
         CURRENT_SOURCE_PROJECT_DIRS=()
+        CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
+        CURRENT_SOURCE_SETTINGS_FILES=()
 
         local gpi2
         for ((gpi2 = 0; gpi2 < global_project_count; gpi2++)); do
@@ -617,7 +648,12 @@ process_github_preset() {
 
     local preset_config="$preset_dir/$PRESET_CONFIG_FILE"
     if [[ ! -f "$preset_config" ]]; then
-        echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in GitHub preset: ${source_key}${NC}" >&2
+        if [[ -f "$preset_dir/claude-compose.json" || -f "$preset_dir/preset.json" ]]; then
+            echo -e "${RED}Error: GitHub preset '${source_key}' uses old config format. Needs $PRESET_CONFIG_FILE${NC}" >&2
+            die_doctor "GitHub preset '${source_key}' uses old config format. The preset author needs to rename claude-compose.json to $PRESET_CONFIG_FILE"
+        else
+            echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in GitHub preset: ${source_key}${NC}" >&2
+        fi
         return
     fi
 
@@ -723,8 +759,8 @@ process_github_preset() {
     # CLAUDE.md via --add-dir
     local claude_md
     claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
-    if [[ "$claude_md" == "true" && -f "$preset_dir/CLAUDE.md" ]]; then
-        CURRENT_SOURCE_ADD_DIRS+=("$preset_dir")
+    if [[ -f "$preset_dir/CLAUDE.md" || -d "$preset_dir/.claude" ]]; then
+        CURRENT_SOURCE_ADD_DIRS+=("${preset_dir}|${claude_md}")
     fi
 
     # Collect preset's projects
