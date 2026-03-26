@@ -117,10 +117,10 @@ claude-compose config -y ~/path       # quick-create config with one project
 claude-compose config --check         # validate config
 claude-compose migrate ~/project      # import config from existing project
 claude-compose copy ~/ws/src ~/ws/dst # clone workspace
-claude-compose update [source]       # update GitHub registry presets
-claude-compose registries            # list cached registries and versions
-claude-compose doctor                # diagnose and fix config problems
-claude-compose start ~/path          # create new workspace interactively
+claude-compose update [source]        # update GitHub registry presets
+claude-compose registries             # list GitHub presets and status
+claude-compose doctor                 # diagnose and fix config problems
+claude-compose start ~/path           # onboarding wizard
 claude-compose instructions           # show this guide
 claude-compose --dry-run              # preview without mutations
 claude-compose -- -p "prompt"         # pass args through to claude

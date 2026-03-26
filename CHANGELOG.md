@@ -4,7 +4,11 @@
 
 ### Breaking Changes
 
-- **Preset config renamed**: Preset config file renamed from `claude-compose.json` to `claude-compose-preset.json`. Existing presets using the old name will show a migration error. Workspace config remains `claude-compose.json`.
+- **Preset config renamed**: Preset config file renamed from `claude-compose.json` to `claude-compose-preset.json`. Workspace config remains `claude-compose.json`.
+  **Migration:** rename the config file in each local preset directory:
+  ```bash
+  mv ~/.claude-compose/presets/<name>/claude-compose.json ~/.claude-compose/presets/<name>/claude-compose-preset.json
+  ```
 
 ### Added
 

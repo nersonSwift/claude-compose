@@ -292,7 +292,7 @@ lock_read() {
 # $1 = lock dir path
 _acquire_lock() {
     local lock_dir="$1"
-    local attempts=0
+    local attempts=0 stale_retries=0
     while ! mkdir "$lock_dir" 2>/dev/null; do
         attempts=$((attempts + 1))
         if [[ "$attempts" -ge 25 ]]; then
@@ -303,14 +303,15 @@ _acquire_lock() {
                 echo -e "${YELLOW}Warning: Lock ${lock_dir} held by active process ${lock_pid}${NC}" >&2
                 return 1
             fi
-            # Stale lock — force-remove and retry
-            rm -rf "$lock_dir"
-            if ! mkdir "$lock_dir" 2>/dev/null; then
-                echo -e "${YELLOW}Warning: Failed to acquire lock ${lock_dir}${NC}" >&2
+            # Stale lock — force-remove and retry the loop
+            stale_retries=$((stale_retries + 1))
+            if [[ "$stale_retries" -ge 3 ]]; then
+                echo -e "${YELLOW}Warning: Failed to acquire lock ${lock_dir} after stale retries${NC}" >&2
                 return 1
             fi
-            echo "$$" > "$lock_dir/pid"
-            return 0
+            rm -rf "$lock_dir"
+            attempts=0
+            continue
         fi
         sleep 0.2
     done

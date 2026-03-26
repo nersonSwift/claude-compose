@@ -279,6 +279,8 @@ Global configuration at `~/.claude-compose/global.json` applies to all workspace
 }
 ```
 
+`update_interval` sets how often (in hours) to auto-check GitHub registry presets for updates. Set to `0` to disable. Default: no auto-checks.
+
 ## GitHub Registry Presets
 
 Presets can be sourced from GitHub repositories with semver versioning:
