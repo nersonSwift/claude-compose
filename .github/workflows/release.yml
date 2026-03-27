@@ -99,12 +99,11 @@ jobs:
           SHA256="${{ steps.sha.outputs.sha256 }}"
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/nersonSwift/homebrew-tap.git" /tmp/homebrew-tap
+
+          cp Formula/claude-compose.rb /tmp/homebrew-tap/Formula/claude-compose.rb
           cd /tmp/homebrew-tap
 
-          sed -i \
-            -e "s|url \".*\"|url \"https://github.com/nersonSwift/claude-compose/archive/refs/tags/v${VERSION}.tar.gz\"|" \
-            -e "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" \
-            Formula/claude-compose.rb
+          sed -i "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" Formula/claude-compose.rb
 
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
