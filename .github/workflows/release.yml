@@ -81,3 +81,34 @@ jobs:
 
             ---
             SHA256 (tar.gz): `${{ steps.sha.outputs.sha256 }}`
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set, skipping tap update"
+            exit 0
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::Unexpected version format '${VERSION}', skipping tap update"
+            exit 0
+          fi
+          SHA256="${{ steps.sha.outputs.sha256 }}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/nersonSwift/homebrew-tap.git" /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+
+          sed -i \
+            -e "s|url \".*\"|url \"https://github.com/nersonSwift/claude-compose/archive/refs/tags/v${VERSION}.tar.gz\"|" \
+            -e "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" \
+            Formula/claude-compose.rb
+
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add Formula/claude-compose.rb
+          git diff --cached --quiet && echo "No changes to formula" && exit 0
+          git commit -m "Update claude-compose to v${VERSION}"
+          git push origin main || echo "::warning::Failed to push tap update"

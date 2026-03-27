@@ -2,13 +2,14 @@
 class ClaudeCompose < Formula
   desc "Multi-project workspace launcher for Claude Code"
   homepage "https://github.com/nersonSwift/claude-compose"
-  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v2.0.0.tar.gz"
+  url "https://github.com/nersonSwift/claude-compose/archive/refs/tags/v#{version}.tar.gz"
   sha256 ""  # Updated by release workflow
   license "MIT"
 
   depends_on "jq"
 
   def install
+    system "make"
     bin.install "claude-compose"
   end
 
