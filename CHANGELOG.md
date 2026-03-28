@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.3.0] - 2026-03-28
+
+### Fixed
+- Homebrew release workflow: use explicit version in formula URL, copy full formula to tap instead of sed-patching
+- Release assets: include `claude-compose-wrapper` in GitHub Release and `.deb` package (previously only available via Homebrew source build)
+
 ## [2.2.0] - 2026-03-25
 
 ### Breaking Changes
