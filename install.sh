@@ -65,6 +65,12 @@ if ! head -1 "${INSTALL_DIR}/${BINARY_NAME}" | grep -q '^#!/usr/bin/env bash'; t
     exit 1
 fi
 
+# Download VS Code wrapper
+WRAPPER_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/claude-compose-wrapper"
+if _download_to "$WRAPPER_URL" "${INSTALL_DIR}/claude-compose-wrapper" 2>/dev/null; then
+    chmod +x "${INSTALL_DIR}/claude-compose-wrapper"
+fi
+
 # Check PATH
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
     echo ""

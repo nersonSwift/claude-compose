@@ -3,6 +3,7 @@ SOURCES := $(sort $(wildcard src/*.sh))
 PROMPTS := $(wildcard prompts/*.md)
 SKILLS := $(wildcard skills/*/SKILL.md)
 TARGET := claude-compose
+WRAPPER := claude-compose-wrapper
 
 .PHONY: clean lint
 
@@ -36,6 +37,8 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 		TAG_VER=$$(git describe --exact-match --tags HEAD 2>/dev/null | sed 's/^v//'); \
 		sed -i.bak "s/^VERSION=\".*\"/VERSION=\"$$TAG_VER\"/" $@ && rm -f $@.bak; \
 	fi
+	@cp scripts/vscode-wrapper.sh $(WRAPPER)
+	@chmod +x $(WRAPPER)
 	@echo "Done: $(TARGET) ($$(wc -l < $@) lines)"
 
 TEST_LIB := tests/test_helper/claude-compose-functions.sh
@@ -65,7 +68,7 @@ test-integration: $(TARGET) $(TEST_LIB)
 	@tests/lib/bats-core/bin/bats tests/integration/
 
 clean:
-	rm -f $(TARGET) $(TARGET).tmp $(TEST_LIB)
+	rm -f $(TARGET) $(TARGET).tmp $(WRAPPER) $(TEST_LIB)
 
 lint: $(TARGET)
 	shellcheck $(TARGET)

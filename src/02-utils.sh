@@ -13,6 +13,8 @@ usage() {
     echo "  claude-compose instructions"
     echo "  claude-compose doctor"
     echo "  claude-compose start [root-path]"
+    echo "  claude-compose wrap <claude-binary> [args...]"
+    echo "  claude-compose vscode [variant]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
     echo "  build         Build workspace from presets/workspaces/resources (auto on launch)"
@@ -24,6 +26,8 @@ usage() {
     echo "  instructions  Show instructions for managing workspace resources"
     echo "  doctor        Diagnose and fix compose problems"
     echo "  start         Onboarding wizard — scan for projects and create workspaces"
+    echo "  wrap          VS Code process wrapper mode (used internally by wrapper script)"
+    echo "  vscode        Set up VS Code integration (wrapper + .code-workspace)"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
@@ -45,6 +49,8 @@ usage() {
     echo "  claude-compose copy ~/ws/main ~/ws/feature  # Clone workspace"
     echo "  claude-compose doctor                        # Diagnose problems"
     echo "  claude-compose start ~/Code                  # Onboarding wizard"
+    echo "  claude-compose vscode                        # Set up VS Code integration"
+    echo "  claude-compose vscode cursor                 # Set up for Cursor editor"
     echo "  claude-compose --dry-run                    # Preview mode"
     echo "  claude-compose -- -p \"explain arch\"         # Pass args to claude"
 }
@@ -143,11 +149,28 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions|update|registries|doctor|start)
+            config|build|migrate|copy|instructions|update|registries|doctor|start|wrap|vscode)
                 SUBCOMMAND="$1"
                 shift
                 ;;
         esac
+    fi
+
+    # Wrap mode: capture all remaining args verbatim (no compose flag parsing)
+    # VS Code passes args like --output-format stream-json that would collide with compose flags
+    if [[ "$SUBCOMMAND" == "wrap" ]]; then
+        if [[ $# -lt 1 ]]; then
+            echo -e "${RED}Error: wrap requires claude binary path${NC}" >&2
+            echo "Usage: claude-compose wrap /path/to/claude [args...]" >&2
+            exit 1
+        fi
+        WRAP_CLAUDE_BIN="$1"
+        shift
+        WRAP_PASSTHROUGH_ARGS=("$@")
+        # shellcheck disable=SC2034
+        WRAP_MODE=true
+        CONFIG_FILE="claude-compose.json"
+        return
     fi
 
     while [[ $# -gt 0 ]]; do
@@ -240,6 +263,15 @@ parse_args() {
                     start)
                         if [[ -z "$START_PATH" && "$1" != -* ]]; then
                             START_PATH="$1"
+                        else
+                            echo -e "${RED}Unknown option: $1${NC}" >&2
+                            usage >&2
+                            exit 1
+                        fi
+                        ;;
+                    vscode)
+                        if [[ -z "$VSCODE_VARIANT" && "$1" != -* ]]; then
+                            VSCODE_VARIANT="$1"
                         else
                             echo -e "${RED}Unknown option: $1${NC}" >&2
                             usage >&2

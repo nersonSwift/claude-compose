@@ -122,6 +122,8 @@ claude-compose registries             # list GitHub presets and status
 claude-compose doctor                 # diagnose and fix config problems
 claude-compose start ~/path           # onboarding wizard
 claude-compose instructions           # show this guide
+claude-compose vscode [variant]      # set up VS Code integration
+claude-compose wrap <bin> [args...]  # VS Code process wrapper (internal)
 claude-compose --dry-run              # preview without mutations
 claude-compose -- -p "prompt"         # pass args through to claude
 ```

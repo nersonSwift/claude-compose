@@ -337,7 +337,7 @@ cmd_instructions() {
     echo "$prompt"
 }
 
-# ── Subcommand: config ───────────────────────────────────────────────
+# ── Subcommand: config ──────────────────────��────────────────────────
 cmd_config() {
     require_jq
 
@@ -535,6 +535,402 @@ cmd_start() {
     else
         claude --system-prompt "$prompt" "do it"
     fi
+}
+
+# ── Wrap Command (VS Code process wrapper) ────────────────────────────
+cmd_wrap() {
+    # 1. Validate claude binary exists and is executable
+    if [[ ! -x "$WRAP_CLAUDE_BIN" ]]; then
+        echo "claude-compose wrap: claude binary not found or not executable: $WRAP_CLAUDE_BIN" >&2
+        exit 1
+    fi
+
+    # 2. Resolve CONFIG_FILE to absolute path
+    if [[ -f "$CONFIG_FILE" ]]; then
+        CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$(basename "$CONFIG_FILE")"
+    fi
+
+    # 3. Graceful degradation: no config or invalid JSON → exec passthrough
+    if [[ ! -f "$CONFIG_FILE" ]] || ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+    fi
+
+    # 4. Reassign ORIGINAL_CWD to dirname of CONFIG_FILE (mimics normal mode)
+    ORIGINAL_CWD="$(dirname "$CONFIG_FILE")"
+
+    # 5. cd to workspace directory for relative path resolution
+    cd "$ORIGINAL_CWD"
+
+    # Set lock file path next to config
+    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
+    # 6. Disable doctor (no interactive stderr in stream-json mode)
+    DOCTOR_ENABLED=false
+
+    # 7. Validate in subshell with DRY_RUN=true
+    # validate() calls die_doctor/exit 1 on errors (not return 1).
+    # Subshell isolates exit so wrap can do graceful passthrough.
+    # DRY_RUN=true skips require_claude (claude may not be in PATH in wrap mode).
+    if ! (DRY_RUN=true validate 2>/dev/null); then
+        exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+    fi
+
+    # 8. Ensure built-in skills are extracted
+    ensure_builtin_skills
+
+    # 9. Auto-build if needed (suppress stderr — no banners in wrap mode)
+    local project_count preset_count ws_count has_resources has_global_config
+    project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
+    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
+    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
+    has_global_config=false
+    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
+
+    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+        # Nothing to compose — passthrough
+        exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+    fi
+
+    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
+        if needs_rebuild; then
+            # Suppress stderr (no banners in stream-json mode)
+            # On failure: fall back to passthrough rather than continuing with partial/stale config
+            if ! build "false" 2>/dev/null; then
+                exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+            fi
+
+            # Update .code-workspace if it already exists (keep in sync after rebuild)
+            local _ws_name _ws_file
+            _ws_name="$(basename "$PWD")"
+            _ws_file="${PWD}/${_ws_name}.code-workspace"
+            if [[ -f "$_ws_file" ]]; then
+                _generate_code_workspace "$PWD" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # 10. Load env files
+    load_global_env_files
+    load_env_files
+    load_all_source_env_files
+
+    # 11. Collect compose args using shared helpers (see src/08a-collect.sh)
+    _collect_project_args "false"
+    _init_system_prompt
+    _collect_manifest_args "false"
+    _build_settings "false" "true"
+
+    # --mcp-config with ABSOLUTE path (wrap-only: CWD may differ from workspace)
+    if [[ -f ".mcp.json" ]]; then
+        CLAUDE_ARGS+=("--mcp-config" "$(pwd -P)/.mcp.json")
+    fi
+
+    # 12. Merge --append-system-prompt from VS Code and compose
+
+    # Extract VS Code's --append-system-prompt from WRAP_PASSTHROUGH_ARGS
+    local vscode_system_prompt=""
+    local filtered_passthrough=()
+    local i=0
+    while [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]]; do
+        if [[ "${WRAP_PASSTHROUGH_ARGS[$i]}" == "--append-system-prompt" ]]; then
+            i=$((i + 1))
+            [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]] && vscode_system_prompt="${WRAP_PASSTHROUGH_ARGS[$i]}"
+        else
+            filtered_passthrough+=("${WRAP_PASSTHROUGH_ARGS[$i]}")
+        fi
+        i=$((i + 1))
+    done
+
+    # Extract compose's --append-system-prompt from CLAUDE_ARGS
+    local compose_system_prompt=""
+    local final_args=()
+    i=0
+    while [[ $i -lt ${#CLAUDE_ARGS[@]} ]]; do
+        if [[ "${CLAUDE_ARGS[$i]}" == "--append-system-prompt" ]]; then
+            i=$((i + 1))
+            [[ $i -lt ${#CLAUDE_ARGS[@]} ]] && compose_system_prompt="${CLAUDE_ARGS[$i]}"
+        else
+            final_args+=("${CLAUDE_ARGS[$i]}")
+        fi
+        i=$((i + 1))
+    done
+
+    # Merge: compose context first, then VS Code context
+    local merged_prompt=""
+    [[ -n "$compose_system_prompt" ]] && merged_prompt="$compose_system_prompt"
+    if [[ -n "$vscode_system_prompt" ]]; then
+        [[ -n "$merged_prompt" ]] && merged_prompt+=$'\n\n'
+        merged_prompt+="$vscode_system_prompt"
+    fi
+    [[ -n "$merged_prompt" ]] && final_args+=("--append-system-prompt" "$merged_prompt")
+
+    # 13. Add filtered passthrough args (VS Code args minus extracted --append-system-prompt)
+    if [[ ${#filtered_passthrough[@]} -gt 0 ]]; then
+        final_args+=("${filtered_passthrough[@]}")
+    fi
+
+    # 14. Set CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD if needed
+    if [[ "$HAS_ANY_ADD_DIR" == true ]]; then
+        export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
+    fi
+
+    # 15. exec claude — replaces process, preserves stream-json stdin/stdout pipe
+    exec "$WRAP_CLAUDE_BIN" "${final_args[@]+"${final_args[@]}"}"
+}
+
+# ── .code-workspace Generation ────────────────────────────────────────
+_generate_code_workspace() {
+    local ws_dir="$1"
+    local ws_name config_file manifest_file ws_file
+    ws_name="$(basename "$ws_dir")"
+    config_file="$ws_dir/claude-compose.json"
+    manifest_file="$ws_dir/.compose-manifest.json"
+    ws_file="$ws_dir/${ws_name}.code-workspace"
+
+    if [[ ! -f "$config_file" ]]; then
+        return
+    fi
+
+    # 1. Collect folders as JSON array: [{path, name, prefix}]
+    local folders_json='[]'
+
+    # 1a. Workspace dir itself
+    folders_json=$(jq -n --arg name "$ws_name" '[{path: ".", name: $name, prefix: "MainWS"}]')
+
+    # 1b. Projects from config
+    local projects_json
+    projects_json=$(jq '[
+        .projects // [] | .[] |
+        {
+            path: .path,
+            name: (.name // (.path | split("/") | last)),
+            prefix: "Project"
+        }
+    ]' "$config_file")
+    folders_json=$(echo "$folders_json" | jq --argjson p "$projects_json" '. + $p')
+
+    # 1c. Build path→name map from all reachable compose configs (for project alias lookup)
+    local path_name_map='{}'
+    # Main config projects
+    path_name_map=$(jq --arg home "$HOME" '[
+        .projects // [] | .[] |
+        select(.name) |
+        {key: (.path | sub("^~"; $home)), value: .name}
+    ] | from_entries' "$config_file")
+    # Workspace/preset configs referenced in manifest
+    if [[ -f "$manifest_file" ]]; then
+        local ws_key
+        while IFS= read -r ws_key; do
+            [[ -z "$ws_key" ]] && continue
+            local nested_config="$ws_key/claude-compose.json"
+            [[ ! -f "$nested_config" ]] && continue
+            local nested_map
+            nested_map=$(jq --arg home "$HOME" '[
+                .projects // [] | .[] |
+                select(.name) |
+                {key: (.path | sub("^~"; $home)), value: .name}
+            ] | from_entries' "$nested_config")
+            path_name_map=$(echo "$path_name_map" | jq --argjson n "$nested_map" '. + $n')
+        done < <(jq -r '[.global, .presets, .workspaces, .resources] | map(keys? // []) | add | .[]' "$manifest_file" 2>/dev/null)
+    fi
+
+    # 1d. add_dirs + project_dirs from manifest sections
+    if [[ -f "$manifest_file" ]]; then
+        local section prefix
+        for section in global presets workspaces resources; do
+            case "$section" in
+                workspaces) prefix="Workspace" ;;
+                *)          prefix="Preset" ;;
+            esac
+            local section_dirs
+            # add_dirs: use source_name for display name
+            section_dirs=$(jq --arg s "$section" --arg pfx "$prefix" '[
+                .[$s] // {} | to_entries[] |
+                .value.source_name as $sname |
+                (.value.add_dirs // []) |
+                [.[] | if type == "object" then .path else . end] | .[] |
+                {path: ., name: (if ($sname | length) > 0 then $sname else (. | split("/") | last) end), prefix: $pfx}
+            ]' "$manifest_file")
+            folders_json=$(echo "$folders_json" | jq --argjson d "$section_dirs" '. + $d')
+            # project_dirs: look up alias from path_name_map, fall back to basename
+            section_dirs=$(jq --arg s "$section" --arg pfx "Project" --argjson names "$path_name_map" '[
+                .[$s] // {} | to_entries[] |
+                (.value.project_dirs // []) |
+                [.[] | if type == "object" then .path else . end] | .[] |
+                {path: ., name: ($names[.] // (. | split("/") | last)), prefix: $pfx}
+            ]' "$manifest_file")
+            folders_json=$(echo "$folders_json" | jq --argjson d "$section_dirs" '. + $d')
+        done
+    fi
+
+    # 2. Expand ~ and resolve relative paths, then deduplicate (first wins)
+    folders_json=$(echo "$folders_json" | jq --arg ws "$ws_dir" --arg home "$HOME" '
+        reduce .[] as $entry ([];
+            ($entry.path | sub("^~"; $home)) as $expanded |
+            (if $expanded | startswith("/") then $expanded
+             else ($ws + "/" + $expanded) end) as $abs |
+            if any(.[]; ._abs == $abs) then .
+            else . + [$entry + {_abs: $abs} + (if $entry.path == "." then {} else {path: $abs} end)]
+            end
+        ) | [.[] | del(._abs)]
+    ')
+
+    # 3. Sort: Workspace first, then Project, then Preset
+    folders_json=$(echo "$folders_json" | jq '
+        sort_by(if .prefix == "MainWS" then 0 elif .prefix == "Workspace" then 1 elif .prefix == "Project" then 2 else 3 end)
+    ')
+
+    # 4. Convert to VS Code format: [{path, name: "Prefix / name"}]
+    local managed_folders
+    managed_folders=$(echo "$folders_json" | jq '[.[] | {path: .path, name: (.prefix + " / " + .name)}]')
+
+    # 5. Merge with existing file
+    local result
+    if [[ -f "$ws_file" ]] && jq empty "$ws_file" 2>/dev/null; then
+        result=$(jq --argjson managed "$managed_folders" '
+            ((.folders // []) | [.[] | select(
+                (.name // "") |
+                (startswith("MainWS / ") or startswith("Workspace / ") or startswith("Project / ") or startswith("Preset / ")) | not
+            )]) as $user |
+            . + {folders: ($user + $managed)}
+        ' "$ws_file")
+    else
+        result=$(echo "$managed_folders" | jq '{folders: ., settings: {}}')
+    fi
+
+    # 6. Write and report
+    atomic_write "$ws_file" "$result"
+    echo -e "${GREEN}Generated:${NC} ${ws_file}" >&2
+}
+
+# ── VS Code Setup Command ─────────────────────────────────────────────
+cmd_vscode() {
+    require_jq
+
+    local variant="${VSCODE_VARIANT:-code}"
+
+    # 1. Determine settings.json location per OS and variant
+    local settings_dir
+    case "$(uname)" in
+        Darwin)
+            case "$variant" in
+                code)     settings_dir="$HOME/Library/Application Support/Code/User" ;;
+                insiders) settings_dir="$HOME/Library/Application Support/Code - Insiders/User" ;;
+                cursor)   settings_dir="$HOME/Library/Application Support/Cursor/User" ;;
+                *)
+                    echo -e "${RED}Error: Unknown variant: ${variant}. Use: code, insiders, cursor${NC}" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        Linux)
+            case "$variant" in
+                code)     settings_dir="$HOME/.config/Code/User" ;;
+                insiders) settings_dir="$HOME/.config/Code - Insiders/User" ;;
+                cursor)   settings_dir="$HOME/.config/Cursor/User" ;;
+                *)
+                    echo -e "${RED}Error: Unknown variant: ${variant}. Use: code, insiders, cursor${NC}" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo -e "${RED}Error: Unsupported OS: $(uname). Only macOS and Linux are supported.${NC}" >&2
+            exit 1
+            ;;
+    esac
+
+    local settings_file="$settings_dir/settings.json"
+
+    # 2. Find wrapper script (shipped alongside binary)
+    local wrapper_path=""
+    local self_path self_dir
+    self_path="$(command -v claude-compose 2>/dev/null || echo "$0")"
+    # Resolve to absolute path if relative (ensures wrapper_path works from any CWD)
+    if [[ "$self_path" != /* ]]; then
+        self_path="$(cd "$(dirname "$self_path")" && pwd -P)/$(basename "$self_path")"
+    fi
+    self_dir="$(dirname "$self_path")"
+
+    if [[ -x "$self_dir/claude-compose-wrapper" ]]; then
+        wrapper_path="$(cd "$self_dir" && pwd -P)/claude-compose-wrapper"
+    elif command -v claude-compose-wrapper &>/dev/null; then
+        wrapper_path="$(command -v claude-compose-wrapper)"
+    fi
+
+    if [[ -z "$wrapper_path" ]]; then
+        echo -e "${RED}Error: claude-compose-wrapper not found.${NC}" >&2
+        echo "It should be installed alongside claude-compose." >&2
+        echo "Reinstall claude-compose or place claude-compose-wrapper in your PATH." >&2
+        exit 1
+    fi
+
+    # 3. Update VS Code settings.json
+    if [[ ! -d "$settings_dir" ]]; then
+        echo "" >&2
+        echo -e "${YELLOW}Settings directory not found:${NC} ${settings_dir}" >&2
+        echo "" >&2
+        echo "Add this to your VS Code settings.json manually:" >&2
+        echo "  \"claudeCode.claudeProcessWrapper\": \"${wrapper_path}\"" >&2
+        return
+    fi
+
+    if [[ ! -f "$settings_file" ]]; then
+        atomic_write "$settings_file" "{}"
+    fi
+
+    if ! jq empty "$settings_file" 2>/dev/null; then
+        echo "" >&2
+        echo -e "${RED}Error: Invalid JSON in ${settings_file}${NC}" >&2
+        echo "" >&2
+        echo "Add this to your VS Code settings.json manually:" >&2
+        echo "  \"claudeCode.claudeProcessWrapper\": \"${wrapper_path}\"" >&2
+        return
+    fi
+
+    local updated
+    updated=$(jq --arg w "$wrapper_path" '."claudeCode.claudeProcessWrapper" = $w' "$settings_file")
+    atomic_write "$settings_file" "$updated"
+
+    echo -e "${GREEN}Updated:${NC} ${settings_file}" >&2
+    echo "  claudeCode.claudeProcessWrapper = ${wrapper_path}" >&2
+
+    # ── Generate .code-workspace ─────────────────────────────────────
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local ws_dir
+        ws_dir="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)"
+
+        # Ensure manifest is up-to-date
+        (cd "$ws_dir" && {
+            if needs_rebuild; then
+                build "false"
+            fi
+        })
+
+        _generate_code_workspace "$ws_dir"
+    else
+        echo "" >&2
+        echo -e "${YELLOW}No claude-compose.json found. Skipping .code-workspace generation.${NC}" >&2
+        echo "  Run 'claude-compose config' first, then 'claude-compose vscode' again." >&2
+    fi
+
+    # ── Success message ──────────────────────────────────────────────
+    echo "" >&2
+    echo -e "${BOLD}VS Code integration configured!${NC}" >&2
+    echo "" >&2
+    echo "Next steps:" >&2
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local ws_name
+        ws_name="$(basename "$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)")"
+        echo "  Open ${ws_name}.code-workspace in VS Code (File → Open Workspace from File)" >&2
+    else
+        echo "  1. Run 'claude-compose config' to create a config" >&2
+        echo "  2. Run 'claude-compose vscode' again to generate .code-workspace" >&2
+    fi
+    echo "" >&2
+    echo "To remove: delete claudeCode.claudeProcessWrapper from VS Code settings" >&2
+    echo "(Cmd+Shift+P → Preferences: Open Settings (JSON))." >&2
 }
 
 # ── Registries Command ─────────────────────────────────────────────────

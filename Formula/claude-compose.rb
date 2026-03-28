@@ -11,6 +11,7 @@ class ClaudeCompose < Formula
   def install
     system "make"
     bin.install "claude-compose"
+    bin.install "claude-compose-wrapper"
   end
 
   test do

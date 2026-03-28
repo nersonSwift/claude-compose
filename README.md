@@ -53,6 +53,10 @@ curl -fsSL https://raw.githubusercontent.com/nersonSwift/claude-compose/main/ins
 ```bash
 curl -fsSL https://github.com/nersonSwift/claude-compose/releases/latest/download/claude-compose -o ~/.local/bin/claude-compose
 chmod +x ~/.local/bin/claude-compose
+
+# Optional: VS Code wrapper (needed for `claude-compose vscode`)
+curl -fsSL https://github.com/nersonSwift/claude-compose/releases/latest/download/claude-compose-wrapper -o ~/.local/bin/claude-compose-wrapper
+chmod +x ~/.local/bin/claude-compose-wrapper
 ```
 
 ## Requirements
@@ -330,7 +334,31 @@ claude-compose start ~/Code
 
 # Show instructions for managing workspace resources
 claude-compose instructions
+
+# Set up VS Code integration
+claude-compose vscode
 ```
+
+## VS Code Integration
+
+Use claude-compose workspaces directly in the Claude Code VS Code extension:
+
+```bash
+# Set up VS Code integration
+claude-compose vscode
+
+# Or specify variant
+claude-compose vscode insiders
+claude-compose vscode cursor
+```
+
+This does two things:
+1. Configures `claudeCode.claudeProcessWrapper` in VS Code settings.json to route Claude through claude-compose
+2. Generates a `.code-workspace` file with all project folders
+
+Open the generated `.code-workspace` file in VS Code, and Claude Code will automatically use your compose configuration (MCP servers, agents, skills, system prompt, env vars).
+
+To remove: delete `claudeCode.claudeProcessWrapper` from VS Code settings (Cmd+Shift+P → Preferences: Open Settings (JSON)).
 
 ## How it works
 

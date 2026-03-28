@@ -19,6 +19,11 @@ COPY_SOURCE=""          # positional arg for copy
 COPY_DEST=""            # positional arg for copy
 UPDATE_SOURCE=""        # optional positional arg for update
 START_PATH=""            # positional arg for start
+WRAP_CLAUDE_BIN=""          # Path to claude binary (wrap mode only)
+WRAP_PASSTHROUGH_ARGS=()    # VS Code args to pass through in wrap mode
+# shellcheck disable=SC2034
+WRAP_MODE=false             # true when running as wrap subcommand
+VSCODE_VARIANT=""           # "code", "insiders", "cursor" for vscode subcommand
 DOCTOR_ERROR_MSG=""      # Error message for doctor mode
 DOCTOR_ENABLED=true      # false prevents doctor trap (when claude/jq missing)
 PRESET_CONFIG_FILE="claude-compose-preset.json"
@@ -45,6 +50,11 @@ CURRENT_PRESET_RENAME='{}'
 CURRENT_SOURCE_NAME=""
 _BUILD_LOCK_HELD=false
 _MCP_EMPTY='{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}'
+
+# Shared collection state (set by _collect_project_args / _collect_manifest_args / _build_settings)
+_PROJECT_ALIASES=""
+_SYSTEM_PROMPT=""
+_COMPOSE_SETTINGS='{}'
 
 # ── Colors ───────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
