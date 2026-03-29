@@ -17,7 +17,7 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(PLUGIN_FILES)
 			*__PROMPT_COMPOSE_INSTRUCTIONS__*) cat prompts/compose-instructions.md ;; \
 			*__PROMPT_COMPOSE_DOCTOR__*) cat prompts/compose-doctor.md ;; \
 			*__PROMPT_COMPOSE_START__*) cat prompts/compose-start.md ;; \
-		*__PROMPT_COMPOSE_KNOWLEDGE__*) cat prompts/compose-knowledge.md ;; \
+			*__PROMPT_COMPOSE_KNOWLEDGE__*) cat prompts/compose-knowledge.md ;; \
 			*__EMBEDDED_PLUGIN__*) \
 				echo 'extract_embedded_plugin() {'; \
 				echo '    local dest="$$1"'; \

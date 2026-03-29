@@ -57,7 +57,7 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
 
 2. **Analyze** the error and identify ALL problems — not just the reported one. Check:
    - JSON syntax validity
-   - Required fields (every project needs `"name"`)
+   - Required fields (top-level `"name"`, every project needs `"name"`)
    - Field types match schema
    - Referenced plugins exist (marketplace names valid, local paths exist)
    - Referenced project paths exist (expand `~` to `$HOME` when checking)
@@ -111,6 +111,10 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
 - **Symptom**: `jq` parse error
 - **Cause**: Trailing commas, missing quotes, unmatched braces, bad escaping
 - **Fix**: Read the file, find the syntax error, rewrite the corrected JSON
+
+### Missing workspace name
+- **Symptom**: "Required field \"name\" is missing"
+- **Fix**: Add top-level `"name"` field to config. Use a short, filesystem-safe identifier (letters, digits, dots, hyphens, underscores). Example: `"name": "my-project"`
 
 ### Missing project name
 - **Symptom**: "Each project must have a name field"

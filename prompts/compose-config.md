@@ -12,6 +12,7 @@ Top-level fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `name` | string | **required** | Workspace name (used for .code-workspace filename, letters/digits/dots/hyphens/underscores) |
 | `projects` | array | `[]` | List of external projects for file access |
 | `resources` | object | `{}` | Local agents, skills, MCP servers, env files |
 | `workspaces` | array | `[]` | Other workspaces to sync config from |

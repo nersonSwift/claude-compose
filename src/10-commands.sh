@@ -422,7 +422,48 @@ cmd_start() {
     fi
 }
 
-# ── Wrap Command (VS Code process wrapper) ────────────────────────────
+# ── Wrap Doctor Helper ─────────────────────────────────────────────────
+# Launch doctor session through the IDE's claude binary, preserving all IDE flags.
+# Replaces --append-system-prompt with doctor --system-prompt.
+# Injects initial "fix it" message via stdin pipe (stream-json format).
+_wrap_launch_doctor() {
+    local error_msg="${1:-Config validation failed}"
+    local ws_dir="${WORKSPACE_DIR:-$(dirname "$CONFIG_FILE")}"
+
+    local prompt
+    prompt=$(compose_doctor_prompt "$CONFIG_FILE" "$ws_dir" "$error_msg")
+
+    # Keep all IDE flags except --append-system-prompt (replaced by --system-prompt).
+    # ALL other flags (--input-format, --output-format, --verbose, -p) stay intact.
+    local doctor_args=()
+    local i=0
+    while [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]]; do
+        case "${WRAP_PASSTHROUGH_ARGS[$i]}" in
+            --append-system-prompt)
+                i=$((i + 1))  # skip value
+                ;;
+            *)
+                doctor_args+=("${WRAP_PASSTHROUGH_ARGS[$i]}")
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    doctor_args+=("--system-prompt" "$prompt")
+    doctor_args+=("--name" "compose-doctor")
+
+    # Inject initial "fix it" message via stdin in stream-json format,
+    # then forward remaining IDE stdin via cat.
+    # Cannot use exec here because we need to prepend to stdin.
+    # Foreground pipeline: cat inherits real stdin (IDE), signals propagate naturally.
+    {
+        printf '{"type":"user","message":{"role":"user","content":"fix it"}}\n'
+        cat
+    } | "$WRAP_CLAUDE_BIN" "${doctor_args[@]}"
+    exit $?
+}
+
+# ── Wrap Command (IDE process wrapper) ────────────────────────────────
 cmd_wrap() {
     # 1. Validate claude binary exists and is executable
     if [[ ! -x "$WRAP_CLAUDE_BIN" ]]; then
@@ -435,24 +476,30 @@ cmd_wrap() {
         CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$(basename "$CONFIG_FILE")"
     fi
 
-    # 3. Graceful degradation: no config or invalid JSON → exec passthrough
-    if [[ ! -f "$CONFIG_FILE" ]] || ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+    # 3. No config → passthrough (no compose workspace here)
+    if [[ ! -f "$CONFIG_FILE" ]]; then
         exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+    fi
+
+    # 3a. Invalid JSON → launch doctor in IDE
+    if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local _json_err
+        _json_err=$(jq empty "$CONFIG_FILE" 2>&1 || true)
+        _wrap_launch_doctor "Invalid JSON in ${CONFIG_FILE}: ${_json_err}"
     fi
 
     # 4. Resolve workspace directory (sets CONFIG_DIR, WORKSPACE_DIR, cd to WORKSPACE_DIR)
     _resolve_workspace_dir
 
-    # 6. Disable doctor (no interactive stderr in stream-json mode)
+    # 6. Disable trap-based doctor (wrap uses _wrap_launch_doctor instead)
     DOCTOR_ENABLED=false
 
-    # 7. Validate in subshell with DRY_RUN=true
-    # validate() calls die_doctor/exit 1 on errors (not return 1).
-    # Subshell isolates exit so wrap can do graceful passthrough.
-    # DRY_RUN=true skips require_claude (claude may not be in PATH in wrap mode).
-    if ! (DRY_RUN=true validate 2>/dev/null); then
-        exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
-    fi
+    # 7. Validate — on failure, launch doctor in IDE
+    local _validate_err=""
+    _validate_err=$(DRY_RUN=true validate 2>&1 >/dev/null) || {
+        _wrap_launch_doctor "${_validate_err:-Config validation failed}"
+    }
+
 
     # 8. Ensure built-in plugin is extracted
     ensure_builtin_plugin
@@ -467,15 +514,16 @@ cmd_wrap() {
     fi
 
     if _has_anything_to_build && needs_rebuild; then
-        # Suppress stderr (no banners in stream-json mode)
-        # On failure: fall back to passthrough rather than continuing with partial/stale config
-        if ! build "false" 2>/dev/null; then
-            exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
-        fi
+        # On failure: launch doctor in IDE
+        local _build_err=""
+        _build_err=$(build "false" 2>&1 >/dev/null) || {
+            _wrap_launch_doctor "${_build_err:-Build failed}"
+        }
 
         # Update .code-workspace if it already exists (keep in sync after rebuild)
         local _ws_name _ws_file
-        _ws_name="$(basename "$PWD")"
+        _ws_name=$(jq -r '.name // empty' "$CONFIG_FILE" 2>/dev/null)
+        [[ -z "$_ws_name" ]] && _ws_name="$(basename "$PWD")"
         _ws_file="${PWD}/${_ws_name}.code-workspace"
         if [[ -f "$_ws_file" ]]; then
             _generate_code_workspace "$PWD" 2>/dev/null || true
@@ -503,14 +551,14 @@ cmd_wrap() {
 
     # 12. Merge --append-system-prompt from VS Code and compose
 
-    # Extract VS Code's --append-system-prompt from WRAP_PASSTHROUGH_ARGS
-    local vscode_system_prompt=""
+    # Extract IDE's --append-system-prompt from WRAP_PASSTHROUGH_ARGS
+    local ide_system_prompt=""
     local filtered_passthrough=()
     local i=0
     while [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]]; do
         if [[ "${WRAP_PASSTHROUGH_ARGS[$i]}" == "--append-system-prompt" ]]; then
             i=$((i + 1))
-            [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]] && vscode_system_prompt="${WRAP_PASSTHROUGH_ARGS[$i]}"
+            [[ $i -lt ${#WRAP_PASSTHROUGH_ARGS[@]} ]] && ide_system_prompt="${WRAP_PASSTHROUGH_ARGS[$i]}"
         else
             filtered_passthrough+=("${WRAP_PASSTHROUGH_ARGS[$i]}")
         fi
@@ -534,9 +582,9 @@ cmd_wrap() {
     # Merge: compose context first, then VS Code context
     local merged_prompt=""
     [[ -n "$compose_system_prompt" ]] && merged_prompt="$compose_system_prompt"
-    if [[ -n "$vscode_system_prompt" ]]; then
+    if [[ -n "$ide_system_prompt" ]]; then
         [[ -n "$merged_prompt" ]] && merged_prompt+=$'\n\n'
-        merged_prompt+="$vscode_system_prompt"
+        merged_prompt+="$ide_system_prompt"
     fi
     [[ -n "$merged_prompt" ]] && final_args+=("--append-system-prompt" "$merged_prompt")
 
@@ -558,8 +606,11 @@ cmd_wrap() {
 _generate_code_workspace() {
     local ws_dir="$1"
     local ws_name config_file manifest_file ws_file
-    ws_name="$(basename "$ws_dir")"
     config_file="$ws_dir/claude-compose.json"
+    ws_name=$(jq -r '.name // empty' "$config_file" 2>/dev/null)
+    if [[ -z "$ws_name" ]]; then
+        ws_name="$(basename "$ws_dir")"
+    fi
     manifest_file="$ws_dir/$COMPOSE_MANIFEST"
     ws_file="$ws_dir/${ws_name}.code-workspace"
 
@@ -681,11 +732,11 @@ _generate_code_workspace() {
     echo -e "${GREEN}Generated:${NC} ${ws_file}" >&2
 }
 
-# ── VS Code Setup Command ─────────────────────────────────────────────
-cmd_vscode() {
+# ── IDE Setup Command ─────────────────────────────────────────────────
+cmd_ide() {
     require_jq
 
-    local variant="${VSCODE_VARIANT:-code}"
+    local variant="${IDE_VARIANT:-code}"
 
     # 1. Determine settings.json location per OS and variant
     local settings_dir
@@ -786,24 +837,25 @@ cmd_vscode() {
     else
         echo "" >&2
         echo -e "${YELLOW}No claude-compose.json found. Skipping .code-workspace generation.${NC}" >&2
-        echo "  Run 'claude-compose config' first, then 'claude-compose vscode' again." >&2
+        echo "  Run 'claude-compose config' first, then 'claude-compose ide' again." >&2
     fi
 
     # ── Success message ──────────────────────────────────────────────
     echo "" >&2
-    echo -e "${BOLD}VS Code integration configured!${NC}" >&2
+    echo -e "${BOLD}IDE integration configured!${NC}" >&2
     echo "" >&2
     echo "Next steps:" >&2
     if [[ -f "$CONFIG_FILE" ]]; then
         local ws_name
-        ws_name="$(basename "$WORKSPACE_DIR")"
-        echo "  Open ${ws_name}.code-workspace in VS Code (File → Open Workspace from File)" >&2
+        ws_name=$(jq -r '.name // empty' "$CONFIG_FILE" 2>/dev/null)
+        [[ -z "$ws_name" ]] && ws_name="$(basename "$WORKSPACE_DIR")"
+        echo "  Open ${ws_name}.code-workspace in your IDE (File → Open Workspace from File)" >&2
     else
         echo "  1. Run 'claude-compose config' to create a config" >&2
-        echo "  2. Run 'claude-compose vscode' again to generate .code-workspace" >&2
+        echo "  2. Run 'claude-compose ide' again to generate .code-workspace" >&2
     fi
     echo "" >&2
-    echo "To remove: delete claudeCode.claudeProcessWrapper from VS Code settings" >&2
-    echo "(Cmd+Shift+P → Preferences: Open Settings (JSON))." >&2
+    echo "To remove: delete claudeCode.claudeProcessWrapper from your IDE settings" >&2
+    echo "(VS Code: Cmd+Shift+P → Preferences: Open Settings (JSON))." >&2
 }
 

@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/nersonSwift/claude-compose/main/ins
 curl -fsSL https://github.com/nersonSwift/claude-compose/releases/latest/download/claude-compose -o ~/.local/bin/claude-compose
 chmod +x ~/.local/bin/claude-compose
 
-# Optional: VS Code wrapper (needed for `claude-compose vscode`)
+# Optional: IDE wrapper (needed for `claude-compose ide`)
 curl -fsSL https://github.com/nersonSwift/claude-compose/releases/latest/download/claude-compose-wrapper -o ~/.local/bin/claude-compose-wrapper
 chmod +x ~/.local/bin/claude-compose-wrapper
 ```
@@ -63,6 +63,7 @@ This creates `claude-compose.json`:
 
 ```json
 {
+  "name": "my-workspace",
   "projects": [
     { "path": "~/Code/my-app", "name": "my-app" }
   ]
@@ -103,6 +104,7 @@ Edit `claude-compose.json` directly or use `claude-compose config`:
 
 ```json
 {
+  "name": "my-workspace",
   "projects": [
     { "path": "~/Code/my-app", "name": "app" },
     { "path": "~/Code/my-lib", "name": "lib" },
@@ -152,7 +154,7 @@ This copies the project's `.claude/` config into your workspace. See [Commands](
 - [Commands](commands.md) — all CLI commands and flags
 - [Workspaces](workspaces.md) — sync config from other workspaces
 - [Plugins](plugins.md) — marketplace and local plugins
-- [VS Code Integration](vscode.md) — use with VS Code or Cursor
+- [IDE Integration](ide.md) — use with VS Code or Cursor
 - [Global Config](global-config.md) — config that applies everywhere
 - [Troubleshooting](troubleshooting.md) — common errors and FAQ
 

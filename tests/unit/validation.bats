@@ -211,12 +211,64 @@ teardown() {
     assert_output --partial "must have a \"repo\" field"
 }
 
+# ── _validate_name ────────────────────────────────────────────────
+
+@test "_validate_name: valid name passes" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":"my-project"}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output ""
+}
+
+@test "_validate_name: single character name passes" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":"a"}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output ""
+}
+
+@test "_validate_name: missing name produces error" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"projects":[]}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output --partial "Required field \"name\" is missing"
+}
+
+@test "_validate_name: non-string type produces error" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":42}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output --partial "must be a string"
+}
+
+@test "_validate_name: name with spaces produces error" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":"my project"}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output --partial "invalid characters"
+}
+
+@test "_validate_name: name starting with dash produces error" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":"-bad"}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output --partial "invalid characters"
+}
+
+@test "_validate_name: name with dots and hyphens passes" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"name":"my-project.v2"}' > "$cfg"
+    run _validate_name "$cfg"
+    assert_output ""
+}
+
 # ── validate_config_semantics ─────────────────────────────────────
 
 @test "validate_config_semantics: config with all valid sections has empty stdout" {
     local cfg="${TEST_TEMP_DIR}/cfg.json"
     cat > "$cfg" <<'JSON'
 {
+    "name": "test-ws",
     "projects": [{"name":"app","path":"/tmp"}],
     "resources": {"agents":["a.md"]},
     "workspaces": [{"path":"~/other"}]
@@ -237,12 +289,13 @@ JSON
 
 @test "validate_config_semantics: first error stops validation" {
     local cfg="${TEST_TEMP_DIR}/cfg.json"
-    # projects error should be reported; resources error should not appear
+    # name error should be reported; projects/resources errors should not appear
     echo '{"projects":"bad","resources":"bad"}' > "$cfg"
     local captured_stdout
     captured_stdout=$(validate_config_semantics "$cfg" 2>/dev/null)
-    echo "$captured_stdout" | grep -qF "projects"
-    # Should NOT contain resources error
+    echo "$captured_stdout" | grep -qF "name"
+    # Should NOT contain projects or resources error (stopped at name)
+    ! echo "$captured_stdout" | grep -qF "projects"
     ! echo "$captured_stdout" | grep -qF "resources"
 }
 

@@ -36,7 +36,7 @@ main() {
         instructions) cmd_instructions; return ;;
         doctor) cmd_doctor; return ;;
         start) cmd_start; return ;;
-        vscode) cmd_vscode; return ;;
+        ide) cmd_ide; return ;;
     esac
 
     validate

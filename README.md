@@ -32,6 +32,7 @@ claude-compose
 
 ```json
 {
+  "name": "my-workspace",
   "projects": [
     { "path": "~/Code/app", "name": "app" },
     { "path": "~/Code/lib", "name": "lib" }
@@ -59,7 +60,7 @@ claude-compose migrate <project>      # Import from project
 claude-compose copy <src> [dst]       # Clone workspace
 claude-compose doctor                 # Diagnose problems
 claude-compose start [root]           # Onboarding wizard
-claude-compose vscode [variant]       # VS Code/Cursor setup
+claude-compose ide [variant]          # IDE setup (VS Code/Cursor)
 claude-compose instructions           # Show guide
 claude-compose --dry-run              # Preview mode
 ```
@@ -74,7 +75,7 @@ claude-compose --dry-run              # Preview mode
 | [Workspaces](docs/workspaces.md) | Cross-workspace sync with filters |
 | [Plugins](docs/plugins.md) | Marketplace and local plugins |
 | [Environment](docs/environment.md) | Env files, secrets, variable isolation |
-| [VS Code](docs/vscode.md) | VS Code and Cursor integration |
+| [IDE Integration](docs/ide.md) | VS Code and Cursor integration |
 | [Global Config](docs/global-config.md) | Config that applies everywhere |
 | [Troubleshooting](docs/troubleshooting.md) | Doctor mode, common errors, FAQ |
 | [Architecture](docs/architecture.md) | Internals, build pipeline, security |

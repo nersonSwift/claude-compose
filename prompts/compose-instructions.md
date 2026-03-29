@@ -71,6 +71,7 @@ Same schema as `claude-compose.json`. Applied automatically to all workspaces, n
 
 ```json
 {
+  "name": "my-workspace",
   "resources": {
     "agents": ["agents/reviewer.md"],
     "skills": ["skills/commit"],
@@ -126,8 +127,8 @@ claude-compose copy ~/ws/src ~/ws/dst # clone workspace
 claude-compose doctor                 # diagnose and fix config problems
 claude-compose start ~/path           # onboarding wizard
 claude-compose instructions           # show this guide
-claude-compose vscode [variant]      # set up VS Code integration
-claude-compose wrap <bin> [args...]  # VS Code process wrapper (internal)
+claude-compose ide [variant]         # set up IDE integration (VS Code / Cursor)
+claude-compose wrap <bin> [args...]  # IDE process wrapper (internal)
 claude-compose --dry-run              # preview without mutations
 claude-compose -- -p "prompt"         # pass args through to claude
 ```

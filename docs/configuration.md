@@ -8,6 +8,7 @@ Complete reference for `claude-compose.json`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `name` | string | **required** | Workspace name (used for `.code-workspace` filename; letters, digits, dots, hyphens, underscores) |
 | `projects` | array | `[]` | External projects for file access |
 | `resources` | object | `{}` | Local agents, skills, MCP servers, env files |
 | `workspaces` | array | `[]` | Other workspaces to sync config from |
@@ -163,6 +164,7 @@ Run `claude-compose config --check` to validate without launching. Common errors
 
 | Error | Fix |
 |-------|-----|
+| "Required field `name` is missing" | Add top-level `"name"` field to config |
 | "Each project must have a `name` field" | Add `"name"` to each project |
 | "Each project must have a `path` field" | Add `"path"` to each project |
 | "Duplicate project name" | Each project needs a unique `name` |
@@ -174,6 +176,7 @@ Run `claude-compose config --check` to validate without launching. Common errors
 
 ```json
 {
+  "name": "my-workspace",
   "projects": [
     { "path": "~/Code/frontend", "name": "web" },
     { "path": "~/Code/backend", "name": "api" },

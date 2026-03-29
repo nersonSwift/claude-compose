@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-compose VS Code process wrapper.
-# Set as claudeCode.claudeProcessWrapper in VS Code settings.
-# See: claude-compose vscode --help
+# claude-compose IDE process wrapper.
+# Set as claudeCode.claudeProcessWrapper in your IDE settings.
+# See: claude-compose ide --help
 exec claude-compose wrap "$@"

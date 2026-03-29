@@ -347,11 +347,33 @@ _validate_marketplaces() {
     done <<< "$mkt_keys"
 }
 
+_validate_name() {
+    local config_file="$1"
+    local name
+    name=$(jq -r '.name // empty' "$config_file")
+    if [[ -z "$name" ]]; then
+        echo "Required field \"name\" is missing. Example: \"name\": \"my-project\""
+        return
+    fi
+    local name_type
+    name_type=$(jq -r '.name | type' "$config_file")
+    if [[ "$name_type" != "string" ]]; then
+        echo "\"name\" must be a string, got: ${name_type}"
+        return
+    fi
+    # Validate filesystem-safe characters (no spaces)
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        echo "\"name\" contains invalid characters. Use: letters, digits, dots, hyphens, underscores. Must start with letter or digit."
+        return
+    fi
+}
+
 validate_config_semantics() {
     local config_file="$1"
+    local is_global="${2:-false}"
 
     # Warn on unknown top-level keys
-    local known_keys='["projects","presets","workspaces","resources","update_interval","plugins","marketplaces","workspace_path"]'
+    local known_keys='["name","projects","presets","workspaces","resources","update_interval","plugins","marketplaces","workspace_path"]'
     local unknown_keys
     unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
     if [[ -n "$unknown_keys" ]]; then
@@ -370,6 +392,10 @@ validate_config_semantics() {
     fi
 
     local err
+    # name is required only for workspace configs, not global
+    if [[ "$is_global" != "true" ]]; then
+        err=$(_validate_name "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    fi
     err=$(_validate_projects "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
     err=$(_validate_resources "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
     err=$(_validate_workspace_path "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
@@ -391,7 +417,7 @@ validate_global_config() {
     fi
 
     local semantic_error
-    semantic_error=$(validate_config_semantics "$GLOBAL_CONFIG")
+    semantic_error=$(validate_config_semantics "$GLOBAL_CONFIG" "true")
     if [[ -n "$semantic_error" ]]; then
         echo -e "${RED}Global config error (${GLOBAL_CONFIG}): ${semantic_error}${NC}" >&2
         die_doctor "Global config error: ${semantic_error}"

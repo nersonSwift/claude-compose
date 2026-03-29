@@ -219,12 +219,12 @@ Displays how to add resources, best practices, and the current workspace state. 
 
 ---
 
-## claude-compose vscode
+## claude-compose ide
 
-Set up VS Code or Cursor integration.
+Set up IDE integration (VS Code, Cursor).
 
 ```bash
-claude-compose vscode [variant]
+claude-compose ide [variant]
 ```
 
 | Variant | Editor |
@@ -233,20 +233,20 @@ claude-compose vscode [variant]
 | `insiders` | VS Code Insiders |
 | `cursor` | Cursor |
 
-See [VS Code Integration](vscode.md) for full details.
+See [IDE Integration](ide.md) for full details.
 
 **Examples:**
 
 ```bash
-claude-compose vscode
-claude-compose vscode cursor
+claude-compose ide
+claude-compose ide cursor
 ```
 
 ---
 
 ## claude-compose wrap
 
-Internal VS Code process wrapper. **Not for manual use.**
+Internal IDE process wrapper. **Not for manual use.**
 
 ```bash
 claude-compose wrap <claude-binary> [args...]

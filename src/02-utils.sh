@@ -12,7 +12,7 @@ usage() {
     echo "  claude-compose doctor"
     echo "  claude-compose start [root-path]"
     echo "  claude-compose wrap <claude-binary> [args...]"
-    echo "  claude-compose vscode [variant]"
+    echo "  claude-compose ide [variant]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
     echo "  build         Build workspace from workspaces/resources/plugins (auto on launch)"
@@ -23,7 +23,7 @@ usage() {
     echo "  doctor        Diagnose and fix compose problems"
     echo "  start         Onboarding wizard — scan for projects and create workspaces"
     echo "  wrap          VS Code process wrapper mode (used internally by wrapper script)"
-    echo "  vscode        Set up VS Code integration (wrapper + .code-workspace)"
+    echo "  ide           Set up IDE integration (wrapper + .code-workspace)"
     echo ""
     echo -e "${BOLD}Options:${NC}"
     echo "  -f <file>     Config file (default: claude-compose.json)"
@@ -45,8 +45,8 @@ usage() {
     echo "  claude-compose copy ~/ws/main ~/ws/feature  # Clone workspace"
     echo "  claude-compose doctor                        # Diagnose problems"
     echo "  claude-compose start ~/Code                  # Onboarding wizard"
-    echo "  claude-compose vscode                        # Set up VS Code integration"
-    echo "  claude-compose vscode cursor                 # Set up for Cursor editor"
+    echo "  claude-compose ide                           # Set up IDE integration"
+    echo "  claude-compose ide cursor                    # Set up for Cursor editor"
     echo "  claude-compose --dry-run                    # Preview mode"
     echo "  claude-compose -- -p \"explain arch\"         # Pass args to claude"
 }
@@ -112,7 +112,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions|doctor|start|wrap|vscode)
+            config|build|migrate|copy|instructions|doctor|start|wrap|ide)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -223,9 +223,9 @@ parse_args() {
                             exit 1
                         fi
                         ;;
-                    vscode)
-                        if [[ -z "$VSCODE_VARIANT" && "$1" != -* ]]; then
-                            VSCODE_VARIANT="$1"
+                    ide)
+                        if [[ -z "$IDE_VARIANT" && "$1" != -* ]]; then
+                            IDE_VARIANT="$1"
                         else
                             echo -e "${RED}Unknown option: $1${NC}" >&2
                             usage >&2
