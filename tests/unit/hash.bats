@@ -17,7 +17,7 @@ teardown() {
 @test "read_manifest returns file contents when manifest exists" {
     local ws_dir="${TEST_TEMP_DIR}/workspace"
     mkdir -p "$ws_dir/$COMPOSE_DIR"
-    local manifest_content='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
+    local manifest_content='{"global":{},"workspaces":{},"resources":{}}'
     echo "$manifest_content" > "${ws_dir}/${COMPOSE_MANIFEST}"
     cd "$ws_dir"
     local result
@@ -31,7 +31,7 @@ teardown() {
     cd "$ws_dir"
     local result
     result=$(read_manifest)
-    echo "$result" | jq -e '.builtin' >/dev/null
+    echo "$result" | jq -e '.global' >/dev/null
     echo "$result" | jq -e '.workspaces' >/dev/null
 }
 
@@ -63,7 +63,7 @@ teardown() {
     run compute_build_hash
     local hash_val="$output"
     echo "$hash_val" > "$COMPOSE_HASH"
-    echo '{"builtin":{},"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
+    echo '{"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
     run needs_rebuild
     assert_failure  # exit 1 means up-to-date
 }
@@ -73,7 +73,7 @@ teardown() {
     create_config '{"projects":[]}'
     mkdir -p "$COMPOSE_DIR"
     echo "wrong_hash_value" > "$COMPOSE_HASH"
-    echo '{"builtin":{},"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
+    echo '{"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
     run needs_rebuild
     assert_success
 }

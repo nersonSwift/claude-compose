@@ -7,22 +7,15 @@ sync_source_dir() {
     local filter_json="$2"
     local source_name="${3:-}"
 
-    # Reset tracking
-    CURRENT_SOURCE_AGENTS=()
-    CURRENT_SOURCE_SKILLS=()
-    CURRENT_SOURCE_MCP_SERVERS=()
-    CURRENT_SOURCE_ADD_DIRS=()
-    CURRENT_SOURCE_PROJECT_DIRS=()
-    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
-    CURRENT_SOURCE_SETTINGS_FILES=()
+    _reset_current_source
 
     # ── Copy agents ──
     local agents_dir="$source_dir/.claude/agents"
     if [[ -d "$agents_dir" ]]; then
         local agents_include agents_exclude agents_rename
-        agents_include=$(echo "$filter_json" | jq -c '.agents.include // ["*"]')
-        agents_exclude=$(echo "$filter_json" | jq -c '.agents.exclude // []')
-        agents_rename=$(echo "$filter_json" | jq -c '.agents.rename // {}')
+        agents_include=$(jq -c '.agents.include // ["*"]' <<< "$filter_json")
+        agents_exclude=$(jq -c '.agents.exclude // []' <<< "$filter_json")
+        agents_rename=$(jq -c '.agents.rename // {}' <<< "$filter_json")
 
         mkdir -p ".claude/agents"
         for agent_file in "$agents_dir"/*.md; do
@@ -32,7 +25,7 @@ sync_source_dir() {
 
             if matches_filter "$agent_name" "$agents_include" "$agents_exclude"; then
                 local final_name
-                final_name=$(echo "$agents_rename" | jq -r --arg n "$agent_name" '.[$n] // $n')
+                final_name=$(jq -r --arg n "$agent_name" '.[$n] // $n' <<< "$agents_rename")
                 local dest_file="${final_name}.md"
 
                 if [[ -f ".claude/agents/${dest_file}" ]]; then
@@ -81,8 +74,8 @@ sync_source_dir() {
     local skills_dir="$source_dir/.claude/skills"
     if [[ -d "$skills_dir" ]]; then
         local skills_include skills_exclude
-        skills_include=$(echo "$filter_json" | jq -c '.skills.include // ["*"]')
-        skills_exclude=$(echo "$filter_json" | jq -c '.skills.exclude // []')
+        skills_include=$(jq -c '.skills.include // ["*"]' <<< "$filter_json")
+        skills_exclude=$(jq -c '.skills.exclude // []' <<< "$filter_json")
 
         mkdir -p ".claude/skills"
         for skill_path in "$skills_dir"/*/; do
@@ -136,9 +129,9 @@ sync_source_dir() {
     local mcp_file="$source_dir/$COMPOSE_MCP"
     if [[ -f "$mcp_file" ]]; then
         local mcp_include mcp_exclude mcp_rename
-        mcp_include=$(echo "$filter_json" | jq -c '.mcp.include // ["*"]')
-        mcp_exclude=$(echo "$filter_json" | jq -c '.mcp.exclude // []')
-        mcp_rename=$(echo "$filter_json" | jq -c '.mcp.rename // {}')
+        mcp_include=$(jq -c '.mcp.include // ["*"]' <<< "$filter_json")
+        mcp_exclude=$(jq -c '.mcp.exclude // []' <<< "$filter_json")
+        mcp_rename=$(jq -c '.mcp.rename // {}' <<< "$filter_json")
 
         ensure_compose_dir
         if [[ ! -f "$COMPOSE_MCP" ]]; then
@@ -151,7 +144,7 @@ sync_source_dir() {
             if matches_filter "$name" "$mcp_include" "$mcp_exclude"; then
                 local server_config final_name
                 server_config=$(jq -c --arg n "$name" '.mcpServers[$n]' "$mcp_file")
-                final_name=$(echo "$mcp_rename" | jq -r --arg n "$name" '.[$n] // $n')
+                final_name=$(jq -r --arg n "$name" '.[$n] // $n' <<< "$mcp_rename")
 
                 # Prefix only env vars defined in source's env_files
                 if [[ -n "$source_name" && -n "${_source_known_vars:-}" ]]; then
@@ -160,7 +153,7 @@ sync_source_dir() {
                     server_config=$(prefix_env_vars_in_mcp "$server_config" "$prefix" "$_source_known_vars")
                 fi
 
-                mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_name" --argjson config "$server_config" '.[$name] = $config')
+                mcp_batch=$(jq --arg name "$final_name" --argjson config "$server_config" '.[$name] = $config' <<< "$mcp_batch")
 
                 CURRENT_SOURCE_MCP_SERVERS+=("$final_name")
                 if [[ "$final_name" != "$name" ]]; then
@@ -188,7 +181,7 @@ sync_source_dir() {
 
     # ── CLAUDE.md via --add-dir ──
     local claude_md
-    claude_md=$(echo "$filter_json" | jq -r 'if has("claude_md") then .claude_md else true end')
+    claude_md=$(jq -r 'if has("claude_md") then .claude_md else true end' <<< "$filter_json")
     if [[ -f "$source_dir/CLAUDE.md" || -d "$source_dir/.claude" ]]; then
         CURRENT_SOURCE_ADD_DIRS+=("${source_dir}|${claude_md}")
     fi
@@ -211,7 +204,7 @@ write_source_manifest() {
         [[ -z "$entry" ]] && continue
         local d="${entry%|*}"
         local cmd="${entry##*|}"
-        dirs_json=$(echo "$dirs_json" | jq --arg d "$d" --arg c "$cmd" '. + [{path: $d, claude_md: ($c == "true")}]')
+        dirs_json=$(jq --arg d "$d" --arg c "$cmd" '. + [{path: $d, claude_md: ($c == "true")}]' <<< "$dirs_json")
     done
 
     # project_dirs: array of {path, claude_md} objects
@@ -220,18 +213,10 @@ write_source_manifest() {
         [[ -z "$entry" ]] && continue
         local p="${entry%|*}"
         local cmd="${entry##*|}"
-        proj_dirs_json=$(echo "$proj_dirs_json" | jq --arg p "$p" --arg c "$cmd" '. + [{path: $p, claude_md: ($c == "true")}]')
+        proj_dirs_json=$(jq --arg p "$p" --arg c "$cmd" '. + [{path: $p, claude_md: ($c == "true")}]' <<< "$proj_dirs_json")
     done
 
-    # system_prompt_files: array of absolute paths
-    local spf_json
-    spf_json=$(printf '%s\n' "${CURRENT_SOURCE_SYSTEM_PROMPT_FILES[@]+"${CURRENT_SOURCE_SYSTEM_PROMPT_FILES[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
-
-    # settings_files: array of absolute paths
-    local sf_json
-    sf_json=$(printf '%s\n' "${CURRENT_SOURCE_SETTINGS_FILES[@]+"${CURRENT_SOURCE_SETTINGS_FILES[@]}"}" | jq -R -s 'split("\n") | map(select(. != ""))')
-
-    MANIFEST_JSON=$(echo "$MANIFEST_JSON" | jq \
+    MANIFEST_JSON=$(jq \
         --arg section "$section" \
         --arg name "$entry_name" \
         --arg sname "$CURRENT_SOURCE_NAME" \
@@ -240,7 +225,5 @@ write_source_manifest() {
         --argjson mcp "$mcp_json" \
         --argjson dirs "$dirs_json" \
         --argjson pdirs "$proj_dirs_json" \
-        --argjson spfiles "$spf_json" \
-        --argjson sfiles "$sf_json" \
-        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs, system_prompt_files: $spfiles, settings_files: $sfiles, source_name: $sname}')
+        '.[$section][$name] = {agents: $agents, skills: $skills, mcp_servers: $mcp, add_dirs: $dirs, project_dirs: $pdirs, source_name: $sname}' <<< "$MANIFEST_JSON")
 }

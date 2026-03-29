@@ -20,11 +20,11 @@ _common_setup() {
     source "${PROJECT_ROOT}/tests/test_helper/claude-compose-functions.sh"
     set -eEu
 
-    # Stub extract_embedded_skills (stripped from test lib)
-    extract_embedded_skills() { :; }
+    # Stub extract_embedded_plugin (stripped from test lib)
+    extract_embedded_plugin() { :; }
 
     # Override HOME-based globals to use isolated temp dirs
-    BUILTIN_SKILLS_DIR="${TEST_TEMP_DIR}/builtin_skills"
+    BUILTIN_PLUGIN_DIR="${TEST_TEMP_DIR}/builtin_plugin"
     GLOBAL_CONFIG="${TEST_TEMP_DIR}/global.json"
     GLOBAL_CONFIG_DIR="${TEST_TEMP_DIR}"
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
@@ -79,7 +79,7 @@ reset_globals() {
     DOCTOR_ERROR_MSG=""
     DOCTOR_ENABLED=false
     PROCESSED_WORKSPACES=()
-    MANIFEST_JSON='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
     CURRENT_SOURCE_AGENTS=()
     CURRENT_SOURCE_SKILLS=()
     CURRENT_SOURCE_MCP_SERVERS=()
@@ -89,6 +89,9 @@ reset_globals() {
     CURRENT_SOURCE_SETTINGS_FILES=()
     CURRENT_SOURCE_NAME=""
     MARKETPLACE_PLUGINS=()
+    PLUGIN_DIRS=()
     PLUGIN_CONFIG_ENVS=()
+    DIRECT_PROJECT_PATHS=()
+    _PLUGINS_RESOLVED=false
     _BUILD_LOCK_HELD=false
 }

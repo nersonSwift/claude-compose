@@ -24,10 +24,10 @@ prefix_env_vars_in_mcp() {
     # Build jq array of known var names
     local vars_json
     vars_json=$(printf '%s\n' "$known_vars" | jq -R -s 'split("\n") | map(select(. != ""))')
-    echo "$config" | jq --arg pfx "$prefix" --argjson known "$vars_json" '
+    jq --arg pfx "$prefix" --argjson known "$vars_json" '
       if .env then .env |= with_entries(
         if (.value | type) == "string" then
           .value |= reduce $known[] as $var (.; gsub("\\$\\{" + $var + "\\}"; "${\($pfx)\($var)}"))
         else . end
-      ) else . end'
+      ) else . end' <<< "$config"
 }

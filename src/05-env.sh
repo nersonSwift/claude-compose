@@ -19,11 +19,6 @@ _validate_env_key() {
     return 0
 }
 
-# Check if a path contains traversal sequences
-_has_path_traversal() {
-    [[ "$1" == *"/.."* || "$1" == ".."* ]]
-}
-
 # Verify resolved path stays within expected directory
 # $1 = file path (absolute), $2 = base directory (absolute)
 # Uses cd+pwd approach for macOS compatibility (no realpath -m)
@@ -44,72 +39,49 @@ _is_within_dir() {
     [[ "$resolved" == "$resolved_base/"* ]]
 }
 
-# Load JSON env files from resources.env_files at launch time
-load_env_files() {
+# Shared implementation for loading env files from a config
+# $1=config_file $2=base_dir $3=label $4=prefix (optional) $5=verbose (default true)
+_load_env_files_impl() {
+    local config_file="$1" base_dir="$2" label="$3" prefix="${4:-}" verbose="${5:-true}"
     local env_files
-    env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+    env_files=$(jq -r '.resources.env_files // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
-        local abs_path="$CONFIG_DIR/$env_file"
-        if ! _is_within_dir "$abs_path" "$CONFIG_DIR"; then
+        local abs_path="$base_dir/$env_file"
+        if ! _is_within_dir "$abs_path" "$base_dir"; then
             echo -e "${YELLOW}Warning: env file escapes base directory, skipping: ${env_file}${NC}" >&2
             continue
         fi
         if [[ ! -f "$abs_path" ]]; then
-            echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
+            [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
             continue
         fi
         if ! jq empty "$abs_path" 2>/dev/null; then
             echo -e "${RED}Error: invalid JSON in env file: ${env_file}${NC}" >&2
             continue
         fi
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local key value
-            key=$(echo "$line" | jq -r '.key')
-            value=$(echo "$line" | jq -r '.value')
-            _validate_env_key "$key" "$env_file" || continue
-            export "$key=$value"
-        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
-        local var_count
-        var_count=$(jq 'length' "$abs_path")
-        echo -e "  ${GREEN}Loaded:${NC} ${env_file} (${var_count} vars)" >&2
+        while IFS=$'\t' read -r key value; do
+            [[ -z "$key" ]] && continue
+            _validate_env_key "$key" "$label" || continue
+            export "${prefix}${key}=${value}"
+        done < <(jq -r 'to_entries[] | [.key, (.value|tostring)] | @tsv' "$abs_path")
+        if [[ "$verbose" == "true" ]]; then
+            local var_count
+            var_count=$(jq 'length' "$abs_path")
+            echo -e "  ${GREEN}Loaded:${NC} ${env_file} (${var_count} vars${label:+, $label})" >&2
+        fi
     done <<< "$env_files"
+}
+
+# Load JSON env files from resources.env_files at launch time
+load_env_files() {
+    _load_env_files_impl "$CONFIG_FILE" "$CONFIG_DIR" ""
 }
 
 # Load global env files (no prefix — intended to be available directly)
 load_global_env_files() {
     [[ ! -f "$GLOBAL_CONFIG" ]] && return
-
-    local env_files
-    env_files=$(jq -r '.resources.env_files // [] | .[]' "$GLOBAL_CONFIG" 2>/dev/null || true)
-    while IFS= read -r env_file; do
-        [[ -z "$env_file" ]] && continue
-        local abs_path="$GLOBAL_CONFIG_DIR/$env_file"
-        if ! _is_within_dir "$abs_path" "$GLOBAL_CONFIG_DIR"; then
-            echo -e "${YELLOW}Warning: env file escapes base directory, skipping: ${env_file}${NC}" >&2
-            continue
-        fi
-        if [[ ! -f "$abs_path" ]]; then
-            echo -e "${YELLOW}Warning: global env file not found: ${env_file}${NC}" >&2
-            continue
-        fi
-        if ! jq empty "$abs_path" 2>/dev/null; then
-            echo -e "${RED}Error: invalid JSON in global env file: ${env_file}${NC}" >&2
-            continue
-        fi
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local key value
-            key=$(echo "$line" | jq -r '.key')
-            value=$(echo "$line" | jq -r '.value')
-            _validate_env_key "$key" "$env_file" || continue
-            export "$key=$value"
-        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
-        local var_count
-        var_count=$(jq 'length' "$abs_path")
-        echo -e "  ${GREEN}Loaded:${NC} ${env_file} (${var_count} vars, global)" >&2
-    done <<< "$env_files"
+    _load_env_files_impl "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "global"
 }
 
 # Load env files from a source directory with prefixed keys (launch-time)
@@ -117,35 +89,9 @@ load_source_env_files() {
     local source_dir="$1" source_name="$2" config_filename="${3:-claude-compose.json}"
     local source_config="$source_dir/$config_filename"
     [[ ! -f "$source_config" ]] && return
-
     local prefix
     prefix=$(compute_source_prefix "$source_name" "$source_dir")
-
-    local env_files
-    env_files=$(jq -r '.resources.env_files // [] | .[]' "$source_config" 2>/dev/null || true)
-    while IFS= read -r env_file; do
-        [[ -z "$env_file" ]] && continue
-        local abs_path="$source_dir/$env_file"
-        if ! _is_within_dir "$abs_path" "$source_dir"; then
-            echo -e "${YELLOW}Warning: env file escapes base directory, skipping: ${source_name}/${env_file}${NC}" >&2
-            continue
-        fi
-        if [[ ! -f "$abs_path" ]]; then
-            continue
-        fi
-        if ! jq empty "$abs_path" 2>/dev/null; then
-            echo -e "${YELLOW}Warning: invalid JSON in source env file: ${source_name}/${env_file}${NC}" >&2
-            continue
-        fi
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local key value
-            key=$(echo "$line" | jq -r '.key')
-            value=$(echo "$line" | jq -r '.value')
-            _validate_env_key "$key" "${source_name}/${env_file}" || continue
-            export "${prefix}${key}=${value}"
-        done < <(jq -c 'to_entries[] | {key, value: (.value | tostring)}' "$abs_path")
-    done <<< "$env_files"
+    _load_env_files_impl "$source_config" "$source_dir" "${source_name}" "$prefix" "false"
 }
 
 # Load env files from all external sources (workspaces) at launch time

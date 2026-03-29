@@ -454,37 +454,31 @@ cmd_wrap() {
         exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
     fi
 
-    # 8. Ensure built-in skills are extracted
-    ensure_builtin_skills
+    # 8. Ensure built-in plugin is extracted
+    ensure_builtin_plugin
 
     # 9. Auto-build if needed (suppress stderr — no banners in wrap mode)
-    local project_count ws_count has_resources has_global_config
+    local project_count
     project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
-    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
-    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
-    has_global_config=false
-    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$project_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+    if [[ "$project_count" -eq 0 ]] && ! _has_anything_to_build; then
         # Nothing to compose — passthrough
         exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
     fi
 
-    if [[ "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
-        if needs_rebuild; then
-            # Suppress stderr (no banners in stream-json mode)
-            # On failure: fall back to passthrough rather than continuing with partial/stale config
-            if ! build "false" 2>/dev/null; then
-                exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
-            fi
+    if _has_anything_to_build && needs_rebuild; then
+        # Suppress stderr (no banners in stream-json mode)
+        # On failure: fall back to passthrough rather than continuing with partial/stale config
+        if ! build "false" 2>/dev/null; then
+            exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
+        fi
 
-            # Update .code-workspace if it already exists (keep in sync after rebuild)
-            local _ws_name _ws_file
-            _ws_name="$(basename "$PWD")"
-            _ws_file="${PWD}/${_ws_name}.code-workspace"
-            if [[ -f "$_ws_file" ]]; then
-                _generate_code_workspace "$PWD" 2>/dev/null || true
-            fi
+        # Update .code-workspace if it already exists (keep in sync after rebuild)
+        local _ws_name _ws_file
+        _ws_name="$(basename "$PWD")"
+        _ws_file="${PWD}/${_ws_name}.code-workspace"
+        if [[ -f "$_ws_file" ]]; then
+            _generate_code_workspace "$PWD" 2>/dev/null || true
         fi
     fi
 
@@ -589,7 +583,7 @@ _generate_code_workspace() {
             prefix: "Project"
         }
     ]' "$config_file")
-    folders_json=$(echo "$folders_json" | jq --argjson p "$projects_json" '. + $p')
+    folders_json=$(jq --argjson p "$projects_json" '. + $p' <<< "$folders_json")
 
     # 1c. Build path→name map from all reachable compose configs (for project alias lookup)
     local path_name_map='{}'
@@ -612,7 +606,7 @@ _generate_code_workspace() {
                 select(.name) |
                 {key: (.path | sub("^~"; $home)), value: .name}
             ] | from_entries' "$nested_config")
-            path_name_map=$(echo "$path_name_map" | jq --argjson n "$nested_map" '. + $n')
+            path_name_map=$(jq --argjson n "$nested_map" '. + $n' <<< "$path_name_map")
         done < <(jq -r '[.global, .workspaces, .resources] | map(keys? // []) | add | .[]' "$manifest_file" 2>/dev/null)
     fi
 
@@ -635,7 +629,7 @@ _generate_code_workspace() {
                 [.[] | if type == "object" then .path else . end] | .[] |
                 {path: ., name: (if ($sname | length) > 0 then $sname else (. | split("/") | last) end), prefix: $pfx}
             ]' "$manifest_file")
-            folders_json=$(echo "$folders_json" | jq --argjson d "$section_dirs" '. + $d')
+            folders_json=$(jq --argjson d "$section_dirs" '. + $d' <<< "$folders_json")
             # project_dirs: look up alias from path_name_map, fall back to basename
             section_dirs=$(jq --arg s "$section" --arg pfx "Project" --argjson names "$path_name_map" '[
                 .[$s] // {} | to_entries[] |
@@ -643,12 +637,12 @@ _generate_code_workspace() {
                 [.[] | if type == "object" then .path else . end] | .[] |
                 {path: ., name: ($names[.] // (. | split("/") | last)), prefix: $pfx}
             ]' "$manifest_file")
-            folders_json=$(echo "$folders_json" | jq --argjson d "$section_dirs" '. + $d')
+            folders_json=$(jq --argjson d "$section_dirs" '. + $d' <<< "$folders_json")
         done
     fi
 
     # 2. Expand ~ and resolve relative paths, then deduplicate (first wins)
-    folders_json=$(echo "$folders_json" | jq --arg ws "$ws_dir" --arg home "$HOME" '
+    folders_json=$(jq --arg ws "$ws_dir" --arg home "$HOME" '
         reduce .[] as $entry ([];
             ($entry.path | sub("^~"; $home)) as $expanded |
             (if $expanded | startswith("/") then $expanded
@@ -657,16 +651,16 @@ _generate_code_workspace() {
             else . + [$entry + {_abs: $abs} + (if $entry.path == "." then {} else {path: $abs} end)]
             end
         ) | [.[] | del(._abs)]
-    ')
+    ' <<< "$folders_json")
 
     # 3. Sort: Workspace first, then Project, then Preset
-    folders_json=$(echo "$folders_json" | jq '
+    folders_json=$(jq '
         sort_by(if .prefix == "MainWS" then 0 elif .prefix == "Workspace" then 1 elif .prefix == "Project" then 2 else 3 end)
-    ')
+    ' <<< "$folders_json")
 
     # 4. Convert to VS Code format: [{path, name: "Prefix / name"}]
     local managed_folders
-    managed_folders=$(echo "$folders_json" | jq '[.[] | {path: .path, name: (.prefix + " / " + .name)}]')
+    managed_folders=$(jq '[.[] | {path: .path, name: (.prefix + " / " + .name)}]' <<< "$folders_json")
 
     # 5. Merge with existing file
     local result
@@ -679,7 +673,7 @@ _generate_code_workspace() {
             . + {folders: ($user + $managed)}
         ' "$ws_file")
     else
-        result=$(echo "$managed_folders" | jq '{folders: ., settings: {}}')
+        result=$(jq '{folders: ., settings: {}}' <<< "$managed_folders")
     fi
 
     # 6. Write and report

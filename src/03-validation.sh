@@ -71,14 +71,14 @@ _validate_projects() {
 
         if [[ ${#missing_path[@]} -gt 0 ]]; then
             local joined
-            joined=$(IFS=', '; echo "${missing_path[*]}")
+            printf -v joined '%s, ' "${missing_path[@]}"; joined="${joined%, }"
             echo "Each project must have a \"path\" field. Missing in: ${joined}"
             return
         fi
 
         if [[ ${#missing_name[@]} -gt 0 ]]; then
             local joined
-            joined=$(IFS=', '; echo "${missing_name[*]}")
+            printf -v joined '%s, ' "${missing_name[@]}"; joined="${joined%, }"
             echo "Each project must have a \"name\" field. Missing in: ${joined}"
             return
         fi
@@ -95,6 +95,22 @@ _validate_projects() {
     fi
 }
 
+# Validate a resources sub-field is an array of strings
+# $1 = config file, $2 = field name under resources
+_validate_string_array() {
+    local config_file="$1" field="$2"
+    local field_type
+    field_type=$(jq -r --arg f "$field" 'if .resources | has($f) then .resources[$f] | type else "null" end' "$config_file")
+    if [[ "$field_type" != "null" && "$field_type" != "array" ]]; then
+        echo "\"resources.${field}\" must be an array, got: ${field_type}"; return
+    fi
+    if [[ "$field_type" == "array" ]]; then
+        local bad
+        bad=$(jq -r --arg f "$field" '.resources[$f] | to_entries[] | select((.value | type) != "string") | "resources.\($f)[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
+        [[ -n "$bad" ]] && { echo "$bad"; return; }
+    fi
+}
+
 _validate_resources() {
     local config_file="$1"
 
@@ -106,39 +122,11 @@ _validate_resources() {
     fi
 
     if [[ "$resources_type" == "object" ]]; then
-        # resources.agents — array of strings
-        local agents_type
-        agents_type=$(jq -r 'if .resources | has("agents") then .resources.agents | type else "null" end' "$config_file")
-        if [[ "$agents_type" != "null" && "$agents_type" != "array" ]]; then
-            echo "\"resources.agents\" must be an array, got: ${agents_type}"
-            return
-        fi
-        if [[ "$agents_type" == "array" ]]; then
-            local bad_agents
-            bad_agents=$(jq -r '.resources.agents | to_entries[] | select((.value | type) != "string") | "resources.agents[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-            if [[ -n "$bad_agents" ]]; then
-                echo "$bad_agents"
-                return
-            fi
-        fi
+        local err
+        err=$(_validate_string_array "$config_file" "agents"); [[ -n "$err" ]] && { echo "$err"; return; }
+        err=$(_validate_string_array "$config_file" "skills"); [[ -n "$err" ]] && { echo "$err"; return; }
 
-        # resources.skills — array of strings
-        local skills_type
-        skills_type=$(jq -r 'if .resources | has("skills") then .resources.skills | type else "null" end' "$config_file")
-        if [[ "$skills_type" != "null" && "$skills_type" != "array" ]]; then
-            echo "\"resources.skills\" must be an array, got: ${skills_type}"
-            return
-        fi
-        if [[ "$skills_type" == "array" ]]; then
-            local bad_skills
-            bad_skills=$(jq -r '.resources.skills | to_entries[] | select((.value | type) != "string") | "resources.skills[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-            if [[ -n "$bad_skills" ]]; then
-                echo "$bad_skills"
-                return
-            fi
-        fi
-
-        # resources.mcp — object of objects
+        # resources.mcp — object of objects (special case, not string array)
         local mcp_type
         mcp_type=$(jq -r 'if .resources | has("mcp") then .resources.mcp | type else "null" end' "$config_file")
         if [[ "$mcp_type" != "null" && "$mcp_type" != "object" ]]; then
@@ -154,37 +142,8 @@ _validate_resources() {
             fi
         fi
 
-        # resources.env_files — array of strings
-        local env_files_type
-        env_files_type=$(jq -r 'if .resources | has("env_files") then .resources.env_files | type else "null" end' "$config_file")
-        if [[ "$env_files_type" != "null" && "$env_files_type" != "array" ]]; then
-            echo "\"resources.env_files\" must be an array, got: ${env_files_type}"
-            return
-        fi
-        if [[ "$env_files_type" == "array" ]]; then
-            local bad_env_files
-            bad_env_files=$(jq -r '.resources.env_files | to_entries[] | select((.value | type) != "string") | "resources.env_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-            if [[ -n "$bad_env_files" ]]; then
-                echo "$bad_env_files"
-                return
-            fi
-        fi
-
-        # resources.append_system_prompt_files — array of strings
-        local aspf_type
-        aspf_type=$(jq -r 'if .resources | has("append_system_prompt_files") then .resources.append_system_prompt_files | type else "null" end' "$config_file")
-        if [[ "$aspf_type" != "null" && "$aspf_type" != "array" ]]; then
-            echo "\"resources.append_system_prompt_files\" must be an array, got: ${aspf_type}"
-            return
-        fi
-        if [[ "$aspf_type" == "array" ]]; then
-            local bad_aspf
-            bad_aspf=$(jq -r '.resources.append_system_prompt_files | to_entries[] | select((.value | type) != "string") | "resources.append_system_prompt_files[\(.key)]: expected string, got \(.value | type)"' "$config_file" 2>/dev/null || true)
-            if [[ -n "$bad_aspf" ]]; then
-                echo "$bad_aspf"
-                return
-            fi
-        fi
+        err=$(_validate_string_array "$config_file" "env_files"); [[ -n "$err" ]] && { echo "$err"; return; }
+        err=$(_validate_string_array "$config_file" "append_system_prompt_files"); [[ -n "$err" ]] && { echo "$err"; return; }
 
         # resources.settings — string
         local settings_type
@@ -224,7 +183,7 @@ _validate_workspaces() {
             fi
             # Validate filter fields if present
             local filter_field
-            for filter_field in mcp agents skills; do
+            for filter_field in mcp agents skills plugins; do
                 local ff_type
                 ff_type=$(jq -r "if .workspaces[$wi] | has(\"$filter_field\") then .workspaces[$wi].$filter_field | type else \"null\" end" "$config_file")
                 if [[ "$ff_type" != "null" && "$ff_type" != "object" ]]; then
@@ -232,6 +191,21 @@ _validate_workspaces() {
                     return
                 fi
             done
+            # Validate claude_md_overrides if present
+            local cmo_type
+            cmo_type=$(jq -r "if .workspaces[$wi] | has(\"claude_md_overrides\") then .workspaces[$wi].claude_md_overrides | type else \"null\" end" "$config_file")
+            if [[ "$cmo_type" != "null" && "$cmo_type" != "object" ]]; then
+                echo "workspaces[$wi].claude_md_overrides must be an object, got: ${cmo_type}"
+                return
+            fi
+            if [[ "$cmo_type" == "object" ]]; then
+                local bad_cmo
+                bad_cmo=$(jq -r ".workspaces[$wi].claude_md_overrides | to_entries[] | select((.value | type) != \"boolean\") | \"workspaces[$wi].claude_md_overrides.\(.key): expected boolean, got \(.value | type)\"" "$config_file" 2>/dev/null | head -1)
+                if [[ -n "$bad_cmo" ]]; then
+                    echo "$bad_cmo"
+                    return
+                fi
+            fi
         done
     fi
 }

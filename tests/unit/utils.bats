@@ -208,23 +208,23 @@ EOF
     [[ "$hash1" != "$hash2" ]]
 }
 
-# ── has_builtin_skills ───────────────────────────────────────────────
+# ── has_builtin_plugin ───────────────────────────────────────────────
 
-@test "has_builtin_skills returns 0 when skills exist" {
-    mkdir -p "${BUILTIN_SKILLS_DIR}/test-skill"
-    run has_builtin_skills
+@test "has_builtin_plugin returns 0 when plugin exists" {
+    mkdir -p "${BUILTIN_PLUGIN_DIR}/.claude-plugin"
+    run has_builtin_plugin
     assert_success
 }
 
-@test "has_builtin_skills returns 1 when dir empty" {
-    mkdir -p "${BUILTIN_SKILLS_DIR}"
-    run has_builtin_skills
+@test "has_builtin_plugin returns 1 when dir empty" {
+    mkdir -p "${BUILTIN_PLUGIN_DIR}"
+    run has_builtin_plugin
     assert_failure
 }
 
-@test "has_builtin_skills returns 1 when dir missing" {
-    rm -rf "${BUILTIN_SKILLS_DIR}"
-    run has_builtin_skills
+@test "has_builtin_plugin returns 1 when dir missing" {
+    rm -rf "${BUILTIN_PLUGIN_DIR}"
+    run has_builtin_plugin
     assert_failure
 }
 

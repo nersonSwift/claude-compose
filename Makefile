@@ -1,13 +1,13 @@
 SHELL := /bin/bash
 SOURCES := $(sort $(wildcard src/*.sh))
 PROMPTS := $(wildcard prompts/*.md)
-SKILLS := $(wildcard skills/*/SKILL.md)
+PLUGIN_FILES := $(shell find plugin -type f -not -name '.DS_Store' 2>/dev/null)
 TARGET := claude-compose
 WRAPPER := claude-compose-wrapper
 
 .PHONY: clean lint
 
-$(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
+$(TARGET): $(SOURCES) $(PROMPTS) $(PLUGIN_FILES)
 	@echo "Building $(TARGET)..."
 	@cat $(SOURCES) > $@.tmp
 	@while IFS= read -r line; do \
@@ -17,15 +17,16 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 			*__PROMPT_COMPOSE_INSTRUCTIONS__*) cat prompts/compose-instructions.md ;; \
 			*__PROMPT_COMPOSE_DOCTOR__*) cat prompts/compose-doctor.md ;; \
 			*__PROMPT_COMPOSE_START__*) cat prompts/compose-start.md ;; \
-			*__EMBEDDED_SKILLS__*) \
-				echo 'extract_embedded_skills() {'; \
+		*__PROMPT_COMPOSE_KNOWLEDGE__*) cat prompts/compose-knowledge.md ;; \
+			*__EMBEDDED_PLUGIN__*) \
+				echo 'extract_embedded_plugin() {'; \
 				echo '    local dest="$$1"'; \
-				for skill_md in skills/*/SKILL.md; do \
-					[ -f "$$skill_md" ] || continue; \
-					skill_name=$$(basename $$(dirname "$$skill_md")); \
-					skill_b64=$$(base64 < "$$skill_md" | tr -d '\n'); \
-					echo "    mkdir -p \"\$$dest/$$skill_name\""; \
-					echo "    printf '%s' \"$$skill_b64\" | base64 -d > \"\$$dest/$$skill_name/SKILL.md\""; \
+				for pfile in $$(find plugin -type f -not -name '.DS_Store'); do \
+					rel_path=$${pfile#plugin/}; \
+					rel_dir=$$(dirname "$$rel_path"); \
+					file_b64=$$(base64 < "$$pfile" | tr -d '\n'); \
+					[ "$$rel_dir" != "." ] && echo "    mkdir -p \"\$$dest/$$rel_dir\""; \
+					echo "    printf '%s' \"$$file_b64\" | base64 -d > \"\$$dest/$$rel_path\""; \
 				done; \
 				echo '}' ;; \
 			*) printf '%s\n' "$$line" ;; \
@@ -43,13 +44,13 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(SKILLS)
 
 TEST_LIB := tests/test_helper/claude-compose-functions.sh
 
-$(TEST_LIB): $(SOURCES) $(PROMPTS) $(SKILLS)
+$(TEST_LIB): $(SOURCES) $(PROMPTS) $(PLUGIN_FILES)
 	@echo "Building test library..."
 	@mkdir -p tests/test_helper
 	@cat $(SOURCES) > $@.tmp
 	@while IFS= read -r line; do \
 		case "$$line" in \
-			*__PROMPT_*__*|*__EMBEDDED_SKILLS__*) ;; \
+			*__PROMPT_*__*|*__EMBEDDED_PLUGIN__*) ;; \
 			'main "$$@"') ;; \
 			*) printf '%s\n' "$$line" ;; \
 		esac; \

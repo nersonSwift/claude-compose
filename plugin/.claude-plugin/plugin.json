@@ -1,0 +1,5 @@
+{
+  "name": "claude-compose",
+  "version": "0.0.0",
+  "description": "Built-in claude-compose plugin with workspace management skills"
+}

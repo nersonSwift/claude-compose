@@ -67,43 +67,7 @@ teardown() {
     assert_failure
 }
 
-# ── _has_path_traversal ─────────────────────────────────────────────
-
-@test "has_path_traversal detects ../ at start" {
-    run _has_path_traversal "../bad"
-    assert_success
-}
-
-@test "has_path_traversal detects embedded ../" {
-    run _has_path_traversal "foo/../bar"
-    assert_success
-}
-
-@test "has_path_traversal detects deep traversal" {
-    run _has_path_traversal "../../etc/passwd"
-    assert_success
-}
-
-@test "has_path_traversal allows relative ./path" {
-    run _has_path_traversal "./ok/path"
-    assert_failure
-}
-
-@test "has_path_traversal allows normal path" {
-    run _has_path_traversal "normal/path"
-    assert_failure
-}
-
-@test "has_path_traversal detects bare .." {
-    run _has_path_traversal ".."
-    assert_success
-}
-
-@test "has_path_traversal edge case ..hidden" {
-    # "..hidden" starts with ".." so the function flags it
-    run _has_path_traversal "..hidden"
-    assert_success
-}
+# _has_path_traversal was removed — replaced by _is_within_dir checks after path resolution
 
 # ── load_env_files ───────────────────────────────────────────────────
 

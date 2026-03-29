@@ -260,3 +260,47 @@ JSON
     run validate_global_config
     assert_failure
 }
+
+# ── _validate_workspaces: plugins filter ──────────────────────────
+
+@test "_validate_workspaces: plugins filter field as object passes" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"workspaces":[{"path":"~/x","plugins":{"include":["*"]}}]}' > "$cfg"
+    run _validate_workspaces "$cfg"
+    assert_success
+    assert_output ""
+}
+
+@test "_validate_workspaces: plugins filter field as non-object fails" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"workspaces":[{"path":"~/x","plugins":"bad"}]}' > "$cfg"
+    run _validate_workspaces "$cfg"
+    assert_success
+    assert_output -p "plugins must be an object"
+}
+
+# ── _validate_workspaces: claude_md_overrides ─────────────────────
+
+@test "_validate_workspaces: claude_md_overrides as object with booleans passes" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"workspaces":[{"path":"~/x","claude_md_overrides":{"proj-A":true,"proj-B":false}}]}' > "$cfg"
+    run _validate_workspaces "$cfg"
+    assert_success
+    assert_output ""
+}
+
+@test "_validate_workspaces: claude_md_overrides as non-object fails" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"workspaces":[{"path":"~/x","claude_md_overrides":"bad"}]}' > "$cfg"
+    run _validate_workspaces "$cfg"
+    assert_success
+    assert_output -p "claude_md_overrides must be an object"
+}
+
+@test "_validate_workspaces: claude_md_overrides with non-boolean value fails" {
+    local cfg="${TEST_TEMP_DIR}/cfg.json"
+    echo '{"workspaces":[{"path":"~/x","claude_md_overrides":{"proj-A":"yes"}}]}' > "$cfg"
+    run _validate_workspaces "$cfg"
+    assert_success
+    assert_output -p "expected boolean"
+}

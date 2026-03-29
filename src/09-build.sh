@@ -4,7 +4,7 @@ process_workspace_source() {
     local base_dir="${2:-$CONFIG_DIR}"
 
     local raw_path
-    raw_path=$(echo "$ws_json" | jq -r '.path')
+    raw_path=$(jq -r '.path' <<< "$ws_json")
     local ws_path
     ws_path=$(expand_path "$raw_path" "$base_dir")
 
@@ -44,12 +44,18 @@ process_workspace_source() {
 
     # Build filter JSON from workspace config entry
     local filter_json
-    filter_json=$(echo "$ws_json" | jq -c '{
+    filter_json=$(jq -c '{
         mcp: (.mcp // {}),
         agents: (.agents // {}),
         skills: (.skills // {}),
+        plugins: (.plugins // {}),
         claude_md: (if .claude_md == null then true else .claude_md end)
-    }')
+    }' <<< "$ws_json")
+
+    # Extract cascade values for claude_md
+    local ws_claude_md ws_claude_md_overrides
+    ws_claude_md=$(jq -r 'if .claude_md == null then "true" else (.claude_md | tostring) end' <<< "$ws_json")
+    ws_claude_md_overrides=$(jq -c '.claude_md_overrides // {}' <<< "$ws_json")
 
     # Sync resources (MCP, agents, skills — no permissions)
     sync_source_dir "$ws_path" "$filter_json" "$(basename "$ws_path")"
@@ -62,19 +68,63 @@ process_workspace_source() {
         if [[ "$ws_project_count" -gt 0 ]]; then
             local wpi
             for ((wpi = 0; wpi < ws_project_count; wpi++)); do
-                local proj_path proj_claude_md
+                local proj_path proj_claude_md proj_name
                 proj_path=$(jq -r ".projects[$wpi].path" "$ws_config")
                 proj_path=$(expand_path "$proj_path" "$ws_path")
+                proj_name=$(jq -r ".projects[$wpi].name // empty" "$ws_config")
+                [[ -z "$proj_name" ]] && proj_name=$(basename "$proj_path")
                 proj_claude_md=$(jq -r ".projects[$wpi].claude_md // true" "$ws_config")
 
                 if [[ ! -d "$proj_path" ]]; then
                     continue
                 fi
 
+                # Direct-wins: skip if this project is directly configured in root
+                local _is_direct=false _dp
+                for _dp in "${DIRECT_PROJECT_PATHS[@]+"${DIRECT_PROJECT_PATHS[@]}"}"; do
+                    [[ "$_dp" == "$proj_path" ]] && _is_direct=true && break
+                done
+                if [[ "$_is_direct" == "true" ]]; then
+                    echo -e "  ${YELLOW}skip project:${NC} $proj_name (directly configured)" >&2
+                    continue
+                fi
+
+                # claude_md_overrides: per-project override from workspace entry
+                local override_val
+                override_val=$(jq -r --arg n "$proj_name" '.[$n] // empty' <<< "$ws_claude_md_overrides")
+                if [[ -n "$override_val" ]]; then
+                    proj_claude_md="$override_val"
+                elif [[ "$ws_claude_md" == "false" ]]; then
+                    # Cascade: workspace claude_md:false caps all projects
+                    proj_claude_md="false"
+                fi
+
                 CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
-                echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from workspace)" >&2
+                echo -e "  ${GREEN}+project:${NC} $proj_name (from workspace)" >&2
             done
+
+            # Warn about unmatched claude_md_overrides keys (typo detection)
+            if [[ "$ws_claude_md_overrides" != "{}" ]]; then
+                local _cmo_keys
+                _cmo_keys=$(jq -r 'keys[]' <<< "$ws_claude_md_overrides" 2>/dev/null || true)
+                while IFS= read -r _cmo_key; do
+                    [[ -z "$_cmo_key" ]] && continue
+                    local _cmo_matched=false _cwpi
+                    for ((_cwpi = 0; _cwpi < ws_project_count; _cwpi++)); do
+                        local _cwp_name
+                        _cwp_name=$(jq -r ".projects[$_cwpi].name // empty" "$ws_config")
+                        [[ -z "$_cwp_name" ]] && _cwp_name=$(basename "$(jq -r ".projects[$_cwpi].path" "$ws_config")")
+                        [[ "$_cwp_name" == "$_cmo_key" ]] && _cmo_matched=true && break
+                    done
+                    if [[ "$_cmo_matched" == "false" ]]; then
+                        echo -e "  ${YELLOW}Warning: claude_md_overrides key \"$_cmo_key\" does not match any project in workspace${NC}" >&2
+                    fi
+                done <<< "$_cmo_keys"
+            fi
         fi
+
+        # Collect workspace plugins (with filter)
+        collect_workspace_plugins "$ws_config" "$ws_path" "$filter_json"
     fi
 
     # Write manifest — use path as key (workspaces don't have global names)
@@ -92,16 +142,8 @@ process_resources() {
     local manifest_section="${4:-resources}"
     local manifest_key="${5:-local}"
 
-    CURRENT_SOURCE_NAME=""
-
     # Reset tracking (must happen before early return so callers see clean arrays)
-    CURRENT_SOURCE_AGENTS=()
-    CURRENT_SOURCE_SKILLS=()
-    CURRENT_SOURCE_MCP_SERVERS=()
-    CURRENT_SOURCE_ADD_DIRS=()
-    CURRENT_SOURCE_PROJECT_DIRS=()
-    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
-    CURRENT_SOURCE_SETTINGS_FILES=()
+    _reset_current_source
 
     local resources
     resources=$(jq -c '.resources // {}' "$config_file")
@@ -116,16 +158,16 @@ process_resources() {
     agents=$(jq -r '.resources.agents // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r agent_path; do
         [[ -z "$agent_path" ]] && continue
-        if _has_path_traversal "$agent_path"; then
-            echo -e "  ${YELLOW}Warning: agent path contains traversal, skipping: ${agent_path}${NC}" >&2
-            continue
-        fi
         local abs_path="$base_dir/$agent_path"
         if [[ ! -f "$abs_path" ]]; then
             echo -e "  ${YELLOW}Warning: agent not found: ${agent_path}${NC}" >&2
             continue
         fi
         abs_path=$(cd "$(dirname "$abs_path")" && pwd -P)/$(basename "$abs_path")
+        if ! _is_within_dir "$abs_path" "$base_dir"; then
+            echo -e "  ${YELLOW}Warning: agent escapes base directory, skipping: ${agent_path}${NC}" >&2
+            continue
+        fi
         local agent_basename
         agent_basename=$(basename "$agent_path")
         local name_no_ext="${agent_basename%.md}"
@@ -143,16 +185,16 @@ process_resources() {
     skills=$(jq -r '.resources.skills // [] | .[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r skill_path; do
         [[ -z "$skill_path" ]] && continue
-        if _has_path_traversal "$skill_path"; then
-            echo -e "  ${YELLOW}Warning: skill path contains traversal, skipping: ${skill_path}${NC}" >&2
-            continue
-        fi
         local abs_path="$base_dir/$skill_path"
         if [[ ! -d "$abs_path" ]]; then
             echo -e "  ${YELLOW}Warning: skill not found: ${skill_path}${NC}" >&2
             continue
         fi
         abs_path=$(cd "$abs_path" && pwd -P)
+        if ! _is_within_dir "$abs_path" "$base_dir"; then
+            echo -e "  ${YELLOW}Warning: skill escapes base directory, skipping: ${skill_path}${NC}" >&2
+            continue
+        fi
         local skill_basename
         skill_basename=$(basename "$skill_path")
         mkdir -p ".claude/skills"
@@ -179,7 +221,7 @@ process_resources() {
         local server_config
         server_config=$(jq -c --arg n "$server_name" '.resources.mcp[$n]' "$config_file")
 
-        mcp_batch=$(echo "$mcp_batch" | jq --arg name "$server_name" --argjson config "$server_config" '.[$name] = $config')
+        mcp_batch=$(jq --arg name "$server_name" --argjson config "$server_config" '.[$name] = $config' <<< "$mcp_batch")
 
         CURRENT_SOURCE_MCP_SERVERS+=("$server_name")
         echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
@@ -202,51 +244,6 @@ process_resources() {
     write_source_manifest "$manifest_section" "$manifest_key"
 }
 
-# ── Sync built-in skills from ~/.claude-compose/skills/ ────────────
-process_builtin_skills() {
-    if [[ ! -d "$BUILTIN_SKILLS_DIR" ]]; then
-        return
-    fi
-
-    local has_skills=false
-    for skill_path in "$BUILTIN_SKILLS_DIR"/*/; do
-        [[ -d "$skill_path" ]] || continue
-        has_skills=true
-        break
-    done
-    [[ "$has_skills" == true ]] || return
-
-    echo -e "${CYAN}Processing built-in skills${NC}" >&2
-
-    CURRENT_SOURCE_AGENTS=()
-    CURRENT_SOURCE_SKILLS=()
-    CURRENT_SOURCE_MCP_SERVERS=()
-    CURRENT_SOURCE_ADD_DIRS=()
-    CURRENT_SOURCE_PROJECT_DIRS=()
-    CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
-    CURRENT_SOURCE_SETTINGS_FILES=()
-
-    mkdir -p ".claude/skills"
-    for skill_path in "$BUILTIN_SKILLS_DIR"/*/; do
-        [[ -d "$skill_path" ]] || continue
-        local skill_name
-        skill_name=$(basename "$skill_path")
-
-        if [[ -L ".claude/skills/${skill_name}" || -d ".claude/skills/${skill_name}" ]]; then
-            rm -f ".claude/skills/${skill_name}" 2>/dev/null || rm -rf ".claude/skills/${skill_name}"
-        fi
-
-        local abs_skill_path
-        abs_skill_path=$(cd "$skill_path" && pwd -P)
-        ln -sf "$abs_skill_path" ".claude/skills/${skill_name}"
-        CURRENT_SOURCE_SKILLS+=("$skill_name")
-        echo -e "  ${GREEN}+skill:${NC} ${skill_name} (built-in)" >&2
-    done
-
-    CURRENT_SOURCE_NAME=""
-    write_source_manifest "builtin" "skills"
-}
-
 # ── Process global config ────────────────────────────────────────────
 process_global() {
     [[ ! -f "$GLOBAL_CONFIG" ]] && return
@@ -259,13 +256,7 @@ process_global() {
     local global_project_count
     global_project_count=$(jq '.projects // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
     if [[ "$global_project_count" -gt 0 ]]; then
-        CURRENT_SOURCE_AGENTS=()
-        CURRENT_SOURCE_SKILLS=()
-        CURRENT_SOURCE_MCP_SERVERS=()
-        CURRENT_SOURCE_ADD_DIRS=()
-        CURRENT_SOURCE_PROJECT_DIRS=()
-        CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
-        CURRENT_SOURCE_SETTINGS_FILES=()
+        _reset_current_source
 
         local gpi2
         for ((gpi2 = 0; gpi2 < global_project_count; gpi2++)); do
@@ -304,17 +295,13 @@ process_global() {
 build() {
     local force="${1:-false}"
 
-    local ws_count has_resources
-    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
-    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
-
-    local has_global_config=false
-    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
-
-    if [[ "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+    if ! _has_anything_to_build; then
         echo -e "${CYAN}No workspaces or resources configured. Nothing to build.${NC}" >&2
         return
     fi
+
+    local ws_count
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
 
     if [[ "$force" != "true" ]] && ! needs_rebuild; then
         echo -e "${GREEN}Workspace is up to date. Use --force to rebuild.${NC}" >&2
@@ -336,9 +323,15 @@ build() {
 
     echo -e "${BOLD}Building workspace...${NC}" >&2
 
+    # Compute hash BEFORE build to avoid TOCTOU: if a source file changes during
+    # build, the stored hash will reflect pre-build state, triggering rebuild next time.
+    local pre_build_hash
+    pre_build_hash=$(compute_build_hash)
+
     # Clean old resources from all sections
     local old_manifest
     old_manifest=$(read_manifest)
+    # Transitional: clean old builtin symlinks from pre-plugin versions
     clean_manifest_section "$old_manifest" "builtin"
     clean_manifest_section "$old_manifest" "global"
     clean_manifest_section "$old_manifest" "workspaces"
@@ -346,10 +339,19 @@ build() {
 
     # Reset state
     PROCESSED_WORKSPACES=()
-    MANIFEST_JSON='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
 
-    # Process built-in skills (first — can be overridden by resources)
-    process_builtin_skills
+    # Pre-scan direct project paths for "direct wins" dedup
+    DIRECT_PROJECT_PATHS=()
+    local _dp_count
+    _dp_count=$(jq '.projects // [] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    local _dpi
+    for ((_dpi = 0; _dpi < _dp_count; _dpi++)); do
+        local _dp_raw _dp_resolved
+        _dp_raw=$(jq -r ".projects[$_dpi].path" "$CONFIG_FILE")
+        _dp_resolved=$(expand_path "$_dp_raw" "$CONFIG_DIR")
+        [[ -d "$_dp_resolved" ]] && DIRECT_PROJECT_PATHS+=("$_dp_resolved")
+    done
 
     # Process global config (resources, workspaces)
     process_global
@@ -367,14 +369,15 @@ build() {
     # Process local resources
     process_resources
 
-    # Resolve plugins (GitHub + local)
+    # Resolve plugins (GitHub + local) — workspace plugins already collected above
     resolve_plugins "$CONFIG_FILE" "$CONFIG_DIR"
     [[ -f "$GLOBAL_CONFIG" ]] && resolve_plugins "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR"
+    _PLUGINS_RESOLVED=true
 
     # Write manifest and hash
     ensure_compose_dir
-    atomic_write "$COMPOSE_MANIFEST" "$(echo "$MANIFEST_JSON" | jq '.')"
-    atomic_write "$COMPOSE_HASH" "$(compute_build_hash)"
+    atomic_write "$COMPOSE_MANIFEST" "$(jq '.' <<< "$MANIFEST_JSON")"
+    atomic_write "$COMPOSE_HASH" "$pre_build_hash"
 
     # Ensure _warning in mcp.json
     if [[ -f "$COMPOSE_MCP" ]]; then
@@ -407,29 +410,17 @@ cmd_build() {
         echo -e "${BOLD}── Dry Run (build) ──${NC}" >&2
         echo "" >&2
 
-        local ws_count has_resources
-        ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
-        has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
-
-        local has_global_dr=false
-        [[ -f "$GLOBAL_CONFIG" ]] && has_global_dr=true
-
-        if [[ "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_dr" != "true" ]] && ! has_builtin_skills; then
+        if ! _has_anything_to_build; then
             echo -e "${CYAN}No workspaces or resources configured. Nothing to build.${NC}" >&2
             return
         fi
 
-        if has_builtin_skills; then
-            echo -e "${CYAN}Built-in skills:${NC}" >&2
-            local _d
-            for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-                [[ -d "$_d" ]] || continue
-                echo -e "  - $(basename "$_d")" >&2
-            done
+        if has_builtin_plugin; then
+            echo -e "${CYAN}Built-in plugin:${NC} ${BUILTIN_PLUGIN_DIR}" >&2
             echo "" >&2
         fi
 
-        if [[ "$has_global_dr" == true ]]; then
+        if [[ -f "$GLOBAL_CONFIG" ]]; then
             echo -e "${CYAN}Global config:${NC} ${GLOBAL_CONFIG}" >&2
             local gw_count ghr
             gw_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
@@ -439,6 +430,8 @@ cmd_build() {
             echo "" >&2
         fi
 
+        local ws_count
+        ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
         if [[ "$ws_count" -gt 0 ]]; then
             echo -e "${CYAN}Workspaces to sync:${NC}" >&2
             local drwi

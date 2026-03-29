@@ -13,6 +13,7 @@ Top-level fields:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `projects` | array | `[]` | List of external projects for file access |
+| `resources` | object | `{}` | Local agents, skills, MCP servers, env files |
 | `workspaces` | array | `[]` | Other workspaces to sync config from |
 | `plugins` | array | `[]` | Plugins: marketplace names or local paths |
 | `marketplaces` | object | `{}` | Custom plugin marketplaces |
@@ -29,7 +30,7 @@ Projects provide file access via `--add-dir` — nothing else. MCP servers, agen
 
 ## Workspaces (cross-sync)
 
-Sync MCP servers, agents, and skills from other workspaces at build time:
+Sync MCP servers, agents, skills, and plugins from other workspaces at build time:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -42,9 +43,12 @@ Sync MCP servers, agents, and skills from other workspaces at build time:
 | `agents.rename` | object | `{}` | Rename agents |
 | `skills.include` | string[] | `["*"]` | Skills to include |
 | `skills.exclude` | string[] | `[]` | Skills to exclude |
-| `claude_md` | boolean | `true` | Load CLAUDE.md from source workspace |
+| `plugins.include` | string[] | `["*"]` | Plugins to include (glob) |
+| `plugins.exclude` | string[] | `[]` | Plugins to exclude |
+| `claude_md` | boolean | `true` | Load CLAUDE.md from source workspace (cascades to child projects when false) |
+| `claude_md_overrides` | object | `{}` | Per-project claude_md overrides: `{"project-name": true}` |
 
-Source workspace's own projects (from its `claude-compose.json`) are transitively added via `--add-dir`.
+Source workspace's own projects and plugins (from its `claude-compose.json`) are transitively synced. If a project is also directly in your `projects[]`, your direct config takes priority.
 
 ## Plugins
 

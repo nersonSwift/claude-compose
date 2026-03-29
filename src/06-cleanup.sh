@@ -5,15 +5,15 @@ clean_manifest_section() {
     local section="$2"
 
     local source_names
-    source_names=$(echo "$old_manifest" | jq -r --arg s "$section" '.[$s] // {} | keys[]' 2>/dev/null || true)
+    source_names=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' <<< "$old_manifest" 2>/dev/null || true)
     while IFS= read -r source_name; do
         [[ -z "$source_name" ]] && continue
         local source_data
-        source_data=$(echo "$old_manifest" | jq -c --arg s "$section" --arg n "$source_name" '.[$s][$n]')
+        source_data=$(jq -c --arg s "$section" --arg n "$source_name" '.[$s][$n]' <<< "$old_manifest")
 
         # Delete agent files
         local agents
-        agents=$(echo "$source_data" | jq -r '.agents // [] | .[]' 2>/dev/null || true)
+        agents=$(jq -r '.agents // [] | .[]' <<< "$source_data" 2>/dev/null || true)
         while IFS= read -r agent; do
             [[ -z "$agent" ]] && continue
             [[ "$agent" == */* || "$agent" == ..* ]] && continue
@@ -25,7 +25,7 @@ clean_manifest_section() {
 
         # Delete skill symlinks/directories
         local skills
-        skills=$(echo "$source_data" | jq -r '.skills // [] | .[]' 2>/dev/null || true)
+        skills=$(jq -r '.skills // [] | .[]' <<< "$source_data" 2>/dev/null || true)
         while IFS= read -r skill; do
             [[ -z "$skill" ]] && continue
             [[ "$skill" == */* || "$skill" == ..* ]] && continue
@@ -40,7 +40,7 @@ clean_manifest_section() {
 
         # Remove MCP servers from $COMPOSE_MCP
         local mcp_servers
-        mcp_servers=$(echo "$source_data" | jq -r '.mcp_servers // [] | .[]' 2>/dev/null || true)
+        mcp_servers=$(jq -r '.mcp_servers // [] | .[]' <<< "$source_data" 2>/dev/null || true)
         if [[ -f "$COMPOSE_MCP" ]]; then
             local -a servers_to_delete=()
             while IFS= read -r server; do
@@ -50,7 +50,7 @@ clean_manifest_section() {
             done <<< "$mcp_servers"
             if [[ ${#servers_to_delete[@]} -gt 0 ]]; then
                 local del_array
-                del_array=$(printf '%s\n' "${servers_to_delete[@]}" | jq -R . | jq -sc .)
+                del_array=$(printf '%s\n' "${servers_to_delete[@]}" | jq -Rs 'split("\n") | map(select(. != ""))')
                 local tmp
                 tmp=$(jq --argjson del "$del_array" 'reduce $del[] as $s (.; del(.mcpServers[$s]))' "$COMPOSE_MCP")
                 atomic_write "$COMPOSE_MCP" "$tmp"

@@ -50,8 +50,10 @@ PROMPT_EOF
     prompt="${prompt//__WORKSPACE_DIR__/$workspace_dir}"
 
     if [[ -n "$error_msg" ]]; then
-        # Sanitize: remove backticks to prevent code fence breakout in prompt
+        # Sanitize: remove chars that could cause prompt injection or code fence breakout
         local sanitized_msg="${error_msg//\`/}"
+        sanitized_msg="${sanitized_msg//\$/}"
+        sanitized_msg="${sanitized_msg//\\/}"
         prompt="${prompt//__ERROR_CONTEXT__/$sanitized_msg}"
         prompt="${prompt//__DOCTOR_MODE__/analyze and fix the error below}"
     else
@@ -63,12 +65,11 @@ PROMPT_EOF
     local ws_summary="(no config file found)"
     if [[ -f "$config_file" ]] && jq empty "$config_file" 2>/dev/null; then
         local pc wsc ac sc mc ec
-        pc=$(jq '.projects // [] | length' "$config_file" 2>/dev/null || echo 0)
-        wsc=$(jq '.workspaces // [] | length' "$config_file" 2>/dev/null || echo 0)
-        ac=$(jq '.resources.agents // [] | length' "$config_file" 2>/dev/null || echo 0)
-        sc=$(jq '.resources.skills // [] | length' "$config_file" 2>/dev/null || echo 0)
-        mc=$(jq '.resources.mcp // {} | length' "$config_file" 2>/dev/null || echo 0)
-        ec=$(jq '.resources.env_files // [] | length' "$config_file" 2>/dev/null || echo 0)
+        read -r pc wsc ac sc mc ec < <(jq -r '[
+            (.projects//[]|length), (.workspaces//[]|length),
+            (.resources.agents//[]|length), (.resources.skills//[]|length),
+            (.resources.mcp//{}|length), (.resources.env_files//[]|length)
+        ] | @tsv' "$config_file" 2>/dev/null || echo "0	0	0	0	0	0")
         ws_summary="Projects: ${pc}, Workspaces: ${wsc}, Resources: ${ac} agents, ${sc} skills, ${mc} MCP servers, ${ec} env files"
     fi
     prompt="${prompt//__WORKSPACE_SUMMARY__/$ws_summary}"

@@ -27,24 +27,23 @@ WRAP_MODE=false             # true when running as wrap subcommand
 VSCODE_VARIANT=""           # "code", "insiders", "cursor" for vscode subcommand
 DOCTOR_ERROR_MSG=""      # Error message for doctor mode
 DOCTOR_ENABLED=true      # false prevents doctor trap (when claude/jq missing)
-BUILTIN_SKILLS_DIR="$HOME/.claude-compose/skills"
+BUILTIN_PLUGIN_DIR="$HOME/.claude-compose/compose-plugin"
 GLOBAL_CONFIG="$HOME/.claude-compose/global.json"
 GLOBAL_CONFIG_DIR="$HOME/.claude-compose"
 PROCESSED_WORKSPACES=() # workspace dedup (absolute paths)
+DIRECT_PROJECT_PATHS=()  # Abs paths of directly-configured projects (for "direct wins" dedup)
 PLUGIN_DIRS=()              # Resolved plugin directory paths for --plugin-dir
 MARKETPLACE_PLUGINS=()          # "name@marketplace" entries to enable
 PLUGIN_CONFIG_ENVS=()           # "KEY=VALUE" pairs for CLAUDE_PLUGIN_OPTION_*
 _PLUGINS_RESOLVED=false     # Guard: true after resolve_plugins() ran
 
 # Manifest state (built during build)
-MANIFEST_JSON='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
+MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
 CURRENT_SOURCE_AGENTS=()
 CURRENT_SOURCE_SKILLS=()
 CURRENT_SOURCE_MCP_SERVERS=()
 CURRENT_SOURCE_ADD_DIRS=()
 CURRENT_SOURCE_PROJECT_DIRS=()
-CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()  # Collected system prompt file paths (workspaces)
-CURRENT_SOURCE_SETTINGS_FILES=()       # Collected settings file paths (workspaces)
 CURRENT_SOURCE_NAME=""
 _BUILD_LOCK_HELD=false
 

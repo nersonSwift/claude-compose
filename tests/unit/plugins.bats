@@ -235,3 +235,102 @@ teardown() {
     # Check config env vars
     [[ ${#PLUGIN_CONFIG_ENVS[@]} -eq 2 ]]
 }
+
+# ── dedup tests ──────────────────────────────────────────────────
+
+@test "resolve_plugins: dedup local path last wins" {
+    local plugin_dir="${TEST_TEMP_DIR}/my-plugin"
+    mkdir -p "$plugin_dir"
+    local cfg1="${TEST_TEMP_DIR}/cfg1.json"
+    local cfg2="${TEST_TEMP_DIR}/cfg2.json"
+    echo "{\"plugins\":[\"$plugin_dir\"]}" > "$cfg1"
+    echo "{\"plugins\":[\"$plugin_dir\"]}" > "$cfg2"
+
+    PLUGIN_DIRS=()
+    _PLUGINS_RESOLVED=false
+    resolve_plugins "$cfg1" "${TEST_TEMP_DIR}"
+    _PLUGINS_RESOLVED=false
+    resolve_plugins "$cfg2" "${TEST_TEMP_DIR}"
+
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == "$plugin_dir" ]]
+}
+
+@test "resolve_plugins: dedup marketplace plugin last wins" {
+    local cfg1="${TEST_TEMP_DIR}/cfg1.json"
+    local cfg2="${TEST_TEMP_DIR}/cfg2.json"
+    echo '{"plugins":["ralph-loop"]}' > "$cfg1"
+    echo '{"plugins":["ralph-loop"]}' > "$cfg2"
+
+    _install_marketplace_plugin() { return 0; }
+    export -f _install_marketplace_plugin
+    MARKETPLACE_PLUGINS=()
+    _PLUGINS_RESOLVED=false
+    resolve_plugins "$cfg1" "${TEST_TEMP_DIR}"
+    _PLUGINS_RESOLVED=false
+    resolve_plugins "$cfg2" "${TEST_TEMP_DIR}"
+
+    [[ ${#MARKETPLACE_PLUGINS[@]} -eq 1 ]]
+    [[ "${MARKETPLACE_PLUGINS[0]}" == "ralph-loop" ]]
+}
+
+# ── collect_workspace_plugins ────────────────────────────────────
+
+@test "collect_workspace_plugins: collects local plugin from workspace" {
+    local ws_dir="${TEST_TEMP_DIR}/ws"
+    local plugin_dir="${ws_dir}/plugins/my-plugin"
+    mkdir -p "$plugin_dir"
+    echo "{\"plugins\":[\"./plugins/my-plugin\"]}" > "${ws_dir}/claude-compose.json"
+
+    PLUGIN_DIRS=()
+    collect_workspace_plugins "${ws_dir}/claude-compose.json" "$ws_dir" '{}'
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == *"/plugins/my-plugin" ]]
+}
+
+@test "collect_workspace_plugins: applies include filter" {
+    local ws_dir="${TEST_TEMP_DIR}/ws"
+    mkdir -p "${ws_dir}/plugins/keep-me" "${ws_dir}/plugins/skip-me"
+    echo '{"plugins":["./plugins/keep-me","./plugins/skip-me"]}' > "${ws_dir}/claude-compose.json"
+
+    PLUGIN_DIRS=()
+    collect_workspace_plugins "${ws_dir}/claude-compose.json" "$ws_dir" '{"plugins":{"include":["keep-*"]}}'
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == *"/keep-me" ]]
+}
+
+@test "collect_workspace_plugins: applies exclude filter" {
+    local ws_dir="${TEST_TEMP_DIR}/ws"
+    mkdir -p "${ws_dir}/plugins/good" "${ws_dir}/plugins/bad"
+    echo '{"plugins":["./plugins/good","./plugins/bad"]}' > "${ws_dir}/claude-compose.json"
+
+    PLUGIN_DIRS=()
+    collect_workspace_plugins "${ws_dir}/claude-compose.json" "$ws_dir" '{"plugins":{"exclude":["bad"]}}'
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == *"/good" ]]
+}
+
+@test "collect_workspace_plugins: resolves paths relative to workspace dir" {
+    local ws_dir="${TEST_TEMP_DIR}/ws-a"
+    local root_dir="${TEST_TEMP_DIR}/root"
+    mkdir -p "${ws_dir}/my-plugin" "$root_dir"
+    echo '{"plugins":["./my-plugin"]}' > "${ws_dir}/claude-compose.json"
+
+    PLUGIN_DIRS=()
+    collect_workspace_plugins "${ws_dir}/claude-compose.json" "$ws_dir" '{}'
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == "${ws_dir}/my-plugin" || "${PLUGIN_DIRS[0]}" == "${ws_dir}/./my-plugin" ]]
+}
+
+@test "collect_workspace_plugins: marketplace plugin with filter" {
+    local ws_dir="${TEST_TEMP_DIR}/ws"
+    mkdir -p "$ws_dir"
+    echo '{"plugins":["ralph-loop","debug-tool"]}' > "${ws_dir}/claude-compose.json"
+
+    _install_marketplace_plugin() { return 0; }
+    export -f _install_marketplace_plugin
+    MARKETPLACE_PLUGINS=()
+    collect_workspace_plugins "${ws_dir}/claude-compose.json" "$ws_dir" '{"plugins":{"exclude":["debug-*"]}}'
+    [[ ${#MARKETPLACE_PLUGINS[@]} -eq 1 ]]
+    [[ "${MARKETPLACE_PLUGINS[0]}" == "ralph-loop" ]]
+}

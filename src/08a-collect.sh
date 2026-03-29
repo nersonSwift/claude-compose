@@ -28,6 +28,9 @@ _collect_project_args() {
         project_path=$(expand_path "$raw_path" "$CONFIG_DIR")
         claude_md=$(jq -r ".projects[$mpi].claude_md // true" "$CONFIG_FILE")
         project_name=$(jq -r ".projects[$mpi].name // empty" "$CONFIG_FILE")
+        # Sanitize: strip newlines/control chars to prevent prompt injection via config
+        project_name="${project_name//$'\n'/}"
+        project_name="${project_name//$'\r'/}"
 
         if [[ ! -d "$project_path" ]]; then
             [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
@@ -88,11 +91,11 @@ _collect_manifest_args() {
                 while IFS= read -r entry; do
                     [[ -z "$entry" ]] && continue
                     local dir cm_flag
-                    if echo "$entry" | jq -e '.path' >/dev/null 2>&1; then
-                        dir=$(echo "$entry" | jq -r '.path')
-                        cm_flag=$(echo "$entry" | jq -r '.claude_md // true')
+                    if jq -e '.path' <<< "$entry" >/dev/null 2>&1; then
+                        dir=$(jq -r '.path' <<< "$entry")
+                        cm_flag=$(jq -r '.claude_md // true' <<< "$entry")
                     else
-                        dir=$(echo "$entry" | jq -r '.')
+                        dir=$(jq -r '.' <<< "$entry")
                         cm_flag="true"
                     fi
                     [[ -z "$dir" || ! -d "$dir" ]] && continue
@@ -109,8 +112,14 @@ _collect_manifest_args() {
                 while IFS= read -r proj_entry; do
                     [[ -z "$proj_entry" ]] && continue
                     local proj_path proj_cmd
-                    proj_path=$(echo "$proj_entry" | jq -r '.path')
-                    proj_cmd=$(echo "$proj_entry" | jq -r '.claude_md')
+                    proj_path=$(jq -r '.path' <<< "$proj_entry")
+                    proj_cmd=$(jq -r '.claude_md' <<< "$proj_entry")
+                    # Direct-wins dedup: skip if already directly configured
+                    local _is_direct=false _ddp
+                    for _ddp in "${DIRECT_PROJECT_PATHS[@]+"${DIRECT_PROJECT_PATHS[@]}"}"; do
+                        [[ "$_ddp" == "$proj_path" ]] && _is_direct=true && break
+                    done
+                    [[ "$_is_direct" == "true" ]] && continue
                     if [[ -d "$proj_path" ]]; then
                         CLAUDE_ARGS+=("--add-dir" "$proj_path")
                         HAS_ANY_ADD_DIR=true
@@ -120,23 +129,6 @@ _collect_manifest_args() {
                     fi
                 done <<< "$proj_dirs"
 
-                # system_prompt_files from manifest
-                local spf_list
-                spf_list=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].system_prompt_files // [] | .[]' "$COMPOSE_MANIFEST" 2>/dev/null || true)
-                while IFS= read -r spf; do
-                    [[ -z "$spf" || ! -f "$spf" ]] && continue
-                    _SYSTEM_PROMPT+=$'\n\n'"$(cat "$spf")"
-                done <<< "$spf_list"
-
-                # settings_files from manifest
-                local sf_list
-                sf_list=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].settings_files // [] | .[]' "$COMPOSE_MANIFEST" 2>/dev/null || true)
-                while IFS= read -r sf; do
-                    [[ -z "$sf" || ! -f "$sf" ]] && continue
-                    if jq empty "$sf" 2>/dev/null; then
-                        _COMPOSE_SETTINGS=$(merge_compose_settings "$_COMPOSE_SETTINGS" "$(cat "$sf")")
-                    fi
-                done <<< "$sf_list"
             done <<< "$source_names"
         done
     fi
@@ -185,9 +177,9 @@ _build_settings() {
         local excludes_json="[]"
         local exc_path
         for exc_path in "${COMPOSE_CLAUDE_MD_EXCLUDES[@]}"; do
-            excludes_json=$(echo "$excludes_json" | jq --arg p "$exc_path" '. + [$p + "/CLAUDE.md", $p + "/.claude/CLAUDE.md", $p + "/.claude/rules/*.md"]')
+            excludes_json=$(jq --arg p "$exc_path" '. + [$p + "/CLAUDE.md", $p + "/.claude/CLAUDE.md", $p + "/.claude/rules/*.md"]' <<< "$excludes_json")
         done
-        _COMPOSE_SETTINGS=$(echo "$_COMPOSE_SETTINGS" | jq --argjson exc "$excludes_json" '.claudeMdExcludes = $exc')
+        _COMPOSE_SETTINGS=$(jq --argjson exc "$excludes_json" '.claudeMdExcludes = $exc' <<< "$_COMPOSE_SETTINGS")
     fi
 
     # Merge settings: compose-generated (base) → global overlay → local overlay (local wins)
@@ -220,22 +212,22 @@ _build_settings() {
         local enabled_json='{}'
         local mp
         for mp in "${MARKETPLACE_PLUGINS[@]}"; do
-            enabled_json=$(echo "$enabled_json" | jq --arg k "$mp" '.[$k] = true')
+            enabled_json=$(jq --arg k "$mp" '.[$k] = true' <<< "$enabled_json")
         done
-        _COMPOSE_SETTINGS=$(echo "$_COMPOSE_SETTINGS" | jq --argjson ep "$enabled_json" '.enabledPlugins = ((.enabledPlugins // {}) + $ep)')
+        _COMPOSE_SETTINGS=$(jq --argjson ep "$enabled_json" '.enabledPlugins = ((.enabledPlugins // {}) + $ep)' <<< "$_COMPOSE_SETTINGS")
     fi
 
     # Merge extraKnownMarketplaces from config
     local mkts
     mkts=$(jq -c '.marketplaces // {}' "$CONFIG_FILE" 2>/dev/null || echo '{}')
     if [[ "$mkts" != "{}" && "$mkts" != "null" ]]; then
-        _COMPOSE_SETTINGS=$(echo "$_COMPOSE_SETTINGS" | jq --argjson m "$mkts" '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $m)')
+        _COMPOSE_SETTINGS=$(jq --argjson m "$mkts" '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $m)' <<< "$_COMPOSE_SETTINGS")
     fi
     if [[ -f "$GLOBAL_CONFIG" ]]; then
         local global_mkts
         global_mkts=$(jq -c '.marketplaces // {}' "$GLOBAL_CONFIG" 2>/dev/null || echo '{}')
         if [[ "$global_mkts" != "{}" && "$global_mkts" != "null" ]]; then
-            _COMPOSE_SETTINGS=$(echo "$_COMPOSE_SETTINGS" | jq --argjson m "$global_mkts" '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $m)')
+            _COMPOSE_SETTINGS=$(jq --argjson m "$global_mkts" '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $m)' <<< "$_COMPOSE_SETTINGS")
         fi
     fi
 
@@ -243,7 +235,7 @@ _build_settings() {
     if [[ "$_COMPOSE_SETTINGS" != '{}' ]]; then
         if [[ "$DRY_RUN" != true ]]; then
             ensure_compose_dir
-            atomic_write "$COMPOSE_SETTINGS" "$(echo "$_COMPOSE_SETTINGS" | jq '.')"
+            atomic_write "$COMPOSE_SETTINGS" "$(jq '.' <<< "$_COMPOSE_SETTINGS")"
         fi
         if [[ "$use_absolute" == "true" ]]; then
             CLAUDE_ARGS+=("--settings" "$(pwd -P)/$COMPOSE_SETTINGS")
@@ -279,6 +271,96 @@ _install_marketplace_plugin() {
     fi
 }
 
+# ── Plugin dedup helpers (last wins) ─────────────────────────────
+_dedup_plugin_dir() {
+    local target="$1" i new=()
+    for i in "${PLUGIN_DIRS[@]+"${PLUGIN_DIRS[@]}"}"; do
+        [[ "$i" != "$target" ]] && new+=("$i")
+    done
+    PLUGIN_DIRS=("${new[@]+"${new[@]}"}")
+}
+
+_dedup_marketplace_plugin() {
+    local target="$1" i new=()
+    for i in "${MARKETPLACE_PLUGINS[@]+"${MARKETPLACE_PLUGINS[@]}"}"; do
+        [[ "$i" != "$target" ]] && new+=("$i")
+    done
+    MARKETPLACE_PLUGINS=("${new[@]+"${new[@]}"}")
+}
+
+# ── _resolve_single_plugin ──────────────────────────────────────
+# Resolve a single plugin entry from a config file.
+# $1 = config file, $2 = plugin index, $3 = base dir for relative paths
+# Populates PLUGIN_DIRS[], MARKETPLACE_PLUGINS[], PLUGIN_CONFIG_ENVS[]
+_resolve_single_plugin() {
+    local config_file="$1" pi="$2" base_dir="$3"
+
+    local entry_type
+    entry_type=$(jq -r ".plugins[$pi] | type" "$config_file")
+
+    if [[ "$entry_type" == "string" ]]; then
+        local str_val
+        str_val=$(jq -r ".plugins[$pi]" "$config_file")
+        if [[ "$str_val" == ./* || "$str_val" == ~* || "$str_val" == /* ]]; then
+            local plugin_dir
+            plugin_dir=$(expand_path "$str_val")
+            [[ "$plugin_dir" != /* ]] && plugin_dir="$base_dir/$plugin_dir"
+            if [[ -d "$plugin_dir" ]]; then
+                _dedup_plugin_dir "$plugin_dir"
+                PLUGIN_DIRS+=("$plugin_dir")
+            else
+                echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
+            fi
+        else
+            _dedup_marketplace_plugin "$str_val"
+            _install_marketplace_plugin "$str_val"
+            MARKETPLACE_PLUGINS+=("$str_val")
+        fi
+
+    elif [[ "$entry_type" == "object" ]]; then
+        local p_path p_name
+        p_path=$(jq -r ".plugins[$pi].path // empty" "$config_file")
+        p_name=$(jq -r ".plugins[$pi].name // empty" "$config_file")
+
+        if [[ -n "$p_path" ]]; then
+            local plugin_dir
+            plugin_dir=$(expand_path "$p_path")
+            [[ "$plugin_dir" != /* ]] && plugin_dir="$base_dir/$plugin_dir"
+            if [[ -d "$plugin_dir" ]]; then
+                _dedup_plugin_dir "$plugin_dir"
+                PLUGIN_DIRS+=("$plugin_dir")
+            else
+                echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
+            fi
+        elif [[ -n "$p_name" ]]; then
+            _dedup_marketplace_plugin "$p_name"
+            _install_marketplace_plugin "$p_name"
+            MARKETPLACE_PLUGINS+=("$p_name")
+
+            # Parse config keys → CLAUDE_PLUGIN_OPTION_* env vars
+            local has_config
+            has_config=$(jq -r ".plugins[$pi] | has(\"config\")" "$config_file")
+            if [[ "$has_config" == "true" ]]; then
+                local config_keys
+                config_keys=$(jq -r ".plugins[$pi].config | keys[]" "$config_file" 2>/dev/null || true)
+                while IFS= read -r ckey; do
+                    [[ -z "$ckey" ]] && continue
+                    local cval upper_key
+                    cval=$(jq -r --arg k "$ckey" ".plugins[$pi].config[\$k]" "$config_file")
+                    upper_key=$(echo "$ckey" | tr '[:lower:]' '[:upper:]')
+                    # Remove old config for this key (last wins)
+                    local _env_new=() _e
+                    for _e in "${PLUGIN_CONFIG_ENVS[@]+"${PLUGIN_CONFIG_ENVS[@]}"}"; do
+                        [[ "$_e" != "CLAUDE_PLUGIN_OPTION_${upper_key}="* ]] && _env_new+=("$_e")
+                    done
+                    PLUGIN_CONFIG_ENVS=("${_env_new[@]+"${_env_new[@]}"}")
+                    PLUGIN_CONFIG_ENVS+=("CLAUDE_PLUGIN_OPTION_${upper_key}=${cval}")
+                done <<< "$config_keys"
+            fi
+        fi
+    fi
+}
+
 # ── resolve_plugins ───────────────────────────────────────────────
 # Resolve plugins from config: local paths → PLUGIN_DIRS[], marketplace names → MARKETPLACE_PLUGINS[].
 # $1 = config file, $2 = base directory for relative path resolution.
@@ -295,66 +377,53 @@ resolve_plugins() {
 
     local pi
     for ((pi = 0; pi < plugin_count; pi++)); do
-        local entry_type
-        entry_type=$(jq -r ".plugins[$pi] | type" "$config_file")
-
-        if [[ "$entry_type" == "string" ]]; then
-            local str_val
-            str_val=$(jq -r ".plugins[$pi]" "$config_file")
-            if [[ "$str_val" == ./* || "$str_val" == ~* || "$str_val" == /* ]]; then
-                # Local path
-                local plugin_dir
-                plugin_dir=$(expand_path "$str_val")
-                [[ "$plugin_dir" != /* ]] && plugin_dir="$base_dir/$plugin_dir"
-                if [[ -d "$plugin_dir" ]]; then
-                    PLUGIN_DIRS+=("$plugin_dir")
-                else
-                    echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
-                fi
-            else
-                # Marketplace name (e.g. "ralph-loop" or "code-review@my-marketplace")
-                _install_marketplace_plugin "$str_val"
-                MARKETPLACE_PLUGINS+=("$str_val")
-            fi
-
-        elif [[ "$entry_type" == "object" ]]; then
-            local p_path p_name
-            p_path=$(jq -r ".plugins[$pi].path // empty" "$config_file")
-            p_name=$(jq -r ".plugins[$pi].name // empty" "$config_file")
-
-            if [[ -n "$p_path" ]]; then
-                # Local path (object form)
-                local plugin_dir
-                plugin_dir=$(expand_path "$p_path")
-                [[ "$plugin_dir" != /* ]] && plugin_dir="$base_dir/$plugin_dir"
-                if [[ -d "$plugin_dir" ]]; then
-                    PLUGIN_DIRS+=("$plugin_dir")
-                else
-                    echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
-                fi
-            elif [[ -n "$p_name" ]]; then
-                # Marketplace plugin (object form with optional config)
-                _install_marketplace_plugin "$p_name"
-                MARKETPLACE_PLUGINS+=("$p_name")
-
-                # Parse config keys → CLAUDE_PLUGIN_OPTION_* env vars
-                local has_config
-                has_config=$(jq -r ".plugins[$pi] | has(\"config\")" "$config_file")
-                if [[ "$has_config" == "true" ]]; then
-                    local config_keys
-                    config_keys=$(jq -r ".plugins[$pi].config | keys[]" "$config_file" 2>/dev/null || true)
-                    while IFS= read -r ckey; do
-                        [[ -z "$ckey" ]] && continue
-                        local cval upper_key
-                        cval=$(jq -r ".plugins[$pi].config[\"$ckey\"]" "$config_file")
-                        upper_key=$(echo "$ckey" | tr '[:lower:]' '[:upper:]')
-                        PLUGIN_CONFIG_ENVS+=("CLAUDE_PLUGIN_OPTION_${upper_key}=${cval}")
-                    done <<< "$config_keys"
-                fi
-            fi
-        fi
+        _resolve_single_plugin "$config_file" "$pi" "$base_dir"
     done
     _PLUGINS_RESOLVED=true
+}
+
+# ── collect_workspace_plugins ────────────────────────────────────
+# Collect plugins from a workspace's claude-compose.json, applying include/exclude.
+# $1 = workspace config file, $2 = workspace base dir, $3 = filter JSON
+collect_workspace_plugins() {
+    local ws_config="$1" ws_base_dir="$2" filter_json="$3"
+    [[ ! -f "$ws_config" ]] && return
+
+    local plugin_count
+    plugin_count=$(jq '.plugins // [] | length' "$ws_config" 2>/dev/null || echo 0)
+    [[ "$plugin_count" -eq 0 ]] && return
+
+    local plugins_include plugins_exclude
+    plugins_include=$(jq -c '.plugins.include // ["*"]' <<< "$filter_json")
+    plugins_exclude=$(jq -c '.plugins.exclude // []' <<< "$filter_json")
+
+    local pi
+    for ((pi = 0; pi < plugin_count; pi++)); do
+        # Determine plugin identifier for filtering
+        local plugin_id=""
+        local entry_type
+        entry_type=$(jq -r ".plugins[$pi] | type" "$ws_config")
+        if [[ "$entry_type" == "string" ]]; then
+            local str_val
+            str_val=$(jq -r ".plugins[$pi]" "$ws_config")
+            if [[ "$str_val" == ./* || "$str_val" == ~* || "$str_val" == /* ]]; then
+                plugin_id=$(basename "$str_val")
+            else
+                plugin_id="$str_val"
+            fi
+        elif [[ "$entry_type" == "object" ]]; then
+            local p_path p_name
+            p_path=$(jq -r ".plugins[$pi].path // empty" "$ws_config")
+            p_name=$(jq -r ".plugins[$pi].name // empty" "$ws_config")
+            plugin_id="${p_name:-$(basename "${p_path:-unknown}")}"
+        fi
+
+        [[ -z "$plugin_id" ]] && continue
+        matches_filter "$plugin_id" "$plugins_include" "$plugins_exclude" || continue
+
+        # Resolve using shared helper (with ws_base_dir for relative paths)
+        _resolve_single_plugin "$ws_config" "$pi" "$ws_base_dir"
+    done
 }
 
 # ── _collect_plugin_args ──────────────────────────────────────────
@@ -368,6 +437,15 @@ _collect_plugin_args() {
     if [[ "$_PLUGINS_RESOLVED" != "true" ]]; then
         resolve_plugins "$CONFIG_FILE" "$base_dir"
         [[ -f "$GLOBAL_CONFIG" ]] && resolve_plugins "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR"
+    fi
+
+    # Always include built-in compose plugin first
+    if [[ -d "$BUILTIN_PLUGIN_DIR/.claude-plugin" ]]; then
+        local _already=false _pd
+        for _pd in "${PLUGIN_DIRS[@]+"${PLUGIN_DIRS[@]}"}"; do
+            [[ "$_pd" == "$BUILTIN_PLUGIN_DIR" ]] && _already=true && break
+        done
+        [[ "$_already" == false ]] && PLUGIN_DIRS=("$BUILTIN_PLUGIN_DIR" "${PLUGIN_DIRS[@]+"${PLUGIN_DIRS[@]}"}")
     fi
 
     local pdir

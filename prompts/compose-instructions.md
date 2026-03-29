@@ -82,7 +82,13 @@ Same schema as `claude-compose.json`. Applied automatically to all workspaces, n
     { "path": "~/Code/my-lib", "name": "mylib", "claude_md": false }
   ],
   "workspaces": [
-    { "path": "~/workspaces/shared", "mcp": { "rename": { "cal": "shared-cal" } } }
+    {
+      "path": "~/workspaces/shared",
+      "mcp": { "rename": { "cal": "shared-cal" } },
+      "plugins": { "exclude": ["debug-*"] },
+      "claude_md": true,
+      "claude_md_overrides": { "internal-tool": false }
+    }
   ],
   "plugins": ["ralph-loop", "./local/plugin"]
 }

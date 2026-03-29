@@ -61,7 +61,7 @@ matches_filter() {
     local exclude_json="$3"
 
     local include_count
-    include_count=$(echo "$include_json" | jq -r 'length')
+    include_count=$(jq -r 'length' <<< "$include_json")
 
     if [[ "$include_count" -eq 0 ]]; then
         return 1
@@ -75,7 +75,7 @@ matches_filter() {
             included=true
             break
         fi
-    done < <(echo "$include_json" | jq -r '.[]')
+    done < <(jq -r '.[]' <<< "$include_json")
 
     if [[ "$included" == false ]]; then
         return 1
@@ -87,7 +87,7 @@ matches_filter() {
         if [[ "$name" == $pattern ]]; then
             return 1
         fi
-    done < <(echo "$exclude_json" | jq -r '.[]')
+    done < <(jq -r '.[]' <<< "$exclude_json")
 
     return 0
 }
@@ -99,11 +99,11 @@ expand_path() {
     local base_dir="${2:-}"
     path="${path/#\~/$HOME}"
     if [[ "$path" == /* ]]; then
-        echo "$path"
+        printf '%s\n' "$path"
     elif [[ -n "$base_dir" ]]; then
-        echo "${base_dir}/${path}"
+        printf '%s\n' "${base_dir}/${path}"
     else
-        echo "$path"
+        printf '%s\n' "$path"
     fi
 }
 
@@ -328,14 +328,9 @@ require_claude() {
     fi
 }
 
-# ── Builtin skills check ───────────────────────────────────────────
-has_builtin_skills() {
-    [[ ! -d "$BUILTIN_SKILLS_DIR" ]] && return 1
-    local _d
-    for _d in "$BUILTIN_SKILLS_DIR"/*/; do
-        [[ -d "$_d" ]] && return 0
-    done
-    return 1
+# ── Builtin plugin check ───────────────────────────────────────────
+has_builtin_plugin() {
+    [[ -d "$BUILTIN_PLUGIN_DIR/.claude-plugin" ]]
 }
 
 # ── Doctor helpers ──────────────────────────────────────────────────
@@ -480,6 +475,25 @@ rewrite_frontmatter_name() {
         in_fm && !done && /^name:/ { print "name: " ENVIRON["_AWK_NEW_NAME"]; done = 1; next }
         { print }
     ' "$input" > "$output"
+}
+
+# ── Check if there are any resources to build ────────────────────────
+_has_anything_to_build() {
+    local ws_count has_resources has_global
+    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
+    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
+    has_global=false; [[ -f "$GLOBAL_CONFIG" ]] && has_global=true
+    [[ "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global" == "true" ]] || has_builtin_plugin
+}
+
+# ── Reset source tracking arrays ──────────────────────────────────────
+_reset_current_source() {
+    CURRENT_SOURCE_AGENTS=()
+    CURRENT_SOURCE_SKILLS=()
+    CURRENT_SOURCE_MCP_SERVERS=()
+    CURRENT_SOURCE_ADD_DIRS=()
+    CURRENT_SOURCE_PROJECT_DIRS=()
+    CURRENT_SOURCE_NAME=""
 }
 
 # Acquire a directory-based lock (POSIX-portable, no flock needed)

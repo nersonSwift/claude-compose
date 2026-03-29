@@ -8,65 +8,13 @@ Root path hint: `__START_ROOT_PATH__`
 
 ## Full compose knowledge
 
-claude-compose is a multi-project workspace launcher (like Docker Compose for Claude Code). It creates a unified working environment where you can work across multiple codebases simultaneously.
-
-### Key concepts
-
-**Workspace directory** — a directory containing `claude-compose.json` and all Claude configuration. It may contain its own code, or serve purely as a launch point.
-
-**Projects** — external codebases added to a workspace. They provide file access (read/write) and optionally their CLAUDE.md instructions. Referenced by aliases (e.g., `myapp://src/main.ts`).
-
-**Presets** — reusable sets of resources (MCP servers, agents, skills) stored at `~/.claude-compose/presets/<name>/`. Activated by name in config.
-
-**Workspaces** — other claude-compose workspaces that can share their configuration into a new workspace at build time.
-
-**Build** — the process of syncing resources from presets/workspaces/local config into the workspace. Runs automatically at launch.
-
-**Global config** — `~/.claude-compose/global.json` applies to all workspaces automatically.
-
-### Config schema (claude-compose.json)
-
-```json
-{
-  "projects": [
-    { "path": "~/Code/my-app", "name": "myapp" },
-    { "path": "~/Code/my-lib", "name": "mylib", "claude_md": false }
-  ],
-  "presets": ["my-tools"],
-  "workspaces": [
-    { "path": "~/other-workspace" }
-  ],
-  "resources": {
-    "agents": ["agents/reviewer.md"],
-    "skills": ["skills/commit"],
-    "mcp": { "server-name": { "command": "...", "args": ["..."] } },
-    "env_files": [".env.json"]
-  }
-}
-```
-
-- `projects[].path` — path to project (required). Keep `~` as-is.
-- `projects[].name` — short alias (required). Used as `name://` prefix for file references.
-- `projects[].claude_md` — load CLAUDE.md from project (default: true, omit if true)
-- Omit fields that equal defaults. Minimal entry: `{"path": "~/path", "name": "alias"}`
+__PROMPT_COMPOSE_KNOWLEDGE__
 
 ### Workspace organization patterns
 
 1. **Single workspace** — one workspace with all projects. Best for related projects that you work on together.
 2. **Multiple workspaces** — separate workspaces for different contexts (e.g., work vs personal, frontend vs backend). Good for isolation.
 3. **Per-project workspaces** — one workspace per project. Useful when projects are independent.
-
-### CLI reference
-
-```
-claude-compose                        # launch workspace
-claude-compose build [--force]        # build/rebuild resources
-claude-compose config                 # create or edit config interactively
-claude-compose config -y ~/path       # quick-create with one project
-claude-compose migrate ~/project      # import existing Claude config from a project
-claude-compose doctor                 # diagnose and fix problems
-claude-compose --dry-run              # preview mode
-```
 
 ---
 

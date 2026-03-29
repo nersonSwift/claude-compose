@@ -217,3 +217,98 @@ EOF
     agent_count=$(echo "$MANIFEST_JSON" | jq '.presets["empty"].agents | length')
     [[ "$agent_count" == "0" ]]
 }
+
+# ── process_workspace_source: claude_md cascade ──────────────────
+
+@test "process_workspace_source: claude_md false cascades to projects" {
+    # Create a workspace with a project that has claude_md: true
+    local ws_dir="${TEST_TEMP_DIR}/ws-cascade"
+    local proj_dir="${TEST_TEMP_DIR}/proj-a"
+    mkdir -p "$ws_dir" "$proj_dir"
+    echo '{"projects":[{"path":"'"$proj_dir"'","name":"proj-a","claude_md":true}]}' > "${ws_dir}/claude-compose.json"
+
+    cd "${TEST_TEMP_DIR}/workspace"
+    PROCESSED_WORKSPACES=()
+    DIRECT_PROJECT_PATHS=()
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
+
+    local ws_json='{"path":"'"$ws_dir"'","claude_md":false}'
+    process_workspace_source "$ws_json"
+
+    # Resolve ws_dir the same way process_workspace_source does (macOS /private/var symlinks)
+    local resolved_ws_dir
+    resolved_ws_dir=$(cd "$ws_dir" && pwd -P)
+
+    # The project_dirs in manifest should have claude_md=false (cascade)
+    local cm_val
+    cm_val=$(echo "$MANIFEST_JSON" | jq -r --arg k "$resolved_ws_dir" '.workspaces[$k].project_dirs[0].claude_md')
+    [[ "$cm_val" == "false" ]]
+}
+
+@test "process_workspace_source: claude_md_overrides takes priority over cascade" {
+    local ws_dir="${TEST_TEMP_DIR}/ws-override"
+    local proj_a="${TEST_TEMP_DIR}/proj-a"
+    local proj_b="${TEST_TEMP_DIR}/proj-b"
+    mkdir -p "$ws_dir" "$proj_a" "$proj_b"
+    echo '{"projects":[{"path":"'"$proj_a"'","name":"proj-a"},{"path":"'"$proj_b"'","name":"proj-b"}]}' > "${ws_dir}/claude-compose.json"
+
+    cd "${TEST_TEMP_DIR}/workspace"
+    PROCESSED_WORKSPACES=()
+    DIRECT_PROJECT_PATHS=()
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
+
+    local ws_json='{"path":"'"$ws_dir"'","claude_md":false,"claude_md_overrides":{"proj-a":true}}'
+    process_workspace_source "$ws_json"
+
+    local resolved_ws_dir
+    resolved_ws_dir=$(cd "$ws_dir" && pwd -P)
+
+    # proj-a should be true (override), proj-b should be false (cascade)
+    local cm_a cm_b
+    cm_a=$(echo "$MANIFEST_JSON" | jq -r --arg k "$resolved_ws_dir" --arg p "$proj_a" '.workspaces[$k].project_dirs[] | select(.path == $p) | .claude_md')
+    cm_b=$(echo "$MANIFEST_JSON" | jq -r --arg k "$resolved_ws_dir" --arg p "$proj_b" '.workspaces[$k].project_dirs[] | select(.path == $p) | .claude_md')
+    [[ "$cm_a" == "true" ]]
+    [[ "$cm_b" == "false" ]]
+}
+
+@test "process_workspace_source: direct project wins over workspace indirect" {
+    local ws_dir="${TEST_TEMP_DIR}/ws-direct"
+    local proj_dir="${TEST_TEMP_DIR}/proj-direct"
+    mkdir -p "$ws_dir" "$proj_dir"
+    echo '{"projects":[{"path":"'"$proj_dir"'","name":"proj-direct","claude_md":true}]}' > "${ws_dir}/claude-compose.json"
+
+    cd "${TEST_TEMP_DIR}/workspace"
+    PROCESSED_WORKSPACES=()
+    DIRECT_PROJECT_PATHS=("$proj_dir")
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
+
+    local ws_json='{"path":"'"$ws_dir"'"}'
+    process_workspace_source "$ws_json"
+
+    local resolved_ws_dir
+    resolved_ws_dir=$(cd "$ws_dir" && pwd -P)
+
+    # proj-direct should be skipped (not in manifest project_dirs)
+    local proj_count
+    proj_count=$(echo "$MANIFEST_JSON" | jq --arg k "$resolved_ws_dir" '.workspaces[$k].project_dirs | length')
+    [[ "$proj_count" == "0" ]]
+}
+
+@test "process_workspace_source: collects workspace plugins" {
+    local ws_dir="${TEST_TEMP_DIR}/ws-plugins"
+    local plugin_dir="${ws_dir}/my-plugin"
+    mkdir -p "$plugin_dir"
+    echo '{"plugins":["./my-plugin"]}' > "${ws_dir}/claude-compose.json"
+
+    cd "${TEST_TEMP_DIR}/workspace"
+    PROCESSED_WORKSPACES=()
+    DIRECT_PROJECT_PATHS=()
+    PLUGIN_DIRS=()
+    MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
+
+    local ws_json='{"path":"'"$ws_dir"'"}'
+    process_workspace_source "$ws_json"
+
+    [[ ${#PLUGIN_DIRS[@]} -eq 1 ]]
+    [[ "${PLUGIN_DIRS[0]}" == *"/my-plugin" ]]
+}

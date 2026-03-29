@@ -9,8 +9,8 @@ main() {
         return
     fi
 
-    # Ensure built-in skills are extracted
-    ensure_builtin_skills
+    # Ensure built-in plugin is extracted
+    ensure_builtin_plugin
 
     # Resolve CONFIG_FILE to absolute path (before any cd)
     local config_dir
@@ -48,28 +48,18 @@ main() {
     fi
     echo "" >&2
 
-    # Read project and workspace counts
-    local project_count ws_count has_resources
+    local project_count
     project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
-    ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
-    has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
-    local has_global_config=false
-    [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
-
-    if [[ "$project_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+    if [[ "$project_count" -eq 0 ]] && ! _has_anything_to_build; then
         echo -e "${YELLOW}No projects, workspaces, or resources defined in config. Launching plain claude.${NC}" >&2
         claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         return
     fi
 
-    # Auto-build from workspaces/resources/plugins/built-in skills if needed
-    if [[ "$DRY_RUN" != true ]]; then
-        if [[ "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
-            if needs_rebuild; then
-                build "false"
-            fi
-        fi
+    # Auto-build if needed
+    if [[ "$DRY_RUN" != true ]] && _has_anything_to_build && needs_rebuild; then
+        build "false"
     fi
 
     # Load global env files (no prefix, before local so local wins)
@@ -105,6 +95,8 @@ main() {
         echo -e "${BOLD}── Dry Run ──${NC}" >&2
         echo "" >&2
 
+        local ws_count
+        ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
         if [[ "$ws_count" -gt 0 ]]; then
             echo -e "${CYAN}Active workspaces:${NC}" >&2
             local mwi
@@ -203,7 +195,7 @@ main() {
 
         if [[ "$_COMPOSE_SETTINGS" != '{}' ]]; then
             echo -e "${CYAN}Settings (--settings ${COMPOSE_SETTINGS}):${NC}" >&2
-            echo "$_COMPOSE_SETTINGS" | jq '.' >&2
+            jq '.' >&2 <<< "$_COMPOSE_SETTINGS"
             echo "" >&2
         fi
 
