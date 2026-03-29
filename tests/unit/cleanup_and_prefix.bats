@@ -40,22 +40,24 @@ teardown() {
     [[ ! -d .claude/skills/my-skill ]]
 }
 
-@test "clean_manifest_section removes MCP servers from .mcp.json" {
+@test "clean_manifest_section removes MCP servers from mcp.json" {
     cd "${TEST_TEMP_DIR}/workspace"
-    echo '{"mcpServers":{"srv":{"command":"echo"},"keep":{"command":"echo"}}}' > .mcp.json
+    mkdir -p "$COMPOSE_DIR"
+    echo '{"mcpServers":{"srv":{"command":"echo"},"keep":{"command":"echo"}}}' > "$COMPOSE_MCP"
     local manifest='{"presets":{"src1":{"agents":[],"skills":[],"mcp_servers":["srv"]}}}'
     clean_manifest_section "$manifest" "presets"
     local remaining
-    remaining=$(jq -r '.mcpServers | keys[]' .mcp.json)
+    remaining=$(jq -r '.mcpServers | keys[]' "$COMPOSE_MCP")
     [[ "$remaining" == "keep" ]]
 }
 
-@test "clean_manifest_section removes .mcp.json when empty" {
+@test "clean_manifest_section removes mcp.json when empty" {
     cd "${TEST_TEMP_DIR}/workspace"
-    echo '{"mcpServers":{"srv":{"command":"echo"}}}' > .mcp.json
+    mkdir -p "$COMPOSE_DIR"
+    echo '{"mcpServers":{"srv":{"command":"echo"}}}' > "$COMPOSE_MCP"
     local manifest='{"presets":{"src1":{"agents":[],"skills":[],"mcp_servers":["srv"]}}}'
     clean_manifest_section "$manifest" "presets"
-    [[ ! -f .mcp.json ]]
+    [[ ! -f "$COMPOSE_MCP" ]]
 }
 
 @test "clean_manifest_section skips path traversal names" {
@@ -75,7 +77,7 @@ teardown() {
     assert_success
 }
 
-@test "clean_manifest_section handles missing .mcp.json" {
+@test "clean_manifest_section handles missing mcp.json" {
     cd "${TEST_TEMP_DIR}/workspace"
     local manifest='{"presets":{"src1":{"agents":[],"skills":[],"mcp_servers":["srv"]}}}'
     run clean_manifest_section "$manifest" "presets"

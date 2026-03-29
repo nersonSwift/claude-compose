@@ -70,7 +70,8 @@ Test skill content.
 EOF
 
     # MCP config (used by sync_source_dir for workspace-style processing)
-    cat > "${preset_dir}/.mcp.json" <<EOF
+    mkdir -p "${preset_dir}/${COMPOSE_DIR}"
+    cat > "${preset_dir}/${COMPOSE_MCP}" <<EOF
 {
     "mcpServers": {
         "${name}-server": {
@@ -97,7 +98,8 @@ description: Workspace agent
 # Workspace Agent
 EOF
 
-    cat > "${path}/.mcp.json" <<EOF
+    mkdir -p "${path}/${COMPOSE_DIR}"
+    cat > "${path}/${COMPOSE_MCP}" <<EOF
 {
     "mcpServers": {
         "ws-server": {
@@ -113,6 +115,14 @@ EOF
     "projects": []
 }
 EOF
+}
+
+# Create a test plugin directory
+# $1 = path, $2 = name (optional, default "test-plugin")
+create_test_plugin() {
+    local path="$1" name="${2:-test-plugin}"
+    mkdir -p "$path/.claude-plugin"
+    echo "{\"name\":\"$name\",\"version\":\"1.0.0\"}" > "$path/.claude-plugin/plugin.json"
 }
 
 # Create a lock file

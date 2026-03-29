@@ -19,8 +19,8 @@ main() {
         CONFIG_FILE="$(cd "$config_dir" && pwd -P)/$(basename "$CONFIG_FILE")"
     fi
 
-    # Set lock file path next to config
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+    # Resolve workspace directory (sets CONFIG_DIR, WORKSPACE_DIR, cd to WORKSPACE_DIR)
+    _resolve_workspace_dir
 
     # Set up doctor traps (must be after parse_args so DOCTOR_ENABLED is correct)
     # ERR trap captures context (command, line, function) for unexpected set -e failures
@@ -34,8 +34,6 @@ main() {
         migrate) cmd_migrate; return ;;
         copy) cmd_copy; return ;;
         instructions) cmd_instructions; return ;;
-        update) cmd_update; return ;;
-        registries) cmd_registries; return ;;
         doctor) cmd_doctor; return ;;
         start) cmd_start; return ;;
         vscode) cmd_vscode; return ;;
@@ -50,25 +48,24 @@ main() {
     fi
     echo "" >&2
 
-    # Read project and preset counts
-    local project_count preset_count ws_count has_resources
+    # Read project and workspace counts
+    local project_count ws_count has_resources
     project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
-    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
     has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
     local has_global_config=false
     [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
-        echo -e "${YELLOW}No projects, presets, workspaces, or resources defined in config. Launching plain claude.${NC}" >&2
+    if [[ "$project_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+        echo -e "${YELLOW}No projects, workspaces, or resources defined in config. Launching plain claude.${NC}" >&2
         claude "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
         return
     fi
 
-    # Auto-build from presets/workspaces/resources/built-in skills if needed
+    # Auto-build from workspaces/resources/plugins/built-in skills if needed
     if [[ "$DRY_RUN" != true ]]; then
-        if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
+        if [[ "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
             if needs_rebuild; then
                 build "false"
             fi
@@ -88,6 +85,14 @@ main() {
     _collect_manifest_args "true"
     _build_settings "true" "false"
 
+    # --mcp-config (compose uses $COMPOSE_MCP which Claude won't auto-discover)
+    if [[ -f "$COMPOSE_MCP" ]]; then
+        CLAUDE_ARGS+=("--mcp-config" "$COMPOSE_MCP")
+    fi
+
+    # Collect plugin dirs
+    _collect_plugin_args "true" "$CONFIG_DIR"
+
     # Extra args
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
         CLAUDE_ARGS+=("${EXTRA_ARGS[@]}")
@@ -99,36 +104,6 @@ main() {
     if [[ "$DRY_RUN" == true ]]; then
         echo -e "${BOLD}── Dry Run ──${NC}" >&2
         echo "" >&2
-
-        if [[ "$preset_count" -gt 0 ]]; then
-            echo -e "${CYAN}Active presets:${NC}" >&2
-            local dri_m
-            for ((dri_m = 0; dri_m < preset_count; dri_m++)); do
-                local drm_type
-                drm_type=$(jq -r ".presets[$dri_m] | type" "$CONFIG_FILE")
-                if [[ "$drm_type" == "string" ]]; then
-                    local drm_name
-                    drm_name=$(jq -r ".presets[$dri_m]" "$CONFIG_FILE")
-                    echo "  - $drm_name" >&2
-                elif [[ "$drm_type" == "object" ]]; then
-                    local drm_source drm_prefix
-                    drm_source=$(jq -r ".presets[$dri_m].source // empty" "$CONFIG_FILE")
-                    drm_prefix=$(jq -r ".presets[$dri_m].prefix // empty" "$CONFIG_FILE")
-                    echo -n "  - ${drm_source}" >&2
-                    [[ -n "$drm_prefix" ]] && echo -n " (prefix: ${drm_prefix})" >&2
-                    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-                        parse_github_source "$drm_source"
-                        local drm_sk="github:${_GH_OWNER}/${_GH_REPO}"
-                        [[ -n "$_GH_PATH" ]] && drm_sk+="/${_GH_PATH}"
-                        local drm_ver
-                        drm_ver=$(jq -r --arg k "$drm_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
-                        [[ -n "$drm_ver" ]] && echo -n " [v${drm_ver}]" >&2
-                    fi
-                    echo "" >&2
-                fi
-            done
-            echo "" >&2
-        fi
 
         if [[ "$ws_count" -gt 0 ]]; then
             echo -e "${CYAN}Active workspaces:${NC}" >&2
@@ -146,12 +121,12 @@ main() {
             echo "" >&2
         fi
 
-        if [[ -f ".compose-manifest.json" ]]; then
+        if [[ -f "$COMPOSE_MANIFEST" ]]; then
             local has_synced_resources=false
             local section
-            for section in global presets workspaces resources; do
+            for section in global workspaces resources; do
                 local section_keys
-                section_keys=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
+                section_keys=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' "$COMPOSE_MANIFEST" 2>/dev/null || true)
                 while IFS= read -r skey; do
                     [[ -z "$skey" ]] && continue
                     has_synced_resources=true
@@ -159,13 +134,13 @@ main() {
             done
             if [[ "$has_synced_resources" == true ]]; then
                 echo -e "${CYAN}Synced resources (from manifest):${NC}" >&2
-                for section in global presets workspaces resources; do
+                for section in global workspaces resources; do
                     jq -r --arg s "$section" '.[$s] // {} | to_entries[] | (
                         (.value.agents // [] | map("  agent: " + .)),
                         (.value.skills // [] | map("  skill: " + .)),
                         (.value.mcp_servers // [] | map("  mcp: " + .)),
                         (.value.add_dirs // [] | map(if type == "object" then "  add_dir: " + .path + (if .claude_md then "" else " (claude_md: false)" end) else "  add_dir: " + . end))
-                    ) | .[]' ".compose-manifest.json" 2>/dev/null | while read -r line; do
+                    ) | .[]' "$COMPOSE_MANIFEST" 2>/dev/null | while read -r line; do
                         echo "  $line" >&2
                     done
                 done
@@ -188,7 +163,7 @@ main() {
             echo -e "${CYAN}Env files:${NC}" >&2
             while IFS= read -r ef; do
                 [[ -z "$ef" ]] && continue
-                local ef_abs="$PWD/$ef"
+                local ef_abs="$CONFIG_DIR/$ef"
                 if [[ -f "$ef_abs" ]]; then
                     local vc
                     vc=$(jq 'length' "$ef_abs" 2>/dev/null || echo "?")
@@ -227,7 +202,7 @@ main() {
         fi
 
         if [[ "$_COMPOSE_SETTINGS" != '{}' ]]; then
-            echo -e "${CYAN}Settings (--settings .compose-settings.json):${NC}" >&2
+            echo -e "${CYAN}Settings (--settings ${COMPOSE_SETTINGS}):${NC}" >&2
             echo "$_COMPOSE_SETTINGS" | jq '.' >&2
             echo "" >&2
         fi
@@ -243,12 +218,20 @@ main() {
 
         # Show workspace config files
         echo -e "${CYAN}Workspace files:${NC}" >&2
-        [[ -f ".mcp.json" ]] && echo "  .mcp.json ($(jq '.mcpServers | length' .mcp.json 2>/dev/null || echo 0) servers)" >&2
+        [[ -f "$COMPOSE_MCP" ]] && echo "  ${COMPOSE_MCP} ($(jq '.mcpServers | length' "$COMPOSE_MCP" 2>/dev/null || echo 0) servers)" >&2
         [[ -d ".claude/agents" ]] && echo "  .claude/agents/ ($(find .claude/agents -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ') agents)" >&2
         [[ -d ".claude/skills" ]] && echo "  .claude/skills/ ($(find .claude/skills -maxdepth 1 -mindepth 1 \( -type d -o -type l \) 2>/dev/null | wc -l | tr -d ' ') skills)" >&2
         [[ -f ".claude/settings.local.json" ]] && echo "  .claude/settings.local.json" >&2
         [[ -f "CLAUDE.md" ]] && echo "  CLAUDE.md" >&2
         echo "" >&2
+
+        if [[ ${#PLUGIN_DIRS[@]} -gt 0 ]]; then
+            echo -e "${CYAN}Plugins:${NC}" >&2
+            for pdir in "${PLUGIN_DIRS[@]+"${PLUGIN_DIRS[@]}"}"; do
+                echo "  --plugin-dir $pdir" >&2
+            done
+            echo "" >&2
+        fi
 
         echo -e "${GREEN}No mutations performed (dry run).${NC}" >&2
         return

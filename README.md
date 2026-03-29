@@ -13,7 +13,7 @@ Claude Code's `--add-dir` gives file access to other directories, but **MCP serv
 ```
 my-workspace/                    # Your workspace directory
 ├── claude-compose.json          # Config — lists projects and presets
-├── .mcp.json                    # MCP servers (yours + from presets)
+├── .compose-mcp.json                    # MCP servers (yours + from presets)
 ├── CLAUDE.md                    # Instructions
 ├── .claude/
 │   ├── agents/*.md              # Agent definitions

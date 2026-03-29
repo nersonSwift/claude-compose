@@ -1,5 +1,5 @@
 # ── Sync resources from a source directory ──────────────────────────
-# Shared logic for presets and workspaces.
+# Shared logic for workspaces.
 # $1 = source dir, $2 = filter JSON, $3 = source name (for env prefix)
 # Populates CURRENT_SOURCE_* arrays. Caller writes manifest.
 sync_source_dir() {
@@ -133,15 +133,16 @@ sync_source_dir() {
     fi
 
     # ── Merge MCP servers ──
-    local mcp_file="$source_dir/.mcp.json"
+    local mcp_file="$source_dir/$COMPOSE_MCP"
     if [[ -f "$mcp_file" ]]; then
         local mcp_include mcp_exclude mcp_rename
         mcp_include=$(echo "$filter_json" | jq -c '.mcp.include // ["*"]')
         mcp_exclude=$(echo "$filter_json" | jq -c '.mcp.exclude // []')
         mcp_rename=$(echo "$filter_json" | jq -c '.mcp.rename // {}')
 
-        if [[ ! -f ".mcp.json" ]]; then
-            atomic_write ".mcp.json" "$_MCP_EMPTY"
+        ensure_compose_dir
+        if [[ ! -f "$COMPOSE_MCP" ]]; then
+            atomic_write "$COMPOSE_MCP" "$_MCP_EMPTY"
         fi
 
         local mcp_batch='{}'
@@ -174,14 +175,14 @@ sync_source_dir() {
             local overwrites
             overwrites=$(jq -r --argjson batch "$mcp_batch" \
                 '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
-                ".mcp.json" 2>/dev/null || true)
+                "$COMPOSE_MCP" 2>/dev/null || true)
             while IFS= read -r ow; do
                 [[ -z "$ow" ]] && continue
                 echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
             done <<< "$overwrites"
             local tmp
-            tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
-            atomic_write ".mcp.json" "$tmp"
+            tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' "$COMPOSE_MCP")
+            atomic_write "$COMPOSE_MCP" "$tmp"
         fi
     fi
 
@@ -194,7 +195,7 @@ sync_source_dir() {
 }
 
 # Write CURRENT_SOURCE_* arrays to manifest under given section/name
-# $1 = section ("presets" or "workspaces"), $2 = entry name
+# $1 = section (e.g. "workspaces"), $2 = entry name
 write_source_manifest() {
     local section="$1"
     local entry_name="$2"

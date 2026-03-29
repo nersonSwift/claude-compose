@@ -50,8 +50,8 @@ load_env_files() {
     env_files=$(jq -r '.resources.env_files // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
     while IFS= read -r env_file; do
         [[ -z "$env_file" ]] && continue
-        local abs_path="$ORIGINAL_CWD/$env_file"
-        if ! _is_within_dir "$abs_path" "$ORIGINAL_CWD"; then
+        local abs_path="$CONFIG_DIR/$env_file"
+        if ! _is_within_dir "$abs_path" "$CONFIG_DIR"; then
             echo -e "${YELLOW}Warning: env file escapes base directory, skipping: ${env_file}${NC}" >&2
             continue
         fi
@@ -148,39 +148,19 @@ load_source_env_files() {
     done <<< "$env_files"
 }
 
-# Load env files from all external sources (presets + workspaces) at launch time
+# Load env files from all external sources (workspaces) at launch time
 load_all_source_env_files() {
-    [[ ! -f ".compose-manifest.json" ]] && return
+    [[ ! -f "$COMPOSE_MANIFEST" ]] && return
 
-    local section
-    for section in presets workspaces; do
-        local source_names
-        source_names=$(jq -r --arg s "$section" '.[$s] // {} | keys[]' ".compose-manifest.json" 2>/dev/null || true)
-        while IFS= read -r sname; do
-            [[ -z "$sname" ]] && continue
-            local source_dir
-            if [[ "$section" == "presets" ]]; then
-                if [[ "$sname" == github:* ]]; then
-                    # GitHub preset: resolve dir from lock file
-                    source_dir=$(resolve_locked_preset_dir "$sname" 2>/dev/null || true)
-                    [[ -z "$source_dir" ]] && continue
-                elif [[ "$sname" == path:* ]]; then
-                    source_dir="${sname#path:}"
-                else
-                    source_dir="$PRESETS_DIR/$sname"
-                fi
-            else
-                source_dir="$sname"  # workspaces use absolute path as key
-            fi
-            [[ ! -d "$source_dir" ]] && continue
-            local source_name
-            source_name=$(jq -r --arg s "$section" --arg n "$sname" '.[$s][$n].source_name // empty' ".compose-manifest.json" 2>/dev/null || true)
-            [[ -z "$source_name" ]] && source_name="$(basename "$source_dir")"
-            if [[ "$section" == "presets" ]]; then
-                load_source_env_files "$source_dir" "$source_name" "$PRESET_CONFIG_FILE"
-            else
-                load_source_env_files "$source_dir" "$source_name"
-            fi
-        done <<< "$source_names"
-    done
+    local source_names
+    source_names=$(jq -r '.workspaces // {} | keys[]' "$COMPOSE_MANIFEST" 2>/dev/null || true)
+    while IFS= read -r sname; do
+        [[ -z "$sname" ]] && continue
+        local source_dir="$sname"  # workspaces use absolute path as key
+        [[ ! -d "$source_dir" ]] && continue
+        local source_name
+        source_name=$(jq -r --arg n "$sname" '.workspaces[$n].source_name // empty' "$COMPOSE_MANIFEST" 2>/dev/null || true)
+        [[ -z "$source_name" ]] && source_name="$(basename "$source_dir")"
+        load_source_env_files "$source_dir" "$source_name"
+    done <<< "$source_names"
 }

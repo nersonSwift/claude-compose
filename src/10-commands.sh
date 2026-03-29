@@ -26,7 +26,7 @@ cmd_migrate() {
             workspace=$(cd "$workspace" && pwd -P)
         fi
     else
-        workspace="$ORIGINAL_CWD"
+        workspace="$WORKSPACE_DIR"
     fi
 
     local project_name
@@ -65,17 +65,18 @@ cmd_migrate() {
 
     # ── Perform migration ──
 
-    # MCP: merge mcpServers
+    # MCP: merge mcpServers (source is project's native .mcp.json, destination is $COMPOSE_MCP)
     if [[ "$has_mcp" == true ]]; then
-        if [[ -f "$workspace/.mcp.json" ]]; then
+        mkdir -p "$workspace/$COMPOSE_DIR"
+        if [[ -f "$workspace/$COMPOSE_MCP" ]]; then
             local tmp
             tmp=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' \
-                "$workspace/.mcp.json" "$project_path/.mcp.json")
-            atomic_write "$workspace/.mcp.json" "$tmp"
-            echo -e "${GREEN}Merged:${NC} .mcp.json" >&2
+                "$workspace/$COMPOSE_MCP" "$project_path/.mcp.json")
+            atomic_write "$workspace/$COMPOSE_MCP" "$tmp"
+            echo -e "${GREEN}Merged:${NC} ${COMPOSE_MCP}" >&2
         else
-            cp "$project_path/.mcp.json" "$workspace/.mcp.json"
-            echo -e "${GREEN}Copied:${NC} .mcp.json" >&2
+            cp "$project_path/.mcp.json" "$workspace/$COMPOSE_MCP"
+            echo -e "${GREEN}Copied:${NC} ${COMPOSE_MCP}" >&2
         fi
     fi
 
@@ -224,7 +225,8 @@ cmd_copy() {
     # List what will be copied
     echo -e "${CYAN}Files to copy:${NC}" >&2
     echo "  $config_name" >&2
-    [[ -f "$source_path/.mcp.json" ]] && echo "  .mcp.json" >&2
+    local _src_mcp="$source_path/$COMPOSE_MCP"
+    [[ -f "$_src_mcp" ]] && echo "  ${_src_mcp#"$source_path"/}" >&2
     [[ -d "$source_path/.claude/agents" ]] && echo "  .claude/agents/" >&2
     [[ -d "$source_path/.claude/skills" ]] && echo "  .claude/skills/" >&2
     [[ -f "$source_path/.claude/settings.local.json" ]] && echo "  .claude/settings.local.json" >&2
@@ -232,8 +234,8 @@ cmd_copy() {
     [[ -f "$source_path/${config_name%.json}.lock.json" ]] && echo "  ${config_name%.json}.lock.json" >&2
     echo "" >&2
     echo -e "${CYAN}NOT copied (will rebuild):${NC}" >&2
-    echo "  .compose-manifest.json" >&2
-    echo "  .compose-hash" >&2
+    echo "  ${COMPOSE_MANIFEST}" >&2
+    echo "  ${COMPOSE_HASH}" >&2
     echo "" >&2
 
     if [[ "$DRY_RUN" == true ]]; then
@@ -247,7 +249,10 @@ cmd_copy() {
     cp "$source_path/$config_name" "$dest_path/$config_name"
     local lock_name="${config_name%.json}.lock.json"
     [[ -f "$source_path/$lock_name" ]] && cp "$source_path/$lock_name" "$dest_path/$lock_name"
-    [[ -f "$source_path/.mcp.json" ]] && cp "$source_path/.mcp.json" "$dest_path/.mcp.json"
+    if [[ -f "$_src_mcp" ]]; then
+        mkdir -p "$dest_path/$COMPOSE_DIR"
+        cp "$_src_mcp" "$dest_path/$COMPOSE_MCP"
+    fi
     [[ -f "$source_path/CLAUDE.md" ]] && cp "$source_path/CLAUDE.md" "$dest_path/CLAUDE.md"
 
     if [[ -d "$source_path/.claude/agents" ]]; then
@@ -294,9 +299,8 @@ cmd_instructions() {
 
     # Build dynamic workspace summary
     local summary=""
-    local project_count preset_count ws_count
+    local project_count ws_count
     project_count=$(jq '.projects // [] | length' "$config_file")
-    preset_count=$(jq '.presets // [] | length' "$config_file")
     ws_count=$(jq '.workspaces // [] | length' "$config_file")
     local agent_count skill_count mcp_count env_count
     agent_count=$(jq '.resources.agents // [] | length' "$config_file")
@@ -306,11 +310,6 @@ cmd_instructions() {
 
     summary="## Current workspace"$'\n'
     summary+="- Projects: $project_count"$'\n'
-    if [[ "$preset_count" -gt 0 ]]; then
-        local preset_names
-        preset_names=$(jq -r '.presets // [] | map(if type == "string" then . elif .source then .source else (. | tostring) end) | join(", ")' "$config_file")
-        summary+="- Presets: $preset_names"$'\n'
-    fi
     if [[ "$ws_count" -gt 0 ]]; then
         summary+="- Workspaces: $ws_count"$'\n'
     fi
@@ -325,10 +324,9 @@ cmd_instructions() {
         summary+=", settings: $settings_val"
     fi
 
-    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 ]]; then
-        summary+=$'\n'$'\n'"External resources are synced from presets/workspaces. Agents and skills"
-        summary+=" are symlinked from source directories. MCP servers are merged into .mcp.json"
-        summary+=" with env var prefixes to prevent conflicts."
+    if [[ "$ws_count" -gt 0 ]]; then
+        summary+=$'\n'$'\n'"External resources are synced from workspaces. Agents and skills"
+        summary+=" are symlinked from source directories. MCP servers are merged into ${COMPOSE_MCP}."
     fi
 
     # Output prompt template with interpolated summary
@@ -390,119 +388,6 @@ cmd_config() {
     claude --system-prompt "$prompt" "do it"
 }
 
-# ── Update Command ─────────────────────────────────────────────────────
-cmd_update() {
-    require_jq
-    require_git
-
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
-        exit 1
-    fi
-
-    echo -e "${BOLD}Checking for updates...${NC}" >&2
-    echo "" >&2
-
-    local updated=false
-
-    # Collect github presets from config and global
-    # shellcheck disable=SC2329
-    _update_preset_cb() {
-        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" _ejson="$6" _cfg="${7:-}" _path_val="${8:-}"
-        [[ "$etype" != "object" || "$is_gh" != "true" ]] && return 0
-        [[ -z "$source" || "$source" != github:* ]] && return 0
-
-        # If specific source filter is set, skip non-matching
-        if [[ -n "$UPDATE_SOURCE" && "$source" != *"$UPDATE_SOURCE"* ]]; then
-            return 0
-        fi
-
-        parse_github_source "$source"
-        local owner="$_GH_OWNER" repo="$_GH_REPO" preset_path="$_GH_PATH" spec_str="$_GH_SPEC"
-
-        local source_key="github:${owner}/${repo}"
-        [[ -n "$preset_path" ]] && source_key+="/${preset_path}"
-
-        local spec_parsed
-        spec_parsed=$(parse_version_spec "$spec_str")
-        local spec_type spec_major spec_minor spec_patch
-        read -r spec_type spec_major spec_minor spec_patch <<< "$spec_parsed"
-
-        # Read current lock
-        local locked_version="" locked_tag=""
-        local lock_data
-        if lock_data=$(lock_read "$source_key"); then
-            read -r locked_version locked_tag _ <<< "$lock_data"
-        fi
-
-        echo -e "${CYAN}${source_key}${NC}" >&2
-        if [[ -n "$locked_version" ]]; then
-            echo -e "  Current: v${locked_version} (spec: ${spec_str:-latest})" >&2
-        else
-            echo -e "  Current: (not installed)" >&2
-        fi
-
-        if [[ "$spec_type" == "exact" ]]; then
-            echo -e "  ${YELLOW}Pinned at v${spec_major}.${spec_minor}.${spec_patch}${NC}" >&2
-            return 0
-        fi
-
-        # Fetch remote tags
-        local remote_tags
-        if ! remote_tags=$(registry_list_remote_tags "$owner" "$repo"); then
-            echo -e "  ${RED}Failed to fetch tags${NC}" >&2
-            return 0
-        fi
-
-        local best_tag
-        if ! best_tag=$(find_best_tag "$remote_tags" "$spec_type" "$spec_major" "$spec_minor" "$spec_patch"); then
-            echo -e "  ${YELLOW}No matching tags found${NC}" >&2
-            return 0
-        fi
-
-        local best_parsed
-        best_parsed=$(parse_tag_version "$best_tag")
-        local best_major best_minor best_patch
-        read -r best_major best_minor best_patch <<< "$best_parsed"
-        local best_version="${best_major}.${best_minor}.${best_patch}"
-
-        if [[ "$best_version" == "$locked_version" ]]; then
-            echo -e "  ${GREEN}Already up to date (v${best_version})${NC}" >&2
-            return 0
-        fi
-
-        # Clone new version
-        if ! registry_has_clone "$owner" "$repo" "$best_version"; then
-            registry_clone_version "$owner" "$repo" "$best_tag" || return 0
-        fi
-
-        if [[ -n "$locked_version" ]]; then
-            if check_major_bump "$locked_version" "$best_version"; then
-                echo -e "  ${YELLOW}Major update:${NC} v${locked_version} → v${best_version}" >&2
-            else
-                echo -e "  ${GREEN}Updated:${NC} v${locked_version} → v${best_version}" >&2
-            fi
-        else
-            echo -e "  ${GREEN}Installed:${NC} v${best_version}" >&2
-        fi
-
-        lock_write "$source_key" "$best_version" "$best_tag" "$spec_str"
-        updated=true
-    }
-
-    iterate_presets "$CONFIG_FILE" _update_preset_cb
-    iterate_presets "$GLOBAL_CONFIG" _update_preset_cb
-
-    echo "" >&2
-    if [[ "$updated" == true ]]; then
-        # Force rebuild
-        rm -f ".compose-hash"
-        echo -e "${GREEN}Updates applied. Rebuild will happen on next launch.${NC}" >&2
-    else
-        echo -e "${GREEN}All registries are up to date.${NC}" >&2
-    fi
-}
-
 # ── Doctor Command ─────────────────────────────────────────────────────
 cmd_doctor() {
     require_jq
@@ -555,14 +440,8 @@ cmd_wrap() {
         exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
     fi
 
-    # 4. Reassign ORIGINAL_CWD to dirname of CONFIG_FILE (mimics normal mode)
-    ORIGINAL_CWD="$(dirname "$CONFIG_FILE")"
-
-    # 5. cd to workspace directory for relative path resolution
-    cd "$ORIGINAL_CWD"
-
-    # Set lock file path next to config
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+    # 4. Resolve workspace directory (sets CONFIG_DIR, WORKSPACE_DIR, cd to WORKSPACE_DIR)
+    _resolve_workspace_dir
 
     # 6. Disable doctor (no interactive stderr in stream-json mode)
     DOCTOR_ENABLED=false
@@ -579,20 +458,19 @@ cmd_wrap() {
     ensure_builtin_skills
 
     # 9. Auto-build if needed (suppress stderr — no banners in wrap mode)
-    local project_count preset_count ws_count has_resources has_global_config
+    local project_count ws_count has_resources has_global_config
     project_count=$(jq '.projects // [] | length' "$CONFIG_FILE")
-    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
     has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
     has_global_config=false
     [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$project_count" -eq 0 && "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+    if [[ "$project_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
         # Nothing to compose — passthrough
         exec "$WRAP_CLAUDE_BIN" "${WRAP_PASSTHROUGH_ARGS[@]+"${WRAP_PASSTHROUGH_ARGS[@]}"}"
     fi
 
-    if [[ "$preset_count" -gt 0 || "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
+    if [[ "$ws_count" -gt 0 || "$has_resources" == "true" || "$has_global_config" == "true" ]] || has_builtin_skills; then
         if needs_rebuild; then
             # Suppress stderr (no banners in stream-json mode)
             # On failure: fall back to passthrough rather than continuing with partial/stale config
@@ -622,9 +500,12 @@ cmd_wrap() {
     _build_settings "false" "true"
 
     # --mcp-config with ABSOLUTE path (wrap-only: CWD may differ from workspace)
-    if [[ -f ".mcp.json" ]]; then
-        CLAUDE_ARGS+=("--mcp-config" "$(pwd -P)/.mcp.json")
+    if [[ -f "$COMPOSE_MCP" ]]; then
+        CLAUDE_ARGS+=("--mcp-config" "$(pwd -P)/$COMPOSE_MCP")
     fi
+
+    # Plugin dirs
+    _collect_plugin_args "false" "$CONFIG_DIR"
 
     # 12. Merge --append-system-prompt from VS Code and compose
 
@@ -685,7 +566,7 @@ _generate_code_workspace() {
     local ws_name config_file manifest_file ws_file
     ws_name="$(basename "$ws_dir")"
     config_file="$ws_dir/claude-compose.json"
-    manifest_file="$ws_dir/.compose-manifest.json"
+    manifest_file="$ws_dir/$COMPOSE_MANIFEST"
     ws_file="$ws_dir/${ws_name}.code-workspace"
 
     if [[ ! -f "$config_file" ]]; then
@@ -718,7 +599,7 @@ _generate_code_workspace() {
         select(.name) |
         {key: (.path | sub("^~"; $home)), value: .name}
     ] | from_entries' "$config_file")
-    # Workspace/preset configs referenced in manifest
+    # Workspace configs referenced in manifest
     if [[ -f "$manifest_file" ]]; then
         local ws_key
         while IFS= read -r ws_key; do
@@ -732,16 +613,18 @@ _generate_code_workspace() {
                 {key: (.path | sub("^~"; $home)), value: .name}
             ] | from_entries' "$nested_config")
             path_name_map=$(echo "$path_name_map" | jq --argjson n "$nested_map" '. + $n')
-        done < <(jq -r '[.global, .presets, .workspaces, .resources] | map(keys? // []) | add | .[]' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '[.global, .workspaces, .resources] | map(keys? // []) | add | .[]' "$manifest_file" 2>/dev/null)
     fi
 
     # 1d. add_dirs + project_dirs from manifest sections
     if [[ -f "$manifest_file" ]]; then
         local section prefix
-        for section in global presets workspaces resources; do
+        for section in global workspaces resources; do
             case "$section" in
+                global)     prefix="Global" ;;
                 workspaces) prefix="Workspace" ;;
-                *)          prefix="Preset" ;;
+                resources)  prefix="Local" ;;
+                *)          prefix="Source" ;;
             esac
             local section_dirs
             # add_dirs: use source_name for display name
@@ -898,17 +781,14 @@ cmd_vscode() {
 
     # ── Generate .code-workspace ─────────────────────────────────────
     if [[ -f "$CONFIG_FILE" ]]; then
-        local ws_dir
-        ws_dir="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)"
-
         # Ensure manifest is up-to-date
-        (cd "$ws_dir" && {
+        (cd "$WORKSPACE_DIR" && {
             if needs_rebuild; then
                 build "false"
             fi
         })
 
-        _generate_code_workspace "$ws_dir"
+        _generate_code_workspace "$WORKSPACE_DIR"
     else
         echo "" >&2
         echo -e "${YELLOW}No claude-compose.json found. Skipping .code-workspace generation.${NC}" >&2
@@ -922,7 +802,7 @@ cmd_vscode() {
     echo "Next steps:" >&2
     if [[ -f "$CONFIG_FILE" ]]; then
         local ws_name
-        ws_name="$(basename "$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)")"
+        ws_name="$(basename "$WORKSPACE_DIR")"
         echo "  Open ${ws_name}.code-workspace in VS Code (File → Open Workspace from File)" >&2
     else
         echo "  1. Run 'claude-compose config' to create a config" >&2
@@ -933,68 +813,3 @@ cmd_vscode() {
     echo "(Cmd+Shift+P → Preferences: Open Settings (JSON))." >&2
 }
 
-# ── Registries Command ─────────────────────────────────────────────────
-cmd_registries() {
-    require_jq
-
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${RED}Error: ${CONFIG_FILE} not found${NC}" >&2
-        exit 1
-    fi
-
-    echo -e "${BOLD}GitHub Presets${NC}" >&2
-    echo "" >&2
-
-    local found=false
-
-    local _list_conf_label=""
-
-    # shellcheck disable=SC2329
-    _list_preset_cb() {
-        local etype="$1" _idx="$2" _name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="${7:-}" _path_val="${8:-}"
-        [[ "$etype" != "object" || "$is_gh" != "true" ]] && return 0
-        [[ -z "$source" || "$source" != github:* ]] && return 0
-
-        found=true
-
-        local prefix rename
-        prefix=$(echo "$ejson" | jq -r '.prefix // empty')
-        rename=$(echo "$ejson" | jq -c '.rename // empty')
-
-        parse_github_source "$source"
-
-        local source_key="github:${_GH_OWNER}/${_GH_REPO}"
-        [[ -n "$_GH_PATH" ]] && source_key+="/${_GH_PATH}"
-
-        echo -e "${CYAN}${source_key}${NC} (${_list_conf_label})" >&2
-        echo "  Source: ${source}" >&2
-        echo "  Spec: ${_GH_SPEC:-latest}" >&2
-
-        if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-            local locked_ver locked_tag
-            locked_ver=$(jq -r --arg k "$source_key" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
-            locked_tag=$(jq -r --arg k "$source_key" '.registries[$k].tag // empty' "$LOCK_FILE" 2>/dev/null || true)
-            if [[ -n "$locked_ver" ]]; then
-                echo "  Locked: v${locked_ver} (${locked_tag})" >&2
-                local reg_dir
-                reg_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$locked_ver" "$_GH_PATH")
-                echo "  Path: ${reg_dir}" >&2
-            else
-                echo "  Locked: (not installed)" >&2
-            fi
-        fi
-
-        [[ -n "$prefix" ]] && echo "  Prefix: ${prefix}" >&2
-        [[ -n "$rename" && "$rename" != "null" ]] && echo "  Rename: ${rename}" >&2
-        echo "" >&2
-    }
-
-    _list_conf_label="workspace"
-    iterate_presets "$CONFIG_FILE" _list_preset_cb
-    _list_conf_label="global"
-    iterate_presets "$GLOBAL_CONFIG" _list_preset_cb
-
-    if [[ "$found" != true ]]; then
-        echo -e "${YELLOW}No GitHub presets configured.${NC}" >&2
-    fi
-}

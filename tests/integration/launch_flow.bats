@@ -20,7 +20,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     run main --dry-run -f "$CONFIG_FILE"
@@ -35,7 +35,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"a\",\"path\":\"$proj1\"},{\"name\":\"b\",\"path\":\"$proj2\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     main --dry-run -f "$CONFIG_FILE"
@@ -54,7 +54,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     main --dry-run -f "$CONFIG_FILE"
@@ -75,7 +75,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"a\",\"path\":\"$p1\"},{\"name\":\"b\",\"path\":\"$p2\"},{\"name\":\"c\",\"path\":\"$p3\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     main --dry-run -f "$CONFIG_FILE"
@@ -93,7 +93,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     main --dry-run -f "$CONFIG_FILE" -- -p "model"
@@ -110,21 +110,6 @@ teardown() {
     assert_failure
 }
 
-@test "main dry-run with presets works" {
-    cd "${TEST_TEMP_DIR}/workspace"
-    create_preset "fp"
-    local proj="${TEST_TEMP_DIR}/proj_f"
-    mkdir -p "$proj"
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}],\"presets\":[\"fp\"]}"
-    reset_globals
-    CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
-    ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
-    DRY_RUN=true
-    run main --dry-run -f "$CONFIG_FILE"
-    assert_success
-}
-
 @test "main exports env vars" {
     cd "${TEST_TEMP_DIR}/workspace"
     local proj="${TEST_TEMP_DIR}/proj_env"
@@ -133,7 +118,7 @@ teardown() {
     create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}],\"resources\":{\"env_files\":[\"env.json\"]}}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${CONFIG_FILE%.json}.lock.json"
+
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
     DRY_RUN=true
     main --dry-run -f "$CONFIG_FILE"

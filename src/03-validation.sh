@@ -5,14 +5,6 @@ validate() {
         require_claude
     fi
 
-    # Check git availability if github presets are configured
-    if [[ -f "$CONFIG_FILE" ]] && has_github_presets "$CONFIG_FILE"; then
-        require_git
-    fi
-    if [[ -f "$GLOBAL_CONFIG" ]] && has_github_presets "$GLOBAL_CONFIG"; then
-        require_git
-    fi
-
     # Validate global config first (before workspace config check)
     validate_global_config
 
@@ -204,25 +196,6 @@ _validate_resources() {
     fi
 }
 
-_validate_update_interval() {
-    local config_file="$1"
-
-    local ui_type
-    ui_type=$(jq -r 'if has("update_interval") then .update_interval | type else "null" end' "$config_file")
-    if [[ "$ui_type" != "null" && "$ui_type" != "number" ]]; then
-        echo "\"update_interval\" must be a number (hours), got: ${ui_type}"
-        return
-    fi
-    if [[ "$ui_type" == "number" ]]; then
-        local ui_val
-        ui_val=$(jq '.update_interval' "$config_file")
-        if jq -e '.update_interval < 0' "$config_file" &>/dev/null; then
-            echo "\"update_interval\" must be >= 0, got: ${ui_val}"
-            return
-        fi
-    fi
-}
-
 _validate_workspaces() {
     local config_file="$1"
 
@@ -263,163 +236,148 @@ _validate_workspaces() {
     fi
 }
 
-_validate_presets() {
+_validate_workspace_path() {
     local config_file="$1"
-
-    local presets_type
-    presets_type=$(jq -r 'if has("presets") then .presets | type else "null" end' "$config_file")
-    if [[ "$presets_type" != "null" && "$presets_type" != "array" ]]; then
-        echo "\"presets\" must be an array, got: ${presets_type}"
+    local wp_type
+    wp_type=$(jq -r 'if has("workspace_path") then .workspace_path | type else "null" end' "$config_file")
+    if [[ "$wp_type" != "null" && "$wp_type" != "string" ]]; then
+        echo "\"workspace_path\" must be a string, got: ${wp_type}"
         return
     fi
-    if [[ "$presets_type" == "array" ]]; then
-        local preset_count_v
-        preset_count_v=$(jq '.presets | length' "$config_file")
-        if [[ "$preset_count_v" -gt 0 ]]; then
-        local i
-        for ((i = 0; i < preset_count_v; i++)); do
-            local entry_type
-            entry_type=$(jq -r ".presets[$i] | type" "$config_file")
-            case "$entry_type" in
-                string)
-                    # Local preset name or path — validate names, allow paths
-                    local str_val
-                    str_val=$(jq -r ".presets[$i]" "$config_file")
-                    if ! _is_preset_path "$str_val"; then
-                        if [[ "$str_val" == *..* || "$str_val" == */* ]]; then
-                            echo "presets[$i]: invalid preset name: ${str_val}"
-                            return
-                        fi
-                    fi
-                    ;;
-                object)
-                    # Preset object — validate fields (GitHub source, local name, or path)
-                    local source_val name_val path_val
-                    source_val=$(jq -r ".presets[$i].source // empty" "$config_file")
-                    name_val=$(jq -r ".presets[$i].name // empty" "$config_file")
-                    path_val=$(jq -r ".presets[$i].path // empty" "$config_file")
-
-                    local field_count=0
-                    [[ -n "$source_val" ]] && ((field_count++)) || true
-                    [[ -n "$name_val" ]] && ((field_count++)) || true
-                    [[ -n "$path_val" ]] && ((field_count++)) || true
-
-                    if [[ "$field_count" -eq 0 ]]; then
-                        echo "presets[$i]: object entry must have \"source\", \"name\", or \"path\" field"
-                        return
-                    fi
-                    if [[ "$field_count" -gt 1 ]]; then
-                        echo "presets[$i]: \"source\", \"name\", and \"path\" are mutually exclusive"
-                        return
-                    fi
-
-                    if [[ -n "$source_val" ]]; then
-                        if [[ "$source_val" != github:* ]]; then
-                            echo "presets[$i].source must start with \"github:\", got: ${source_val}"
-                            return
-                        fi
-                        # Validate github source has at least owner/repo with safe characters
-                        local gh_rest="${source_val#github:}"
-                        gh_rest="${gh_rest%%@*}"
-                        if [[ "$gh_rest" != */* ]]; then
-                            echo "presets[$i].source must contain at least owner/repo, got: ${source_val}"
-                            return
-                        fi
-                        # Validate owner and repo contain only safe characters (no path traversal)
-                        local gh_owner="${gh_rest%%/*}"
-                        local gh_after="${gh_rest#*/}"
-                        local gh_repo="${gh_after%%/*}"
-                        if [[ ! "$gh_owner" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_owner" == "." ]] || [[ "$gh_owner" == ".." ]]; then
-                            echo "presets[$i].source: invalid owner name: ${gh_owner}"
-                            return
-                        fi
-                        if [[ ! "$gh_repo" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ "$gh_repo" == "." ]] || [[ "$gh_repo" == ".." ]]; then
-                            echo "presets[$i].source: invalid repo name: ${gh_repo}"
-                            return
-                        fi
-                        # Validate path segments (no path traversal via ..)
-                        local gh_path_part="${gh_rest#*/*/}"
-                        if [[ "$gh_path_part" != "$gh_rest" && -n "$gh_path_part" ]]; then
-                            local _remaining="$gh_path_part" gh_seg
-                            while [[ -n "$_remaining" ]]; do
-                                gh_seg="${_remaining%%/*}"
-                                if [[ "$gh_seg" == ".." || "$gh_seg" == "." ]]; then
-                                    echo "presets[$i].source: path contains invalid segment: ${gh_seg}"
-                                    return
-                                fi
-                                [[ "$_remaining" == */* ]] && _remaining="${_remaining#*/}" || _remaining=""
-                            done
-                        fi
-                        # Validate prefix format if present
-                        local prefix_val
-                        prefix_val=$(jq -r ".presets[$i].prefix // empty" "$config_file")
-                        if [[ -n "$prefix_val" ]]; then
-                            if [[ ! "$prefix_val" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
-                                echo "presets[$i].prefix must be lowercase alphanumeric with optional hyphens (no leading/trailing hyphens), got: ${prefix_val}"
-                                return
-                            fi
-                        fi
-                        # Validate env_files if present
-                        local ef_type
-                        ef_type=$(jq -r "if .presets[$i] | has(\"env_files\") then .presets[$i].env_files | type else \"null\" end" "$config_file")
-                        if [[ "$ef_type" != "null" && "$ef_type" != "array" ]]; then
-                            echo "presets[$i].env_files must be an array, got: ${ef_type}"
-                            return
-                        fi
-                        # Validate rename if present
-                        local rename_type
-                        rename_type=$(jq -r "if .presets[$i] | has(\"rename\") then .presets[$i].rename | type else \"null\" end" "$config_file")
-                        if [[ "$rename_type" != "null" && "$rename_type" != "object" ]]; then
-                            echo "presets[$i].rename must be an object, got: ${rename_type}"
-                            return
-                        fi
-                    elif [[ -n "$path_val" ]]; then
-                        # Path preset — no additional validation needed
-                        :
-                    elif [[ -n "$name_val" ]]; then
-                        if [[ "$name_val" == *..* || "$name_val" == */* ]]; then
-                            echo "presets[$i].name: invalid preset name: ${name_val}"
-                            return
-                        fi
-                    fi
-
-                    # Validate filter fields (common to both source and name objects)
-                    local filter_type
-                    for filter_type in agents skills mcp; do
-                        local ft
-                        ft=$(jq -r "if .presets[$i] | has(\"$filter_type\") then .presets[$i].${filter_type} | type else \"null\" end" "$config_file")
-                        if [[ "$ft" != "null" && "$ft" != "object" ]]; then
-                            echo "presets[$i].${filter_type} must be an object, got: ${ft}"
-                            return
-                        fi
-                        if [[ "$ft" == "object" ]]; then
-                            local arr_field
-                            for arr_field in include exclude; do
-                                local af
-                                af=$(jq -r "if .presets[$i].${filter_type} | has(\"$arr_field\") then .presets[$i].${filter_type}.${arr_field} | type else \"null\" end" "$config_file")
-                                if [[ "$af" != "null" && "$af" != "array" ]]; then
-                                    echo "presets[$i].${filter_type}.${arr_field} must be an array, got: ${af}"
-                                    return
-                                fi
-                            done
-                        fi
-                    done
-                    ;;
-                *)
-                    echo "presets[$i]: expected string or object, got: ${entry_type}"
-                    return
-                    ;;
-            esac
-        done
+    if [[ "$wp_type" == "string" ]]; then
+        local wp_val
+        wp_val=$(jq -r '.workspace_path' "$config_file")
+        if [[ -z "$wp_val" ]]; then
+            echo "\"workspace_path\" must not be empty"
+            return
         fi
     fi
+}
+
+_validate_plugins() {
+    local config_file="$1"
+    local plugins_type
+    plugins_type=$(jq -r 'if has("plugins") then .plugins | type else "null" end' "$config_file")
+    [[ "$plugins_type" == "null" ]] && return
+    if [[ "$plugins_type" != "array" ]]; then
+        echo "\"plugins\" must be an array, got: ${plugins_type}"
+        return
+    fi
+    local plugin_count
+    plugin_count=$(jq '.plugins | length' "$config_file")
+    local pi
+    for ((pi = 0; pi < plugin_count; pi++)); do
+        local entry_type
+        entry_type=$(jq -r ".plugins[$pi] | type" "$config_file")
+        case "$entry_type" in
+            string)
+                local str_val
+                str_val=$(jq -r ".plugins[$pi]" "$config_file")
+                if [[ -z "$str_val" ]]; then
+                    echo "plugins[$pi]: empty string"
+                    return
+                fi
+                # Local path (./,~/,/) or marketplace name (alphanumeric + hyphens + optional @marketplace)
+                if [[ "$str_val" != ./* && "$str_val" != ~* && "$str_val" != /* ]]; then
+                    # Marketplace name: validate format
+                    if [[ ! "$str_val" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?(@[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?)?$ ]]; then
+                        echo "plugins[$pi]: invalid marketplace plugin name: ${str_val}"
+                        return
+                    fi
+                fi
+                ;;
+            object)
+                local p_path p_name
+                p_path=$(jq -r ".plugins[$pi].path // empty" "$config_file")
+                p_name=$(jq -r ".plugins[$pi].name // empty" "$config_file")
+                if [[ -z "$p_path" && -z "$p_name" ]]; then
+                    echo "plugins[$pi]: object entry must have \"name\" or \"path\" field"
+                    return
+                fi
+                if [[ -n "$p_path" && -n "$p_name" ]]; then
+                    echo "plugins[$pi]: \"name\" and \"path\" are mutually exclusive"
+                    return
+                fi
+                if [[ -n "$p_name" ]]; then
+                    # Validate marketplace name format
+                    if [[ ! "$p_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?(@[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?)?$ ]]; then
+                        echo "plugins[$pi].name: invalid marketplace plugin name: ${p_name}"
+                        return
+                    fi
+                fi
+                # Validate config field if present
+                local config_type
+                config_type=$(jq -r "if .plugins[$pi] | has(\"config\") then .plugins[$pi].config | type else \"null\" end" "$config_file")
+                if [[ "$config_type" != "null" && "$config_type" != "object" ]]; then
+                    echo "plugins[$pi].config must be an object, got: ${config_type}"
+                    return
+                fi
+                if [[ "$config_type" == "object" ]]; then
+                    # All config values must be strings
+                    local bad_config
+                    bad_config=$(jq -r ".plugins[$pi].config | to_entries[] | select((.value | type) != \"string\") | \"plugins[$pi].config.\(.key): expected string, got \(.value | type)\"" "$config_file" 2>/dev/null || true)
+                    if [[ -n "$bad_config" ]]; then
+                        echo "$bad_config"
+                        return
+                    fi
+                fi
+                # Only allow valid keys: name, path, config
+                local unknown_plugin_keys
+                unknown_plugin_keys=$(jq -r ".plugins[$pi] | keys | map(select(. != \"name\" and . != \"path\" and . != \"config\")) | .[]" "$config_file" 2>/dev/null || true)
+                if [[ -n "$unknown_plugin_keys" ]]; then
+                    local first_uk
+                    first_uk=$(echo "$unknown_plugin_keys" | head -1)
+                    echo "plugins[$pi]: unknown key \"${first_uk}\". Allowed keys: name, path, config"
+                    return
+                fi
+                ;;
+            *)
+                echo "plugins[$pi]: expected string or object, got: ${entry_type}"
+                return
+                ;;
+        esac
+    done
+}
+
+_validate_marketplaces() {
+    local config_file="$1"
+    local mkts_type
+    mkts_type=$(jq -r 'if has("marketplaces") then .marketplaces | type else "null" end' "$config_file")
+    [[ "$mkts_type" == "null" ]] && return
+    if [[ "$mkts_type" != "object" ]]; then
+        echo "\"marketplaces\" must be an object, got: ${mkts_type}"
+        return
+    fi
+    local mkt_keys
+    mkt_keys=$(jq -r '.marketplaces | keys[]' "$config_file" 2>/dev/null || true)
+    while IFS= read -r mkt_name; do
+        [[ -z "$mkt_name" ]] && continue
+        local mkt_type
+        mkt_type=$(jq -r --arg n "$mkt_name" '.marketplaces[$n] | type' "$config_file")
+        if [[ "$mkt_type" != "object" ]]; then
+            echo "marketplaces.${mkt_name}: must be an object, got: ${mkt_type}"
+            return
+        fi
+        local mkt_source
+        mkt_source=$(jq -r --arg n "$mkt_name" '.marketplaces[$n].source // empty' "$config_file")
+        if [[ -z "$mkt_source" ]]; then
+            echo "marketplaces.${mkt_name}: must have a \"source\" field"
+            return
+        fi
+        local mkt_repo
+        mkt_repo=$(jq -r --arg n "$mkt_name" '.marketplaces[$n].repo // empty' "$config_file")
+        if [[ -z "$mkt_repo" ]]; then
+            echo "marketplaces.${mkt_name}: must have a \"repo\" field"
+            return
+        fi
+    done <<< "$mkt_keys"
 }
 
 validate_config_semantics() {
     local config_file="$1"
 
     # Warn on unknown top-level keys
-    local known_keys='["projects","presets","workspaces","resources","update_interval"]'
+    local known_keys='["projects","presets","workspaces","resources","update_interval","plugins","marketplaces","workspace_path"]'
     local unknown_keys
     unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
     if [[ -n "$unknown_keys" ]]; then
@@ -429,12 +387,21 @@ validate_config_semantics() {
         done <<< "$unknown_keys"
     fi
 
+    # Deprecation warnings
+    if jq -e 'has("presets")' "$config_file" >/dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: The 'presets' key is no longer supported. Use 'plugins' for reusable extensions.${NC}" >&2
+    fi
+    if jq -e 'has("update_interval")' "$config_file" >/dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: The 'update_interval' key is no longer supported.${NC}" >&2
+    fi
+
     local err
     err=$(_validate_projects "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
     err=$(_validate_resources "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
-    err=$(_validate_update_interval "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_workspace_path "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
     err=$(_validate_workspaces "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
-    err=$(_validate_presets "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_plugins "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
+    err=$(_validate_marketplaces "$config_file"); [[ -n "$err" ]] && { echo "$err"; return; }
     return 0
 }
 

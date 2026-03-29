@@ -24,17 +24,17 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
 
 ### Key concepts
 
-**Workspace directory** — the current working directory. It may contain its own code, or serve purely as a launch point for working with external projects. All Claude configuration (.claude/, .mcp.json, agents, skills, permissions) lives here and is managed by claude-compose.
+**Workspace directory** — the current working directory. It may contain its own code, or serve purely as a launch point for working with external projects. All Claude configuration (.claude/, .claude/claude-compose/mcp.json, agents, skills, permissions) lives here and is managed by claude-compose.
 
 **Projects** — external codebases added via `--add-dir`. They provide file access (read/write) and optionally their CLAUDE.md instructions. Projects are listed in `claude-compose.json` and referenced by aliases (e.g., `myapp://src/main.ts`).
 
-**Presets** — reusable sets of resources (MCP servers, agents, skills) stored globally at `~/.claude-compose/presets/<name>/`. Each preset has a `claude-compose-preset.json` with explicit `resources` declarations (same format as workspace). Activated by name in config. Can also come from GitHub registries via `{"source": "github:owner/repo@spec"}`.
+**Plugins** — reusable Claude Code extensions from marketplaces or local paths. Marketplace plugins are auto-installed via `claude plugins install` and enabled in settings. Local plugins are loaded via `--plugin-dir`.
 
 **Workspaces** — other claude-compose workspaces that can share their configuration (MCP servers, agents, skills) into this one at build time.
 
-**Build** — the process of syncing resources from presets/workspaces/local config into the workspace's `.claude/` directory and `.mcp.json`. Runs automatically at launch when changes are detected.
+**Build** — the process of syncing resources from workspaces/local config and installing marketplace plugins into the workspace's `.claude/` directory and `.claude/claude-compose/mcp.json`. Runs automatically at launch when changes are detected.
 
-**Global config** — `~/.claude-compose/global.json` is an optional file with the same schema as `claude-compose.json`. It is auto-applied to all workspaces. Useful for presets, MCP servers, agents, or skills you always want available. **Important: global and local configs are processed independently — their arrays (presets, projects, etc.) are NOT merged. Each is iterated separately at build time.** An empty `"presets": []` in local config does NOT conflict with global presets.
+**Global config** — `~/.claude-compose/global.json` is an optional file with the same schema as `claude-compose.json`. It is auto-applied to all workspaces. Useful for plugins, MCP servers, agents, or skills you always want available. **Important: global and local configs are processed independently — their arrays (plugins, projects, etc.) are NOT merged. Each is iterated separately at build time.**
 
 ### Config schema (claude-compose.json)
 
@@ -53,8 +53,7 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
   "workspaces": [
     { "path": "~/workspaces/shared", "mcp": { "rename": { "cal": "shared-cal" } } }
   ],
-  "presets": ["my-tools", "common-agents"],
-  "update_interval": 24
+  "plugins": ["ralph-loop", "./local/plugin"]
 }
 ```
 
@@ -62,33 +61,29 @@ Field rules:
 - `projects[].path` — path to external project (required)
 - `projects[].name` — alias for file references (required)
 - `projects[].claude_md` — load CLAUDE.md from project (default: `true`, omit if true)
-- `presets[]` — string (local preset name or path) or object `{"source": "github:owner/repo@spec", ...}`, `{"name": "preset-name", ...}`, or `{"path": "./local-preset", ...}`
+- `plugins[]` — string (marketplace name or local path) or object {"name": "...", "config": {...}} or {"path": "..."}
 - `resources.agents` — array of string paths to agent .md files
 - `resources.skills` — array of string paths to skill directories
 - `resources.mcp` — object of MCP server configs
 - `resources.env_files` — array of string paths to JSON env files
-- `update_interval` — number (hours), must be >= 0
+- `marketplaces` — object of marketplace configs, each with "source" and "repo" fields
 - `workspaces[].path` — path to source workspace (required)
 - `workspaces[].mcp.include/exclude/rename` — MCP server filters
 - `workspaces[].agents.include/exclude/rename` — agent filters
 - `workspaces[].skills.include/exclude` — skill filters
-
-GitHub preset source format: `github:owner/repo[/path][@version-spec]`
-- Version spec: `@1.2.3` (exact), `@^1.2.3` (compatible), `@~1.2.3` (patch-only), omit for latest
-- Owner/repo must be alphanumeric with hyphens/dots/underscores
-- Path segments must not contain `.` or `..`
 
 ### File structure
 
 ```
 workspace/
 ├── claude-compose.json        # main config
-├── claude-compose.lock.json   # version lock for GitHub presets
 ├── CLAUDE.md                  # workspace instructions
-├── .mcp.json                  # GENERATED — merged MCP servers
-├── .compose-manifest.json     # GENERATED — tracks synced resources
-├── .compose-hash              # GENERATED — content hash for rebuild detection
 ├── .claude/
+│   ├── claude-compose/        # GENERATED — all compose output files
+│   │   ├── mcp.json           # merged MCP servers
+│   │   ├── manifest.json      # tracks synced resources
+│   │   ├── hash               # content hash for rebuild detection
+│   │   └── settings.json      # compose-generated settings
 │   ├── agents/                # GENERATED — symlinks to agent files
 │   ├── skills/                # GENERATED — symlinks to skill dirs
 │   └── settings.local.json    # permissions (user-managed)
@@ -98,8 +93,6 @@ workspace/
 ```
 
 Global config: `~/.claude-compose/global.json` (same schema)
-Presets dir: `~/.claude-compose/presets/<name>/`
-Registries dir: `~/.claude-compose/registries/<owner>/<repo>/<version>/`
 
 ### CLI reference
 
@@ -111,8 +104,6 @@ claude-compose config -y ~/path       # quick-create config with one project
 claude-compose config --check         # validate config
 claude-compose migrate ~/project      # import config from existing project
 claude-compose copy ~/ws/src ~/ws/dst # clone workspace
-claude-compose update [source]        # check and apply GitHub preset updates
-claude-compose registries             # list GitHub presets and status
 claude-compose instructions           # show workspace management guide
 claude-compose doctor                 # diagnose and fix problems
 claude-compose start [root-path]      # onboarding wizard
@@ -137,13 +128,13 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
    - JSON syntax validity
    - Required fields (every project needs `"name"`)
    - Field types match schema
-   - Referenced presets exist (`ls ~/.claude-compose/presets/`)
+   - Referenced plugins exist (marketplace names valid, local paths exist)
    - Referenced project paths exist (expand `~` to `$HOME` when checking)
    - Global config if relevant: `~/.claude-compose/global.json`
 
 3. **Fix everything** in one pass. For ambiguous fixes, use sensible defaults:
    - Missing `"name"` → use basename of path
-   - Nonexistent preset → remove it from config
+   - Nonexistent plugin → remove it from config
    - Nonexistent project path → warn but keep (user may create it later)
 
 4. **Apply** atomically:
@@ -172,9 +163,9 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
    - Read config file
    - Check JSON validity
    - Validate semantic correctness (required fields, types, values)
-   - Check that referenced paths exist (project dirs, preset dirs, workspace dirs)
+   - Check that referenced paths exist (project dirs, plugin paths, workspace dirs)
    - Check global config
-   - Check `.mcp.json` and `.compose-manifest.json` for build state
+   - Check `.claude/claude-compose/mcp.json` and `.claude/claude-compose/manifest.json` for build state
    - Check tool availability (jq, git, claude)
 
 3. **Report** findings and propose fixes.
@@ -198,23 +189,13 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
 - **Symptom**: "X must be an array/object, got: Y"
 - **Fix**: Convert to the correct type. Show before/after.
 
-### Preset not found
-- **Symptom**: "Preset not found: X"
-- **Cause**: Preset directory `~/.claude-compose/presets/X/` doesn't exist
-- **Fix**: List available presets (`ls ~/.claude-compose/presets/`), suggest correction or creation
-
-### GitHub preset errors
-- **Symptom**: Various source format or git clone errors
-- **Cause**: Invalid source format, network issues, private repo without auth
-- **Fix**: Verify source format, check network, suggest `git clone` manually to test
-
 ### Global config errors
 - **Symptom**: "Global config error" or "Invalid JSON in global config"
 - **Cause**: Same issues as workspace config but in `~/.claude-compose/global.json`
 - **Fix**: Same approach but on the global config file
 
 ### Build failures
-- **Symptom**: Errors during preset/workspace processing
+- **Symptom**: Errors during workspace/plugin processing
 - **Cause**: Missing dependencies, broken symlinks, permission issues
 - **Fix**: Check the specific resource, verify source exists, fix paths
 
@@ -222,7 +203,6 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
 - **Symptom**: "jq is required" / "git is required" / "claude CLI not found"
 - **Fix**: Provide install instructions:
   - jq: `brew install jq` / `apt install jq`
-  - git: `brew install git` / `apt install git` / Xcode Command Line Tools
   - claude: See Anthropic docs for Claude CLI installation
 
 ### Project path not found
@@ -241,5 +221,5 @@ You MUST fix the problem yourself, fully and autonomously. Do NOT stop halfway o
 - If `__CONFIG_FILE__` does not exist, create a minimal valid config with an empty projects array.
 - If global config is the problem, edit `~/.claude-compose/global.json` (not the workspace config).
 - For ambiguous fixes, use sensible defaults and explain what you chose.
-- Remove references to nonexistent presets rather than leaving broken config.
+- Remove references to broken plugins rather than leaving broken config.
 - After fixing, always verify by reading the file back and checking with `jq empty`.

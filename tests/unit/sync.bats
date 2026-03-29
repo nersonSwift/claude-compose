@@ -23,7 +23,8 @@ description: Test
 Body
 EOF
     echo "skill content" > "${src}/.claude/skills/test-skill/SKILL.md"
-    echo '{"mcpServers":{"test-srv":{"command":"echo","args":["hi"]}}}' > "${src}/.mcp.json"
+    mkdir -p "${src}/.claude/claude-compose"
+    echo '{"mcpServers":{"test-srv":{"command":"echo","args":["hi"]}}}' > "${src}/.claude/claude-compose/mcp.json"
 }
 
 # ── sync_source_dir ──────────────────────────────────────────────────
@@ -105,9 +106,9 @@ EOF
     _create_source "$src"
     cd "${TEST_TEMP_DIR}/workspace"
     sync_source_dir "$src" '{}' "test"
-    [[ -f .mcp.json ]]
+    [[ -f "$COMPOSE_MCP" ]]
     local srv
-    srv=$(jq -r '.mcpServers["test-srv"].command' .mcp.json)
+    srv=$(jq -r '.mcpServers["test-srv"].command' "$COMPOSE_MCP")
     [[ "$srv" == "echo" ]]
 }
 
@@ -117,7 +118,7 @@ EOF
     cd "${TEST_TEMP_DIR}/workspace"
     sync_source_dir "$src" '{"mcp":{"rename":{"test-srv":"new-srv"}}}' ""
     local keys
-    keys=$(jq -r '.mcpServers | keys[]' .mcp.json)
+    keys=$(jq -r '.mcpServers | keys[]' "$COMPOSE_MCP")
     [[ "$keys" == *"new-srv"* ]]
     [[ "$keys" != *"test-srv"* ]]
 }

@@ -35,28 +35,6 @@ teardown() {
     assert_output "$HOME"
 }
 
-# ── _is_preset_path ─────────────────────────────────────────────────
-
-@test "_is_preset_path returns 0 for relative path" {
-    run _is_preset_path "./my-preset"
-    assert_success
-}
-
-@test "_is_preset_path returns 0 for absolute path" {
-    run _is_preset_path "/path/to/preset"
-    assert_success
-}
-
-@test "_is_preset_path returns 0 for tilde path" {
-    run _is_preset_path "~/presets/mine"
-    assert_success
-}
-
-@test "_is_preset_path returns 1 for bare name" {
-    run _is_preset_path "my-preset"
-    assert_failure
-}
-
 # ── matches_filter ───────────────────────────────────────────────────
 
 @test "matches_filter with wildcard include matches all" {
@@ -94,44 +72,6 @@ teardown() {
 @test "matches_filter with no match returns 1" {
     run matches_filter "bar" '["foo"]' '[]'
     assert_failure
-}
-
-# ── merge_preset_filters ────────────────────────────────────────────
-
-@test "merge_preset_filters child include overrides parent" {
-    local result
-    result=$(merge_preset_filters '{"agents":{"include":["a"]}}' '{"agents":{"include":["b"]}}')
-    local include
-    include=$(echo "$result" | jq -c '.agents.include')
-    [[ "$include" == '["b"]' ]]
-}
-
-@test "merge_preset_filters exclude accumulates" {
-    # Parent has exclude, child adds to it (using empty parent exclude to avoid jq 1.8 pipe precedence issue)
-    local result
-    result=$(merge_preset_filters '{"agents":{"include":["*"]}}' '{"agents":{"exclude":["b"]}}')
-    local exclude
-    exclude=$(echo "$result" | jq -c '.agents.exclude')
-    [[ "$exclude" == '["b"]' ]]
-}
-
-@test "merge_preset_filters empty child inherits parent" {
-    local result
-    result=$(merge_preset_filters '{"agents":{"include":["x"]}}' '{}')
-    local include
-    include=$(echo "$result" | jq -c '.agents.include')
-    [[ "$include" == '["x"]' ]]
-}
-
-@test "merge_preset_filters null handling" {
-    local result
-    result=$(merge_preset_filters '{}' '{}')
-    # Result should be valid JSON (may have empty sections with empty exclude arrays)
-    echo "$result" | jq empty
-    # No include keys should exist when both inputs are empty
-    local has_include
-    has_include=$(echo "$result" | jq '[.. | objects | select(has("include"))] | length')
-    [[ "$has_include" == "0" ]]
 }
 
 # ── merge_compose_settings ──────────────────────────────────────────

@@ -24,18 +24,16 @@ _common_setup() {
     extract_embedded_skills() { :; }
 
     # Override HOME-based globals to use isolated temp dirs
-    PRESETS_DIR="${TEST_TEMP_DIR}/presets"
     BUILTIN_SKILLS_DIR="${TEST_TEMP_DIR}/builtin_skills"
     GLOBAL_CONFIG="${TEST_TEMP_DIR}/global.json"
     GLOBAL_CONFIG_DIR="${TEST_TEMP_DIR}"
-    REGISTRIES_DIR="${TEST_TEMP_DIR}/registries"
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
+    CONFIG_DIR="${TEST_TEMP_DIR}/workspace"
+    WORKSPACE_DIR="${TEST_TEMP_DIR}/workspace"
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.lock.json"
 
     # Create workspace directory
     mkdir -p "${TEST_TEMP_DIR}/workspace"
-    mkdir -p "${PRESETS_DIR}"
 
     # Disable colors
     RED=''
@@ -58,10 +56,11 @@ _common_teardown() {
 # Reset all mutable globals from 01-globals.sh to their defaults
 reset_globals() {
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
-    LOCK_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.lock.json"
     DRY_RUN=false
     EXTRA_ARGS=()
     ORIGINAL_CWD="${TEST_TEMP_DIR}/workspace"
+    CONFIG_DIR="${TEST_TEMP_DIR}/workspace"
+    WORKSPACE_DIR="${TEST_TEMP_DIR}/workspace"
     CLAUDE_ARGS=()
     COMPOSE_CLAUDE_MD_EXCLUDES=()
     HAS_ANY_ADD_DIR=false
@@ -79,9 +78,8 @@ reset_globals() {
     START_PATH=""
     DOCTOR_ERROR_MSG=""
     DOCTOR_ENABLED=false
-    PROCESSED_PRESETS=()
     PROCESSED_WORKSPACES=()
-    MANIFEST_JSON='{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
+    MANIFEST_JSON='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
     CURRENT_SOURCE_AGENTS=()
     CURRENT_SOURCE_SKILLS=()
     CURRENT_SOURCE_MCP_SERVERS=()
@@ -89,8 +87,8 @@ reset_globals() {
     CURRENT_SOURCE_PROJECT_DIRS=()
     CURRENT_SOURCE_SYSTEM_PROMPT_FILES=()
     CURRENT_SOURCE_SETTINGS_FILES=()
-    CURRENT_PRESET_PREFIX=""
-    CURRENT_PRESET_RENAME='{}'
     CURRENT_SOURCE_NAME=""
+    MARKETPLACE_PLUGINS=()
+    PLUGIN_CONFIG_ENVS=()
     _BUILD_LOCK_HELD=false
 }

@@ -82,9 +82,9 @@ teardown() {
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
     cd "${TEST_TEMP_DIR}/workspace"
     cmd_migrate
-    [[ -f "${TEST_TEMP_DIR}/workspace/.mcp.json" ]]
+    [[ -f "${TEST_TEMP_DIR}/workspace/${COMPOSE_MCP}" ]]
     local srv
-    srv=$(jq -r '.mcpServers.srv.command' "${TEST_TEMP_DIR}/workspace/.mcp.json")
+    srv=$(jq -r '.mcpServers.srv.command' "${TEST_TEMP_DIR}/workspace/${COMPOSE_MCP}")
     [[ "$srv" == "echo" ]]
 }
 
@@ -115,7 +115,7 @@ teardown() {
     run cmd_migrate
     assert_success
     # Should not actually copy files
-    [[ ! -f "${TEST_TEMP_DIR}/workspace/.mcp.json" ]]
+    [[ ! -f "${TEST_TEMP_DIR}/workspace/${COMPOSE_MCP}" ]]
 }
 
 # ── cmd_copy ─────────────────────────────────────────────────────────
@@ -165,24 +165,6 @@ teardown() {
     reset_globals
     create_config '{"projects":[],"resources":{"agents":["a.md","b.md"],"skills":[],"mcp":{"s":{"command":"echo"}},"env_files":[]}}'
     run cmd_instructions
-    assert_success
-}
-
-# ── cmd_registries ───────────────────────────────────────────────────
-
-@test "cmd_registries handles no github presets" {
-    reset_globals
-    create_config '{"presets":["local-preset"]}'
-    run cmd_registries
-    assert_success
-}
-
-# ── cmd_update ───────────────────────────────────────────────────────
-
-@test "cmd_update with no github presets" {
-    reset_globals
-    create_config '{"presets":["local-only"]}'
-    run cmd_update
     assert_success
 }
 

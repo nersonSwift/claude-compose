@@ -8,8 +8,6 @@ usage() {
     echo "  claude-compose config [-y <path>] [--check] [-f <file>]"
     echo "  claude-compose migrate <project-path> [--delete] [--workspace <path>]"
     echo "  claude-compose copy <source-workspace> [dest-path]"
-    echo "  claude-compose update [source]"
-    echo "  claude-compose registries"
     echo "  claude-compose instructions"
     echo "  claude-compose doctor"
     echo "  claude-compose start [root-path]"
@@ -17,12 +15,10 @@ usage() {
     echo "  claude-compose vscode [variant]"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
-    echo "  build         Build workspace from presets/workspaces/resources (auto on launch)"
+    echo "  build         Build workspace from workspaces/resources/plugins (auto on launch)"
     echo "  config        Create or manage claude-compose.json config"
     echo "  migrate       Copy Claude config from a project into this workspace"
     echo "  copy          Clone a workspace to a new location"
-    echo "  update        Check and apply updates for GitHub presets"
-    echo "  registries    List configured GitHub presets and their status"
     echo "  instructions  Show instructions for managing workspace resources"
     echo "  doctor        Diagnose and fix compose problems"
     echo "  start         Onboarding wizard — scan for projects and create workspaces"
@@ -42,7 +38,7 @@ usage() {
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  claude-compose                              # Launch from workspace"
-    echo "  claude-compose build                        # Build presets explicitly"
+    echo "  claude-compose build                        # Build workspace explicitly"
     echo "  claude-compose config                       # Create or edit config"
     echo "  claude-compose config -y ~/Code/app         # Quick create with defaults"
     echo "  claude-compose migrate ~/Code/app           # Import config from project"
@@ -96,52 +92,19 @@ matches_filter() {
     return 0
 }
 
-# Merge parent and child preset filter JSON for recursive inheritance.
-# exclude: union (accumulates down the tree)
-# include: child overrides parent if child specifies; otherwise inherits parent's
-# $1 = parent filter JSON, $2 = child filter JSON
-# Prints: merged filter JSON
-merge_preset_filters() {
-    local parent="$1" child="$2"
-    jq -n --argjson p "$parent" --argjson c "$child" '
-        def merge_section($p; $c):
-            {
-                include: (if ($c | has("include")) then $c.include
-                         elif ($p | has("include")) then $p.include
-                         else null end),
-                exclude: ([$p.exclude // [] | .[], $c.exclude // [] | .[]] | unique)
-            } | with_entries(select(.value != null));
-        {
-            agents: merge_section($p.agents // {}; $c.agents // {}),
-            skills: merge_section($p.skills // {}; $c.skills // {}),
-            mcp: merge_section($p.mcp // {}; $c.mcp // {})
-        } | with_entries(select(.value != {}))'
-}
-
-# ── Expand ~ safely ─────────────────────────────────────────────────
+# ── Expand ~ safely + resolve relative paths ──────────────────────────
+# $1 = path, $2 = optional base_dir for relative path resolution
 expand_path() {
     local path="$1"
-    echo "${path/#\~/$HOME}"
-}
-
-# Check if a preset string should be treated as a path (not a name)
-_is_preset_path() {
-    [[ "$1" == */* || "$1" == ~* ]]
-}
-
-# Resolve a preset path to an absolute directory
-# $1 = raw path string, $2 = base directory for relative resolution
-resolve_preset_path() {
-    local raw="$1" base_dir="$2"
-    local expanded
-    expanded=$(expand_path "$raw")
-    if [[ "$expanded" != /* ]]; then
-        expanded="$base_dir/$expanded"
+    local base_dir="${2:-}"
+    path="${path/#\~/$HOME}"
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+    elif [[ -n "$base_dir" ]]; then
+        echo "${base_dir}/${path}"
+    else
+        echo "$path"
     fi
-    if [[ -d "$expanded" ]]; then
-        expanded=$(cd "$expanded" && pwd -P)
-    fi
-    echo "$expanded"
 }
 
 # ── Parse CLI args ───────────────────────────────────────────────────
@@ -149,7 +112,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions|update|registries|doctor|start|wrap|vscode)
+            config|build|migrate|copy|instructions|doctor|start|wrap|vscode)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -245,15 +208,6 @@ parse_args() {
                             COPY_SOURCE="$1"
                         elif [[ -z "$COPY_DEST" && "$1" != -* ]]; then
                             COPY_DEST="$1"
-                        else
-                            echo -e "${RED}Unknown option: $1${NC}" >&2
-                            usage >&2
-                            exit 1
-                        fi
-                        ;;
-                    update)
-                        if [[ -z "$UPDATE_SOURCE" && "$1" != -* ]]; then
-                            UPDATE_SOURCE="$1"
                         else
                             echo -e "${RED}Unknown option: $1${NC}" >&2
                             usage >&2
@@ -394,7 +348,7 @@ launch_doctor() {
     local error_msg="$1"
     local config_file="${CONFIG_FILE:-claude-compose.json}"
     local ws_dir
-    ws_dir="$(dirname "$config_file")"
+    ws_dir="${WORKSPACE_DIR:-$(dirname "$config_file")}"
 
     local prompt
     prompt=$(compose_doctor_prompt "$config_file" "$ws_dir" "$error_msg")
@@ -443,7 +397,7 @@ _doctor_trap() {
 
     # Release build lock if held (RETURN trap doesn't fire on exit)
     if [[ "${_BUILD_LOCK_HELD:-}" == true ]]; then
-        _release_lock ".compose-build.lock" 2>/dev/null || true
+        _release_lock "$COMPOSE_LOCK" 2>/dev/null || true
         _BUILD_LOCK_HELD=false
     fi
 
@@ -455,6 +409,51 @@ _doctor_trap() {
         launch_doctor "${DOCTOR_ERROR_MSG:-Unknown error (exit code $exit_code)}"
     fi
 }
+
+# ── Resolve workspace directory from config ──────────────────────────
+# Sets globals: CONFIG_DIR, WORKSPACE_DIR, ORIGINAL_CWD.
+# Prerequisite: CONFIG_FILE must be an absolute path.
+# Side effect: cd to WORKSPACE_DIR.
+_resolve_workspace_dir() {
+    # Follow symlink to resolve real config location (e.g. when launched from workspace_path dir)
+    if [[ -L "$CONFIG_FILE" ]]; then
+        local _link_target
+        _link_target=$(readlink "$CONFIG_FILE")
+        if [[ "$_link_target" == /* ]]; then
+            CONFIG_FILE="$_link_target"
+        else
+            CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)/$_link_target"
+        fi
+        # Re-resolve to absolute (link target may contain ../)
+        local _resolved_dir
+        _resolved_dir="$(cd "$(dirname "$CONFIG_FILE")" && pwd -P)"
+        CONFIG_FILE="${_resolved_dir}/$(basename "$CONFIG_FILE")"
+    fi
+    CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+    ORIGINAL_CWD="$CONFIG_DIR"
+    WORKSPACE_DIR="$CONFIG_DIR"
+    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" 2>/dev/null; then
+        local raw_ws_path
+        raw_ws_path=$(jq -r '.workspace_path // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        if [[ -n "$raw_ws_path" ]]; then
+            WORKSPACE_DIR=$(expand_path "$raw_ws_path" "$CONFIG_DIR")
+            mkdir -p "$WORKSPACE_DIR"
+            WORKSPACE_DIR=$(cd "$WORKSPACE_DIR" && pwd -P)
+            if [[ "$WORKSPACE_DIR" != "$CONFIG_DIR" ]]; then
+                local ws_config="$WORKSPACE_DIR/claude-compose.json"
+                if [[ ! -e "$ws_config" ]] || [[ -L "$ws_config" ]]; then
+                    ln -sf "$CONFIG_FILE" "$ws_config"
+                elif [[ -f "$ws_config" ]]; then
+                    echo -e "${YELLOW}Warning: workspace_path contains its own claude-compose.json, skipping symlink${NC}" >&2
+                fi
+            fi
+        fi
+    fi
+    cd "$WORKSPACE_DIR"
+}
+
+# Ensure compose output directory exists
+ensure_compose_dir() { mkdir -p "$COMPOSE_DIR"; }
 
 # Atomic file write: writes content to a temp file, then moves it into place.
 # Usage: atomic_write "destination_path" "content"
@@ -481,4 +480,40 @@ rewrite_frontmatter_name() {
         in_fm && !done && /^name:/ { print "name: " ENVIRON["_AWK_NEW_NAME"]; done = 1; next }
         { print }
     ' "$input" > "$output"
+}
+
+# Acquire a directory-based lock (POSIX-portable, no flock needed)
+# $1 = lock dir path
+_acquire_lock() {
+    local lock_dir="$1"
+    local attempts=0 stale_retries=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [[ "$attempts" -ge 25 ]]; then
+            # Check if lock holder is still alive
+            local lock_pid=""
+            [[ -f "$lock_dir/pid" ]] && lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+            if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+                echo -e "${YELLOW}Warning: Lock ${lock_dir} held by active process ${lock_pid}${NC}" >&2
+                return 1
+            fi
+            # Stale lock — force-remove and retry the loop
+            stale_retries=$((stale_retries + 1))
+            if [[ "$stale_retries" -ge 3 ]]; then
+                echo -e "${YELLOW}Warning: Failed to acquire lock ${lock_dir} after stale retries${NC}" >&2
+                return 1
+            fi
+            rm -rf "$lock_dir"
+            attempts=0
+            continue
+        fi
+        sleep 0.2
+    done
+    echo "$$" > "$lock_dir/pid"
+}
+
+# Release a directory-based lock
+# $1 = lock dir path
+_release_lock() {
+    rm -rf "$1" 2>/dev/null || true
 }

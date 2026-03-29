@@ -1,190 +1,19 @@
-# Extract filter JSON from a preset entry (object with optional agents/skills/mcp fields)
-# $1 = preset entry JSON
-# Prints: filter JSON (or '{}' if no filters)
-extract_preset_filters() {
-    local entry="$1"
-    local result
-    result=$(echo "$entry" | jq -c '{
-        agents: (if has("agents") then .agents else null end),
-        skills: (if has("skills") then .skills else null end),
-        mcp: (if has("mcp") then .mcp else null end)
-    } | with_entries(select(.value != null))')
-    if [[ -z "$result" || "$result" == "null" ]]; then
-        echo '{}'
-    else
-        echo "$result"
-    fi
-}
-
-# ── Process a single preset ─────────────────────────────────────────
-process_preset() {
-    local preset_name="$1"
-    local _empty_json='{}'
-    local filter_json="${2:-$_empty_json}"
-    local preset_dir="${3:-}"  # optional resolved absolute path
-
-    # Resolve directory
-    if [[ -z "$preset_dir" ]]; then
-        preset_dir="$PRESETS_DIR/$preset_name"
-    fi
-
-    # Cycle detection — use preset_dir for path presets, preset_name for name presets
-    local cycle_key="${3:+$preset_dir}"
-    cycle_key="${cycle_key:-$preset_name}"
-    for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
-        if [[ "$processed" == "$cycle_key" ]]; then
-            echo -e "${YELLOW}Warning: Preset already processed, skipping: ${cycle_key}${NC}" >&2
-            return
-        fi
-    done
-    PROCESSED_PRESETS+=("$cycle_key")
-
-    if [[ ! -d "$preset_dir" ]]; then
-        echo -e "${RED}Error: Preset not found: ${preset_dir}${NC}" >&2
-        die_doctor "Preset not found: ${preset_dir}"
-    fi
-
-    local preset_config="$preset_dir/$PRESET_CONFIG_FILE"
-    if [[ ! -f "$preset_config" ]]; then
-        if [[ -f "$preset_dir/preset.json" || -f "$preset_dir/claude-compose.json" || -d "$preset_dir/.claude" ]]; then
-            echo -e "${RED}Error: Preset '${preset_dir}' uses old format. Rename to $PRESET_CONFIG_FILE${NC}" >&2
-            die_doctor "Preset '$(basename "$preset_dir")' uses old config format. Rename claude-compose.json to $PRESET_CONFIG_FILE in ${preset_dir}"
-        else
-            echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in preset: ${preset_dir}${NC}" >&2
-        fi
-        return
-    fi
-
-    # Display label
-    if [[ -n "${3:-}" ]]; then
-        echo -e "${CYAN}Processing path preset:${NC} ${preset_dir}" >&2
-    else
-        echo -e "${CYAN}Processing preset:${NC} ${preset_name}" >&2
-    fi
-
-    # Local presets don't use prefix/rename
-    CURRENT_PRESET_PREFIX=""
-    CURRENT_PRESET_RENAME='{}'
-
-    # Recursively process nested presets FIRST (so own resources override nested ones)
-    local nested_count
-    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    local ni
-    for ((ni = 0; ni < nested_count; ni++)); do
-        local nested_type
-        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
-        if [[ "$nested_type" == "string" ]]; then
-            local nested_name
-            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
-            [[ -z "$nested_name" ]] && continue
-            if _is_preset_path "$nested_name"; then
-                local nested_resolved
-                nested_resolved=$(resolve_preset_path "$nested_name" "$preset_dir")
-                process_preset "$(basename "$nested_resolved")" "$filter_json" "$nested_resolved"
-            else
-                if [[ "$nested_name" == *..* ]]; then
-                    echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                    continue
-                fi
-                # String entry inherits parent's filter unchanged
-                process_preset "$nested_name" "$filter_json"
-            fi
-        elif [[ "$nested_type" == "object" ]]; then
-            local nested_json
-            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source nested_name_field nested_path_val
-            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
-            nested_path_val=$(echo "$nested_json" | jq -r '.path // empty')
-
-            # Extract child filters and merge with inherited
-            local child_filter merged_filter
-            child_filter=$(extract_preset_filters "$nested_json")
-            merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
-
-            if [[ -n "$nested_path_val" ]]; then
-                local nested_resolved
-                nested_resolved=$(resolve_preset_path "$nested_path_val" "$preset_dir")
-                process_preset "$(basename "$nested_resolved")" "$merged_filter" "$nested_resolved"
-            elif [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
-                # Rebuild entry_json with merged filters for process_github_preset
-                local patched_entry
-                patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
-                    del(.agents, .skills, .mcp) +
-                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
-                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
-                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
-                process_github_preset "$patched_entry"
-            elif [[ -n "$nested_name_field" ]]; then
-                # Local preset with filters
-                process_preset "$nested_name_field" "$merged_filter"
-            fi
-        fi
-    done
-
-    # Reset prefix/rename after nested recursion (may have been clobbered by nested github presets)
-    CURRENT_PRESET_PREFIX=""
-    CURRENT_PRESET_RENAME='{}'
-
-    # Manifest key: path presets use "path:<dir>", name presets use name
-    local manifest_key
-    if [[ -n "${3:-}" ]]; then
-        manifest_key="path:$preset_dir"
-    else
-        manifest_key="$preset_name"
-    fi
-
-    # Display label
-    local label="${3:+$preset_dir}"
-    label="${label:-$preset_name}"
-
-    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
-    process_resources "$preset_config" "$preset_dir" "$label" \
-        "presets" "$manifest_key" "$preset_name" "true" "$filter_json"
-
-    # CLAUDE.md via --add-dir (process_resources always resets arrays, even on early return)
-    local claude_md
-    claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
-    if [[ -f "$preset_dir/CLAUDE.md" || -d "$preset_dir/.claude" ]]; then
-        CURRENT_SOURCE_ADD_DIRS+=("${preset_dir}|${claude_md}")
-    fi
-
-    # Collect preset's projects
-    local preset_project_count
-    preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    if [[ "$preset_project_count" -gt 0 ]]; then
-        local ppi
-        for ((ppi = 0; ppi < preset_project_count; ppi++)); do
-            local proj_path proj_claude_md
-            proj_path=$(jq -r ".projects[$ppi].path" "$preset_config")
-            proj_path=$(expand_path "$proj_path")
-            proj_claude_md=$(jq -r ".projects[$ppi].claude_md // true" "$preset_config")
-
-            if [[ ! -d "$proj_path" ]]; then
-                echo -e "${YELLOW}Warning: Preset project path not found, skipping: ${proj_path}${NC}" >&2
-                continue
-            fi
-
-            CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
-            echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from preset)" >&2
-        done
-    fi
-
-    # Write manifest entry (includes agents/skills/mcp from process_resources + add_dirs + project_dirs)
-    CURRENT_SOURCE_NAME="$preset_name"
-    write_source_manifest "presets" "$manifest_key"
-}
-
 # ── Process a single workspace source ───────────────────────────────
 process_workspace_source() {
     local ws_json="$1"
+    local base_dir="${2:-$CONFIG_DIR}"
 
     local raw_path
     raw_path=$(echo "$ws_json" | jq -r '.path')
     local ws_path
-    ws_path=$(expand_path "$raw_path")
+    ws_path=$(expand_path "$raw_path" "$base_dir")
 
-    if [[ ! -d "$ws_path" ]]; then
+    # If path points to a file, use its directory
+    local ws_config_file=""
+    if [[ -f "$ws_path" ]]; then
+        ws_config_file="$ws_path"
+        ws_path=$(dirname "$ws_path")
+    elif [[ ! -d "$ws_path" ]]; then
         echo -e "${YELLOW}Warning: Workspace not found, skipping: ${raw_path}${NC}" >&2
         return
     fi
@@ -226,16 +55,17 @@ process_workspace_source() {
     sync_source_dir "$ws_path" "$filter_json" "$(basename "$ws_path")"
 
     # Collect workspace's own projects (from its claude-compose.json)
-    if [[ -f "$ws_path/claude-compose.json" ]]; then
+    local ws_config="${ws_config_file:-$ws_path/claude-compose.json}"
+    if [[ -f "$ws_config" ]]; then
         local ws_project_count
-        ws_project_count=$(jq '.projects // [] | length' "$ws_path/claude-compose.json" 2>/dev/null || echo 0)
+        ws_project_count=$(jq '.projects // [] | length' "$ws_config" 2>/dev/null || echo 0)
         if [[ "$ws_project_count" -gt 0 ]]; then
             local wpi
             for ((wpi = 0; wpi < ws_project_count; wpi++)); do
                 local proj_path proj_claude_md
-                proj_path=$(jq -r ".projects[$wpi].path" "$ws_path/claude-compose.json")
-                proj_path=$(expand_path "$proj_path")
-                proj_claude_md=$(jq -r ".projects[$wpi].claude_md // true" "$ws_path/claude-compose.json")
+                proj_path=$(jq -r ".projects[$wpi].path" "$ws_config")
+                proj_path=$(expand_path "$proj_path" "$ws_path")
+                proj_claude_md=$(jq -r ".projects[$wpi].claude_md // true" "$ws_config")
 
                 if [[ ! -d "$proj_path" ]]; then
                     continue
@@ -253,24 +83,16 @@ process_workspace_source() {
 }
 
 # ── Process resources from a config file ───────────────────────────
-# Args: [config_file] [base_dir] [label] [manifest_section] [manifest_key] [source_name] [skip_manifest] [filter_json]
+# Args: [config_file] [base_dir] [label] [manifest_section] [manifest_key]
 # Defaults preserve backward compatibility for local resources.
-# source_name: if set, enables env var prefixing for MCP servers (used by presets)
-# skip_manifest: if "true", caller handles write_source_manifest (used by presets)
-# filter_json: preset filter JSON with agents/skills/mcp include/exclude (default '{}')
 process_resources() {
     local config_file="${1:-$CONFIG_FILE}"
-    local base_dir="${2:-$PWD}"
+    local base_dir="${2:-$CONFIG_DIR}"
     local label="${3:-local}"
     local manifest_section="${4:-resources}"
     local manifest_key="${5:-local}"
-    local source_name="${6:-}"
-    local skip_manifest="${7:-false}"
-    local _empty_json='{}'
-    local filter_json="${8:-$_empty_json}"
 
-    # Set source_name for manifest tracking (used by env var prefixing at launch time)
-    CURRENT_SOURCE_NAME="$source_name"
+    CURRENT_SOURCE_NAME=""
 
     # Reset tracking (must happen before early return so callers see clean arrays)
     CURRENT_SOURCE_AGENTS=()
@@ -288,15 +110,6 @@ process_resources() {
     fi
 
     echo -e "${CYAN}Processing ${label} resources${NC}" >&2
-
-    # Parse filter JSON for include/exclude lists
-    local pr_agents_include pr_agents_exclude pr_skills_include pr_skills_exclude pr_mcp_include pr_mcp_exclude
-    pr_agents_include=$(echo "$filter_json" | jq -c '.agents.include // ["*"]')
-    pr_agents_exclude=$(echo "$filter_json" | jq -c '.agents.exclude // []')
-    pr_skills_include=$(echo "$filter_json" | jq -c '.skills.include // ["*"]')
-    pr_skills_exclude=$(echo "$filter_json" | jq -c '.skills.exclude // []')
-    pr_mcp_include=$(echo "$filter_json" | jq -c '.mcp.include // ["*"]')
-    pr_mcp_exclude=$(echo "$filter_json" | jq -c '.mcp.exclude // []')
 
     # ── Sync agents (symlink or copy+rename) ──
     local agents
@@ -316,29 +129,13 @@ process_resources() {
         local agent_basename
         agent_basename=$(basename "$agent_path")
         local name_no_ext="${agent_basename%.md}"
-        if ! matches_filter "$name_no_ext" "$pr_agents_include" "$pr_agents_exclude"; then continue; fi
-        # Apply prefix/rename if active
-        local final_name="$name_no_ext"
-        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
-            final_name=$(apply_resource_prefix "$name_no_ext" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
-        fi
-        local final_agent="${final_name}.md"
         mkdir -p ".claude/agents"
-        if [[ -f ".claude/agents/${final_agent}" || -L ".claude/agents/${final_agent}" ]]; then
-            echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${final_agent}" >&2
+        if [[ -f ".claude/agents/${agent_basename}" || -L ".claude/agents/${agent_basename}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/agents/${agent_basename}" >&2
         fi
-        if [[ "$final_name" != "$name_no_ext" ]]; then
-            # Name changed — copy and rewrite name: in frontmatter (Claude CLI reads it)
-            rewrite_frontmatter_name "$abs_path" ".claude/agents/${final_agent}" "$final_name"
-        else
-            ln -sf "$abs_path" ".claude/agents/${final_agent}"
-        fi
-        CURRENT_SOURCE_AGENTS+=("$final_agent")
-        if [[ "$final_name" != "$name_no_ext" ]]; then
-            echo -e "  ${GREEN}+agent:${NC} ${name_no_ext} → ${final_name} (${label})" >&2
-        else
-            echo -e "  ${GREEN}+agent:${NC} ${name_no_ext} (${label})" >&2
-        fi
+        ln -sf "$abs_path" ".claude/agents/${agent_basename}"
+        CURRENT_SOURCE_AGENTS+=("$agent_basename")
+        echo -e "  ${GREEN}+agent:${NC} ${name_no_ext} (${label})" >&2
     done <<< "$agents"
 
     # ── Sync skills (symlink or copy+rename) ──
@@ -358,54 +155,20 @@ process_resources() {
         abs_path=$(cd "$abs_path" && pwd -P)
         local skill_basename
         skill_basename=$(basename "$skill_path")
-        if ! matches_filter "$skill_basename" "$pr_skills_include" "$pr_skills_exclude"; then continue; fi
-        # Apply prefix/rename if active
-        local final_skill="$skill_basename"
-        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
-            final_skill=$(apply_resource_prefix "$skill_basename" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
-        fi
         mkdir -p ".claude/skills"
-        if [[ -L ".claude/skills/${final_skill}" || -d ".claude/skills/${final_skill}" ]]; then
-            echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${final_skill}/" >&2
-            rm -f ".claude/skills/${final_skill}" 2>/dev/null || rm -rf ".claude/skills/${final_skill}"
+        if [[ -L ".claude/skills/${skill_basename}" || -d ".claude/skills/${skill_basename}" ]]; then
+            echo -e "  ${YELLOW}overwrite:${NC} .claude/skills/${skill_basename}/" >&2
+            rm -f ".claude/skills/${skill_basename}" 2>/dev/null || rm -rf ".claude/skills/${skill_basename}"
         fi
-        if [[ "$final_skill" != "$skill_basename" ]]; then
-            # Name changed — copy dir and rewrite name: in SKILL.md
-            cp -R "$abs_path" ".claude/skills/${final_skill}"
-            if [[ -f ".claude/skills/${final_skill}/SKILL.md" ]]; then
-                local tmp_skill
-                tmp_skill=$(mktemp ".claude/skills/${final_skill}/SKILL.md.XXXXXX")
-                rewrite_frontmatter_name ".claude/skills/${final_skill}/SKILL.md" "$tmp_skill" "$final_skill"
-                mv "$tmp_skill" ".claude/skills/${final_skill}/SKILL.md"
-            fi
-        else
-            ln -sf "$abs_path" ".claude/skills/${final_skill}"
-        fi
-        CURRENT_SOURCE_SKILLS+=("$final_skill")
-        if [[ "$final_skill" != "$skill_basename" ]]; then
-            echo -e "  ${GREEN}+skill:${NC} ${skill_basename} → ${final_skill} (${label})" >&2
-        else
-            echo -e "  ${GREEN}+skill:${NC} ${skill_basename} (${label})" >&2
-        fi
+        ln -sf "$abs_path" ".claude/skills/${skill_basename}"
+        CURRENT_SOURCE_SKILLS+=("$skill_basename")
+        echo -e "  ${GREEN}+skill:${NC} ${skill_basename} (${label})" >&2
     done <<< "$skills"
 
-    # ── Collect known env var names for MCP prefixing (when source_name is set) ──
-    local _source_known_vars=""
-    if [[ -n "$source_name" ]]; then
-        local _src_env_files
-        _src_env_files=$(jq -r '.resources.env_files // [] | .[]' "$config_file" 2>/dev/null || true)
-        while IFS= read -r _ef; do
-            [[ -z "$_ef" ]] && continue
-            local _ef_abs="$base_dir/$_ef"
-            [[ -f "$_ef_abs" ]] || continue
-            _source_known_vars+=$(jq -r 'keys[]' "$_ef_abs" 2>/dev/null || true)
-            _source_known_vars+=$'\n'
-        done <<< "$_src_env_files"
-    fi
-
     # ── Merge MCP servers ──
-    if [[ ! -f ".mcp.json" ]]; then
-        atomic_write ".mcp.json" "$_MCP_EMPTY"
+    ensure_compose_dir
+    if [[ ! -f "$COMPOSE_MCP" ]]; then
+        atomic_write "$COMPOSE_MCP" "$_MCP_EMPTY"
     fi
 
     local mcp_batch='{}'
@@ -413,72 +176,30 @@ process_resources() {
     mcp_keys=$(jq -r '.resources.mcp // {} | keys[]' "$config_file" 2>/dev/null || true)
     while IFS= read -r server_name; do
         [[ -z "$server_name" ]] && continue
-        if ! matches_filter "$server_name" "$pr_mcp_include" "$pr_mcp_exclude"; then continue; fi
         local server_config
         server_config=$(jq -c --arg n "$server_name" '.resources.mcp[$n]' "$config_file")
 
-        # Prefix env vars from source's env_files (when source_name is set)
-        if [[ -n "$source_name" && -n "${_source_known_vars:-}" ]]; then
-            local env_prefix
-            env_prefix=$(compute_source_prefix "$source_name" "$base_dir")
-            server_config=$(prefix_env_vars_in_mcp "$server_config" "$env_prefix" "$_source_known_vars")
-        fi
+        mcp_batch=$(echo "$mcp_batch" | jq --arg name "$server_name" --argjson config "$server_config" '.[$name] = $config')
 
-        # Apply resource prefix/rename to server name
-        local final_server="$server_name"
-        if [[ -n "$CURRENT_PRESET_PREFIX" || "$CURRENT_PRESET_RENAME" != '{}' ]]; then
-            final_server=$(apply_resource_prefix "$server_name" "$CURRENT_PRESET_PREFIX" "$CURRENT_PRESET_RENAME")
-        fi
-
-        mcp_batch=$(echo "$mcp_batch" | jq --arg name "$final_server" --argjson config "$server_config" '.[$name] = $config')
-
-        CURRENT_SOURCE_MCP_SERVERS+=("$final_server")
-        if [[ "$final_server" != "$server_name" ]]; then
-            echo -e "  ${GREEN}+mcp:${NC} ${server_name} → ${final_server} (${label})" >&2
-        else
-            echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
-        fi
+        CURRENT_SOURCE_MCP_SERVERS+=("$server_name")
+        echo -e "  ${GREEN}+mcp:${NC} ${server_name} (${label})" >&2
     done <<< "$mcp_keys"
 
     if [[ "$mcp_batch" != '{}' ]]; then
         local overwrites
         overwrites=$(jq -r --argjson batch "$mcp_batch" \
             '[.mcpServers // {} | keys[] as $k | select($batch | has($k)) | $k] | .[]' \
-            ".mcp.json" 2>/dev/null || true)
+            "$COMPOSE_MCP" 2>/dev/null || true)
         while IFS= read -r ow; do
             [[ -z "$ow" ]] && continue
             echo -e "  ${YELLOW}overwrite mcp:${NC} $ow" >&2
         done <<< "$overwrites"
         local tmp
-        tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' ".mcp.json")
-        atomic_write ".mcp.json" "$tmp"
+        tmp=$(jq --argjson batch "$mcp_batch" '.mcpServers += $batch' "$COMPOSE_MCP")
+        atomic_write "$COMPOSE_MCP" "$tmp"
     fi
 
-    # Collect system_prompt_files and settings (only for preset/workspace sources — local/global are read directly at launch)
-    if [[ -n "$source_name" ]]; then
-        local aspf_list
-        aspf_list=$(jq -r '.resources.append_system_prompt_files // [] | .[]' "$config_file" 2>/dev/null || true)
-        while IFS= read -r aspf; do
-            [[ -z "$aspf" ]] && continue
-            local abs_aspf="$base_dir/$aspf"
-            if [[ -f "$abs_aspf" ]]; then
-                CURRENT_SOURCE_SYSTEM_PROMPT_FILES+=("$(cd "$(dirname "$abs_aspf")" && pwd -P)/$(basename "$abs_aspf")")
-            fi
-        done <<< "$aspf_list"
-
-        local settings_path
-        settings_path=$(jq -r '.resources.settings // empty' "$config_file" 2>/dev/null || true)
-        if [[ -n "$settings_path" ]]; then
-            local abs_sp="$base_dir/$settings_path"
-            if [[ -f "$abs_sp" ]]; then
-                CURRENT_SOURCE_SETTINGS_FILES+=("$(cd "$(dirname "$abs_sp")" && pwd -P)/$(basename "$abs_sp")")
-            fi
-        fi
-    fi
-
-    if [[ "$skip_manifest" != "true" ]]; then
-        write_source_manifest "$manifest_section" "$manifest_key"
-    fi
+    write_source_manifest "$manifest_section" "$manifest_key"
 }
 
 # ── Sync built-in skills from ~/.claude-compose/skills/ ────────────
@@ -532,28 +253,6 @@ process_global() {
 
     echo -e "${CYAN}Processing global config${NC}" >&2
 
-    # ── Global presets (handles mixed arrays) ──
-    # shellcheck disable=SC2329
-    _global_preset_cb() {
-        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="$7" path_val="${8:-}"
-        if [[ -n "$path_val" ]]; then
-            local resolved
-            resolved=$(resolve_preset_path "$path_val" "$GLOBAL_CONFIG_DIR")
-            local filter='{}'
-            [[ "$etype" == "object" ]] && filter=$(extract_preset_filters "$ejson")
-            process_preset "$(basename "$resolved")" "$filter" "$resolved"
-        elif [[ "$etype" == "string" ]]; then
-            process_preset "$name"
-        elif [[ "$is_gh" == "true" ]]; then
-            process_github_preset "$ejson"
-        elif [[ -n "$name" ]]; then
-            local filter; filter=$(extract_preset_filters "$ejson")
-            process_preset "$name" "$filter"
-        fi
-    }
-    iterate_presets "$GLOBAL_CONFIG" _global_preset_cb
-
-    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
     process_resources "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "global" "global" "resources"
 
     # ── Global projects (top-level, not inside resources) ──
@@ -572,7 +271,7 @@ process_global() {
         for ((gpi2 = 0; gpi2 < global_project_count; gpi2++)); do
             local proj_path proj_claude_md
             proj_path=$(jq -r ".projects[$gpi2].path" "$GLOBAL_CONFIG")
-            proj_path=$(expand_path "$proj_path")
+            proj_path=$(expand_path "$proj_path" "$GLOBAL_CONFIG_DIR")
             proj_claude_md=$(jq -r ".projects[$gpi2].claude_md // true" "$GLOBAL_CONFIG")
 
             if [[ ! -d "$proj_path" ]]; then
@@ -596,274 +295,24 @@ process_global() {
         for ((gwi = 0; gwi < global_ws_count; gwi++)); do
             local ws_json
             ws_json=$(jq -c ".workspaces[$gwi]" "$GLOBAL_CONFIG")
-            process_workspace_source "$ws_json"
+            process_workspace_source "$ws_json" "$GLOBAL_CONFIG_DIR"
         done
     fi
-}
-
-# ── Process a GitHub preset ─────────────────────────────────────────
-process_github_preset() {
-    local entry_json="$1"
-
-    local source
-    source=$(echo "$entry_json" | jq -r '.source')
-    local prefix
-    prefix=$(echo "$entry_json" | jq -r '.prefix // empty')
-    local rename_json
-    rename_json=$(echo "$entry_json" | jq -c '.rename // {}')
-    # Parse source
-    parse_github_source "$source"
-    local owner="$_GH_OWNER" repo="$_GH_REPO" preset_path="$_GH_PATH" spec_str="$_GH_SPEC"
-
-    # Build source_key
-    local source_key="github:${owner}/${repo}"
-    [[ -n "$preset_path" ]] && source_key+="/${preset_path}"
-
-    # Cycle detection
-    for processed in "${PROCESSED_PRESETS[@]+"${PROCESSED_PRESETS[@]}"}"; do
-        if [[ "$processed" == "$source_key" ]]; then
-            echo -e "${YELLOW}Warning: GitHub preset already processed, skipping: ${source_key}${NC}" >&2
-            return
-        fi
-    done
-    PROCESSED_PRESETS+=("$source_key")
-
-    require_git
-
-    echo -e "${CYAN}Processing GitHub preset:${NC} ${source_key}" >&2
-
-    # Resolve version
-    local resolved_info resolved_version
-    resolved_info=$(resolve_github_version "$owner" "$repo" "$source_key" "$spec_str")
-    read -r resolved_version _ <<< "$resolved_info"
-
-    # Get preset directory
-    local preset_dir
-    preset_dir=$(registry_preset_dir "$owner" "$repo" "$resolved_version" "$preset_path")
-
-    if [[ ! -d "$preset_dir" ]]; then
-        echo -e "${RED}Error: Preset directory not found in registry: ${preset_dir}${NC}" >&2
-        die_doctor "Preset directory not found in registry: ${preset_dir}. Try running: claude-compose update"
-    fi
-
-    local preset_config="$preset_dir/$PRESET_CONFIG_FILE"
-    if [[ ! -f "$preset_config" ]]; then
-        if [[ -f "$preset_dir/claude-compose.json" || -f "$preset_dir/preset.json" ]]; then
-            echo -e "${RED}Error: GitHub preset '${source_key}' uses old config format. Needs $PRESET_CONFIG_FILE${NC}" >&2
-            die_doctor "GitHub preset '${source_key}' uses old config format. The preset author needs to rename claude-compose.json to $PRESET_CONFIG_FILE"
-        else
-            echo -e "${YELLOW}Warning: No $PRESET_CONFIG_FILE in GitHub preset: ${source_key}${NC}" >&2
-        fi
-        return
-    fi
-
-    # Compute stable source_name (without version) for env var prefixing
-    local source_name
-    source_name="${owner}_${repo}"
-    [[ -n "$preset_path" ]] && source_name+="_${preset_path}"
-    # If prefix is set, use it for more readable env var names
-    if [[ -n "$prefix" ]]; then
-        source_name="$prefix"
-    fi
-
-    # Extract filters from entry_json
-    local filter_json
-    filter_json=$(extract_preset_filters "$entry_json")
-
-    # Save prefix/rename to locals for later use by process_resources
-    local my_prefix="$prefix"
-    local my_rename="$rename_json"
-
-    # Reset globals before nested recursion (nested presets manage their own)
-    CURRENT_PRESET_PREFIX=""
-    CURRENT_PRESET_RENAME='{}'
-
-    # Recursively process nested presets FIRST (so own resources override nested ones)
-    local nested_count
-    nested_count=$(jq '.presets // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    local ni
-    for ((ni = 0; ni < nested_count; ni++)); do
-        local nested_type
-        nested_type=$(jq -r ".presets[$ni] | type" "$preset_config" 2>/dev/null || echo "null")
-        if [[ "$nested_type" == "string" ]]; then
-            local nested_name
-            nested_name=$(jq -r ".presets[$ni]" "$preset_config")
-            [[ -z "$nested_name" ]] && continue
-            if _is_preset_path "$nested_name"; then
-                local nested_resolved
-                nested_resolved=$(resolve_preset_path "$nested_name" "$preset_dir")
-                process_preset "$(basename "$nested_resolved")" "$filter_json" "$nested_resolved"
-            else
-                if [[ "$nested_name" == *..* ]]; then
-                    echo -e "${YELLOW}Warning: Invalid nested preset name '${nested_name}', skipping${NC}" >&2
-                    continue
-                fi
-                # Local presets within a github registry resolve relative to registry root
-                local reg_root
-                reg_root=$(registry_version_dir "$owner" "$repo" "$resolved_version")
-                if [[ -d "$reg_root/$nested_name" ]]; then
-                    # Treat as another github preset from same repo — inherit filter
-                    local nested_entry
-                    nested_entry=$(jq -n --arg s "github:${owner}/${repo}/${nested_name}@${resolved_version}" \
-                        --argjson f "$filter_json" \
-                        '{source: $s} +
-                        (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
-                        (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
-                        (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
-                    process_github_preset "$nested_entry"
-                else
-                    process_preset "$nested_name" "$filter_json"
-                fi
-            fi
-        elif [[ "$nested_type" == "object" ]]; then
-            local nested_json
-            nested_json=$(jq -c ".presets[$ni]" "$preset_config")
-            local nested_source nested_name_field nested_path_val
-            nested_source=$(echo "$nested_json" | jq -r '.source // empty')
-            nested_name_field=$(echo "$nested_json" | jq -r '.name // empty')
-            nested_path_val=$(echo "$nested_json" | jq -r '.path // empty')
-
-            # Extract child filters and merge with inherited
-            local child_filter merged_filter
-            child_filter=$(extract_preset_filters "$nested_json")
-            merged_filter=$(merge_preset_filters "$filter_json" "$child_filter")
-
-            if [[ -n "$nested_path_val" ]]; then
-                local nested_resolved
-                nested_resolved=$(resolve_preset_path "$nested_path_val" "$preset_dir")
-                process_preset "$(basename "$nested_resolved")" "$merged_filter" "$nested_resolved"
-            elif [[ -n "$nested_source" && "$nested_source" == github:* ]]; then
-                # Rebuild entry_json with merged filters for process_github_preset
-                local patched_entry
-                patched_entry=$(echo "$nested_json" | jq --argjson f "$merged_filter" '
-                    del(.agents, .skills, .mcp) +
-                    (if ($f.agents // null) != null then {agents: $f.agents} else {} end) +
-                    (if ($f.skills // null) != null then {skills: $f.skills} else {} end) +
-                    (if ($f.mcp // null) != null then {mcp: $f.mcp} else {} end)')
-                process_github_preset "$patched_entry"
-            elif [[ -n "$nested_name_field" ]]; then
-                # Local preset with filters
-                process_preset "$nested_name_field" "$merged_filter"
-            fi
-        fi
-    done
-
-    # Restore prefix/rename for own resource processing
-    CURRENT_PRESET_PREFIX="$my_prefix"
-    CURRENT_PRESET_RENAME="$my_rename"
-
-    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
-    process_resources "$preset_config" "$preset_dir" "$source_key" \
-        "presets" "$source_key" "$source_name" "true" "$filter_json"
-
-    # CLAUDE.md via --add-dir
-    local claude_md
-    claude_md=$(jq -r '.claude_md // true' "$preset_config" 2>/dev/null || echo "true")
-    if [[ -f "$preset_dir/CLAUDE.md" || -d "$preset_dir/.claude" ]]; then
-        CURRENT_SOURCE_ADD_DIRS+=("${preset_dir}|${claude_md}")
-    fi
-
-    # Collect preset's projects
-    local preset_project_count
-    preset_project_count=$(jq '.projects // [] | length' "$preset_config" 2>/dev/null || echo 0)
-    if [[ "$preset_project_count" -gt 0 ]]; then
-        local pi
-        for ((pi = 0; pi < preset_project_count; pi++)); do
-            local proj_path proj_claude_md
-            proj_path=$(jq -r ".projects[$pi].path" "$preset_config")
-            proj_path=$(expand_path "$proj_path")
-            proj_claude_md=$(jq -r ".projects[$pi].claude_md // true" "$preset_config")
-
-            if [[ ! -d "$proj_path" ]]; then
-                echo -e "${YELLOW}Warning: GitHub preset project path not found, skipping: ${proj_path}${NC}" >&2
-                continue
-            fi
-
-            CURRENT_SOURCE_PROJECT_DIRS+=("${proj_path}|${proj_claude_md}")
-            echo -e "  ${GREEN}+project:${NC} $(basename "$proj_path") (from github preset)" >&2
-        done
-    fi
-
-    # Write manifest entry
-    CURRENT_SOURCE_NAME="$source_name"
-    write_source_manifest "presets" "$source_key"
-
-    # Reset prefix/rename to prevent leaking to caller
-    CURRENT_PRESET_PREFIX=""
-    CURRENT_PRESET_RENAME='{}'
-}
-
-# ── Apply resource prefix/rename ──────────────────────────────────────
-# $1 = original name, $2 = prefix, $3 = rename JSON object
-# Prints the final name
-apply_resource_prefix() {
-    local name="$1" prefix="$2" rename_json="$3"
-
-    # Check rename map first
-    local renamed
-    renamed=$(echo "$rename_json" | jq -r --arg n "$name" '.[$n] // empty')
-    if [[ -n "$renamed" ]]; then
-        echo "$renamed"
-        return
-    fi
-
-    # Apply prefix
-    if [[ -n "$prefix" ]]; then
-        echo "${prefix}-${name}"
-    else
-        echo "$name"
-    fi
-}
-
-# Iterate over a presets array in a config file, calling a callback for each entry.
-# $1 = config file path
-# $2 = callback function name
-# Callback receives: entry_type index name source is_github entry_json config_file path_val
-# shellcheck disable=SC2329
-iterate_presets() {
-    local config_file="$1" callback="$2"
-    [[ ! -f "$config_file" ]] && return
-    local count
-    count=$(jq '.presets // [] | length' "$config_file" 2>/dev/null || echo 0)
-    local i
-    for ((i = 0; i < count; i++)); do
-        local entry_type
-        entry_type=$(jq -r ".presets[$i] | type" "$config_file" 2>/dev/null || echo "null")
-        if [[ "$entry_type" == "string" ]]; then
-            local name
-            name=$(jq -r ".presets[$i]" "$config_file")
-            [[ -z "$name" ]] && continue
-            if _is_preset_path "$name"; then
-                "$callback" "string" "$i" "" "" "false" '{}' "$config_file" "$name"
-            else
-                "$callback" "string" "$i" "$name" "" "false" '{}' "$config_file" ""
-            fi
-        elif [[ "$entry_type" == "object" ]]; then
-            local entry_json source_val name_val path_val is_github="false"
-            entry_json=$(jq -c ".presets[$i]" "$config_file")
-            source_val=$(echo "$entry_json" | jq -r '.source // empty')
-            name_val=$(echo "$entry_json" | jq -r '.name // empty')
-            path_val=$(echo "$entry_json" | jq -r '.path // empty')
-            [[ -n "$source_val" && "$source_val" == github:* ]] && is_github="true"
-            "$callback" "object" "$i" "$name_val" "$source_val" "$is_github" "$entry_json" "$config_file" "$path_val"
-        fi
-    done
 }
 
 # Build orchestrator
 build() {
     local force="${1:-false}"
 
-    local preset_count ws_count has_resources
-    preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+    local ws_count has_resources
     ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
     has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
     local has_global_config=false
     [[ -f "$GLOBAL_CONFIG" ]] && has_global_config=true
 
-    if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
-        echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
+    if [[ "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_config" != "true" ]] && ! has_builtin_skills; then
+        echo -e "${CYAN}No workspaces or resources configured. Nothing to build.${NC}" >&2
         return
     fi
 
@@ -872,14 +321,17 @@ build() {
         return
     fi
 
+    # Ensure compose output directory exists (must be before _acquire_lock which uses mkdir without -p)
+    ensure_compose_dir
+
     # Acquire build lock to prevent concurrent builds
-    if ! _acquire_lock ".compose-build.lock"; then
+    if ! _acquire_lock "$COMPOSE_LOCK"; then
         echo -e "${YELLOW}Warning: Another build is in progress, skipping.${NC}" >&2
         return
     fi
     # Release lock on normal return; also chain into EXIT trap for abnormal exit (die_doctor, etc.)
     # shellcheck disable=SC2064
-    trap '_release_lock ".compose-build.lock"; _BUILD_LOCK_HELD=false' RETURN
+    trap '_release_lock "$COMPOSE_LOCK"; _BUILD_LOCK_HELD=false' RETURN
     _BUILD_LOCK_HELD=true
 
     echo -e "${BOLD}Building workspace...${NC}" >&2
@@ -889,41 +341,18 @@ build() {
     old_manifest=$(read_manifest)
     clean_manifest_section "$old_manifest" "builtin"
     clean_manifest_section "$old_manifest" "global"
-    clean_manifest_section "$old_manifest" "presets"
     clean_manifest_section "$old_manifest" "workspaces"
     clean_manifest_section "$old_manifest" "resources"
 
     # Reset state
-    PROCESSED_PRESETS=()
     PROCESSED_WORKSPACES=()
-    MANIFEST_JSON='{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}'
+    MANIFEST_JSON='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
 
-    # Process built-in skills (first — can be overridden by presets/resources)
+    # Process built-in skills (first — can be overridden by resources)
     process_builtin_skills
 
-    # Process global config (presets, resources, workspaces)
+    # Process global config (resources, workspaces)
     process_global
-
-    # Process presets (handles mixed arrays)
-    # shellcheck disable=SC2329
-    _build_preset_cb() {
-        local etype="$1" _idx="$2" name="$3" source="$4" is_gh="$5" ejson="$6" _cfg="$7" path_val="${8:-}"
-        if [[ -n "$path_val" ]]; then
-            local resolved
-            resolved=$(resolve_preset_path "$path_val" "$ORIGINAL_CWD")
-            local filter='{}'
-            [[ "$etype" == "object" ]] && filter=$(extract_preset_filters "$ejson")
-            process_preset "$(basename "$resolved")" "$filter" "$resolved"
-        elif [[ "$etype" == "string" ]]; then
-            process_preset "$name"
-        elif [[ "$is_gh" == "true" ]]; then
-            process_github_preset "$ejson"
-        elif [[ -n "$name" ]]; then
-            local filter; filter=$(extract_preset_filters "$ejson")
-            process_preset "$name" "$filter"
-        fi
-    }
-    iterate_presets "$CONFIG_FILE" _build_preset_cb
 
     # Process workspaces
     if [[ "$ws_count" -gt 0 ]]; then
@@ -935,19 +364,23 @@ build() {
         done
     fi
 
-    # process_resources: config_file base_dir label manifest_section manifest_key source_name skip_manifest filter_json
-    # (all defaults: CONFIG_FILE, PWD, "local", "resources", "local", "", "false", "{}")
+    # Process local resources
     process_resources
 
-    # Write manifest and hash
-    atomic_write ".compose-manifest.json" "$(echo "$MANIFEST_JSON" | jq '.')"
-    atomic_write ".compose-hash" "$(compute_build_hash)"
+    # Resolve plugins (GitHub + local)
+    resolve_plugins "$CONFIG_FILE" "$CONFIG_DIR"
+    [[ -f "$GLOBAL_CONFIG" ]] && resolve_plugins "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR"
 
-    # Ensure _warning in .mcp.json
-    if [[ -f ".mcp.json" ]]; then
+    # Write manifest and hash
+    ensure_compose_dir
+    atomic_write "$COMPOSE_MANIFEST" "$(echo "$MANIFEST_JSON" | jq '.')"
+    atomic_write "$COMPOSE_HASH" "$(compute_build_hash)"
+
+    # Ensure _warning in mcp.json
+    if [[ -f "$COMPOSE_MCP" ]]; then
         local tmp
-        tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' ".mcp.json")
-        atomic_write ".mcp.json" "$tmp"
+        tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' "$COMPOSE_MCP")
+        atomic_write "$COMPOSE_MCP" "$tmp"
     fi
 
     echo "" >&2
@@ -974,16 +407,15 @@ cmd_build() {
         echo -e "${BOLD}── Dry Run (build) ──${NC}" >&2
         echo "" >&2
 
-        local preset_count ws_count has_resources
-        preset_count=$(jq '.presets // [] | length' "$CONFIG_FILE")
+        local ws_count has_resources
         ws_count=$(jq '.workspaces // [] | length' "$CONFIG_FILE")
         has_resources=$(jq 'has("resources") and (.resources | length > 0)' "$CONFIG_FILE")
 
         local has_global_dr=false
         [[ -f "$GLOBAL_CONFIG" ]] && has_global_dr=true
 
-        if [[ "$preset_count" -eq 0 && "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_dr" != "true" ]] && ! has_builtin_skills; then
-            echo -e "${CYAN}No presets, workspaces, or resources configured. Nothing to build.${NC}" >&2
+        if [[ "$ws_count" -eq 0 && "$has_resources" != "true" && "$has_global_dr" != "true" ]] && ! has_builtin_skills; then
+            echo -e "${CYAN}No workspaces or resources configured. Nothing to build.${NC}" >&2
             return
         fi
 
@@ -999,107 +431,11 @@ cmd_build() {
 
         if [[ "$has_global_dr" == true ]]; then
             echo -e "${CYAN}Global config:${NC} ${GLOBAL_CONFIG}" >&2
-            local gp_count gw_count ghr
-            gp_count=$(jq '.presets // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
+            local gw_count ghr
             gw_count=$(jq '.workspaces // [] | length' "$GLOBAL_CONFIG" 2>/dev/null || echo 0)
             ghr=$(jq 'has("resources") and (.resources | length > 0)' "$GLOBAL_CONFIG" 2>/dev/null || echo false)
-            [[ "$gp_count" -gt 0 ]] && echo "  presets: $gp_count" >&2
             [[ "$ghr" == "true" ]] && echo "  resources: yes" >&2
             [[ "$gw_count" -gt 0 ]] && echo "  workspaces: $gw_count" >&2
-            echo "" >&2
-        fi
-
-        if [[ "$preset_count" -gt 0 ]]; then
-            echo -e "${CYAN}Presets to process:${NC}" >&2
-            local dri
-            for ((dri = 0; dri < preset_count; dri++)); do
-                local dr_type
-                dr_type=$(jq -r ".presets[$dri] | type" "$CONFIG_FILE")
-                if [[ "$dr_type" == "string" ]]; then
-                    local name
-                    name=$(jq -r ".presets[$dri]" "$CONFIG_FILE")
-                    if _is_preset_path "$name"; then
-                        local resolved
-                        resolved=$(resolve_preset_path "$name" "$ORIGINAL_CWD")
-                        if [[ -d "$resolved" ]]; then
-                            echo -e "  - path: $resolved" >&2
-                            if [[ -f "$resolved/$PRESET_CONFIG_FILE" ]]; then
-                                local pa ps pm
-                                pa=$(jq '.resources.agents // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                ps=$(jq '.resources.skills // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                pm=$(jq '.resources.mcp // {} | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
-                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
-                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
-                            else
-                                echo "    (no $PRESET_CONFIG_FILE)" >&2
-                            fi
-                            [[ -f "$resolved/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
-                        else
-                            echo -e "  - $name ${RED}(not found)${NC}" >&2
-                        fi
-                    else
-                        local preset_dir="$PRESETS_DIR/$name"
-                        if [[ -d "$preset_dir" ]]; then
-                            echo -e "  - $name (${preset_dir})" >&2
-                            if [[ -f "$preset_dir/$PRESET_CONFIG_FILE" ]]; then
-                                local pa ps pm
-                                pa=$(jq '.resources.agents // [] | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                ps=$(jq '.resources.skills // [] | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                pm=$(jq '.resources.mcp // {} | length' "$preset_dir/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
-                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
-                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
-                            else
-                                echo "    (no $PRESET_CONFIG_FILE)" >&2
-                            fi
-                            [[ -f "$preset_dir/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
-                        else
-                            echo -e "  - $name ${RED}(not found)${NC}" >&2
-                        fi
-                    fi
-                elif [[ "$dr_type" == "object" ]]; then
-                    local dr_path
-                    dr_path=$(jq -r ".presets[$dri].path // empty" "$CONFIG_FILE")
-                    if [[ -n "$dr_path" ]]; then
-                        local resolved
-                        resolved=$(resolve_preset_path "$dr_path" "$ORIGINAL_CWD")
-                        if [[ -d "$resolved" ]]; then
-                            echo -e "  - path: ${resolved}" >&2
-                            if [[ -f "$resolved/$PRESET_CONFIG_FILE" ]]; then
-                                local pa ps pm
-                                pa=$(jq '.resources.agents // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                ps=$(jq '.resources.skills // [] | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                pm=$(jq '.resources.mcp // {} | length' "$resolved/$PRESET_CONFIG_FILE" 2>/dev/null || echo 0)
-                                [[ "$pa" -gt 0 ]] && echo "    agents: $pa" >&2
-                                [[ "$ps" -gt 0 ]] && echo "    skills: $ps" >&2
-                                [[ "$pm" -gt 0 ]] && echo "    mcp: $pm" >&2
-                            else
-                                echo "    (no $PRESET_CONFIG_FILE)" >&2
-                            fi
-                            [[ -f "$resolved/CLAUDE.md" ]] && echo "    CLAUDE.md: yes" >&2
-                        else
-                            echo -e "  - $dr_path ${RED}(not found)${NC}" >&2
-                        fi
-                    else
-                        local dr_source dr_prefix dr_locked_ver
-                        dr_source=$(jq -r ".presets[$dri].source // empty" "$CONFIG_FILE")
-                        dr_prefix=$(jq -r ".presets[$dri].prefix // empty" "$CONFIG_FILE")
-                        echo -e "  - ${dr_source}" >&2
-                        [[ -n "$dr_prefix" ]] && echo "    prefix: ${dr_prefix}" >&2
-                        if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
-                            parse_github_source "$dr_source"
-                            local dr_sk="github:${_GH_OWNER}/${_GH_REPO}"
-                            [[ -n "$_GH_PATH" ]] && dr_sk+="/${_GH_PATH}"
-                            dr_locked_ver=$(jq -r --arg k "$dr_sk" '.registries[$k].resolved // empty' "$LOCK_FILE" 2>/dev/null || true)
-                            [[ -n "$dr_locked_ver" ]] && echo "    locked: v${dr_locked_ver}" >&2
-                            local dr_dir
-                            dr_dir=$(registry_preset_dir "$_GH_OWNER" "$_GH_REPO" "$dr_locked_ver" "$_GH_PATH")
-                            [[ -d "$dr_dir" ]] && echo "    path: ${dr_dir}" >&2
-                        fi
-                    fi
-                fi
-            done
             echo "" >&2
         fi
 
@@ -1110,7 +446,10 @@ cmd_build() {
                 local ws_path
                 ws_path=$(jq -r ".workspaces[$drwi].path" "$CONFIG_FILE")
                 local ws_expanded
-                ws_expanded=$(expand_path "$ws_path")
+                ws_expanded=$(expand_path "$ws_path" "$CONFIG_DIR")
+                if [[ -f "$ws_expanded" ]]; then
+                    ws_expanded=$(dirname "$ws_expanded")
+                fi
                 if [[ -d "$ws_expanded" ]]; then
                     echo -e "  - $(basename "$ws_expanded") (${ws_expanded})" >&2
                 else

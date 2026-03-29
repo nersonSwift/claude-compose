@@ -14,11 +14,11 @@ teardown() {
 
 # ── read_manifest ────────────────────────────────────────────────────
 
-@test "read_manifest returns file contents when .compose-manifest.json exists" {
+@test "read_manifest returns file contents when manifest exists" {
     local ws_dir="${TEST_TEMP_DIR}/workspace"
-    mkdir -p "$ws_dir"
-    local manifest_content='{"builtin":{},"global":{},"presets":{"test":"value"},"workspaces":{},"resources":{}}'
-    echo "$manifest_content" > "${ws_dir}/.compose-manifest.json"
+    mkdir -p "$ws_dir/$COMPOSE_DIR"
+    local manifest_content='{"builtin":{},"global":{},"workspaces":{},"resources":{}}'
+    echo "$manifest_content" > "${ws_dir}/${COMPOSE_MANIFEST}"
     cd "$ws_dir"
     local result
     result=$(read_manifest)
@@ -32,23 +32,24 @@ teardown() {
     local result
     result=$(read_manifest)
     echo "$result" | jq -e '.builtin' >/dev/null
-    echo "$result" | jq -e '.presets' >/dev/null
+    echo "$result" | jq -e '.workspaces' >/dev/null
 }
 
 # ── needs_rebuild ────────────────────────────────────────────────────
 
 @test "needs_rebuild returns 0 when no manifest exists" {
     cd "${TEST_TEMP_DIR}/workspace"
-    rm -f .compose-manifest.json
+    rm -f "$COMPOSE_MANIFEST"
     create_config '{"projects":[]}'
     run needs_rebuild
     assert_success
 }
 
-@test "needs_rebuild returns 0 when no .compose-hash file exists" {
+@test "needs_rebuild returns 0 when no hash file exists" {
     cd "${TEST_TEMP_DIR}/workspace"
-    echo '{}' > .compose-manifest.json
-    rm -f .compose-hash
+    mkdir -p "$COMPOSE_DIR"
+    echo '{}' > "$COMPOSE_MANIFEST"
+    rm -f "$COMPOSE_HASH"
     create_config '{"projects":[]}'
     run needs_rebuild
     assert_success
@@ -57,11 +58,12 @@ teardown() {
 @test "needs_rebuild returns 1 (up-to-date) when hash matches" {
     cd "${TEST_TEMP_DIR}/workspace"
     create_config '{"projects":[]}'
+    mkdir -p "$COMPOSE_DIR"
     # Use run to call compute_build_hash in subshell (avoids RETURN trap issue)
     run compute_build_hash
     local hash_val="$output"
-    echo "$hash_val" > .compose-hash
-    echo '{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}' > .compose-manifest.json
+    echo "$hash_val" > "$COMPOSE_HASH"
+    echo '{"builtin":{},"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
     run needs_rebuild
     assert_failure  # exit 1 means up-to-date
 }
@@ -69,8 +71,9 @@ teardown() {
 @test "needs_rebuild returns 0 when hash differs" {
     cd "${TEST_TEMP_DIR}/workspace"
     create_config '{"projects":[]}'
-    echo "wrong_hash_value" > .compose-hash
-    echo '{"builtin":{},"global":{},"presets":{},"workspaces":{},"resources":{}}' > .compose-manifest.json
+    mkdir -p "$COMPOSE_DIR"
+    echo "wrong_hash_value" > "$COMPOSE_HASH"
+    echo '{"builtin":{},"global":{},"workspaces":{},"resources":{}}' > "$COMPOSE_MANIFEST"
     run needs_rebuild
     assert_success
 }

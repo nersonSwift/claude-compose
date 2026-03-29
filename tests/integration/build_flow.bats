@@ -14,35 +14,6 @@ teardown() {
     _common_teardown
 }
 
-@test "build with local preset syncs agents" {
-    create_preset "test-preset"
-    cd "${TEST_TEMP_DIR}/workspace"
-    create_config '{"presets":["test-preset"]}'
-    # Use run to isolate hash computation errors
-    run build "true"
-    # Verify agents were synced
-    [[ -e "${TEST_TEMP_DIR}/workspace/.claude/agents/test-preset-agent.md" ]]
-}
-
-@test "build with local preset syncs skills" {
-    create_preset "test-preset"
-    cd "${TEST_TEMP_DIR}/workspace"
-    create_config '{"presets":["test-preset"]}'
-    run build "true"
-    [[ -L "${TEST_TEMP_DIR}/workspace/.claude/skills/default-skill" ]]
-}
-
-@test "build with local preset syncs mcp" {
-    create_preset "test-preset"
-    cd "${TEST_TEMP_DIR}/workspace"
-    create_config '{"presets":["test-preset"]}'
-    run build "true"
-    [[ -f "${TEST_TEMP_DIR}/workspace/.mcp.json" ]]
-    local srv
-    srv=$(jq -r '.mcpServers["test-preset-server"].command' "${TEST_TEMP_DIR}/workspace/.mcp.json")
-    [[ "$srv" == "echo" ]]
-}
-
 @test "build with workspace source merges resources" {
     local ws_src="${TEST_TEMP_DIR}/ws_source"
     create_workspace_source "$ws_src"
@@ -60,28 +31,24 @@ teardown() {
     run build "true"
     [[ -f "${TEST_TEMP_DIR}/workspace/.claude/agents/custom.md" ]]
     local srv
-    srv=$(jq -r '.mcpServers["direct-srv"].command' "${TEST_TEMP_DIR}/workspace/.mcp.json")
+    srv=$(jq -r '.mcpServers["direct-srv"].command' "${TEST_TEMP_DIR}/workspace/${COMPOSE_MCP}")
     [[ "$srv" == "echo" ]]
 }
 
 @test "build creates manifest" {
-    create_preset "test-preset"
     cd "${TEST_TEMP_DIR}/workspace"
-    create_config '{"presets":["test-preset"]}'
+    create_config '{"resources":{"mcp":{"srv":{"command":"echo"}}}}'
     run build "true"
-    [[ -f "${TEST_TEMP_DIR}/workspace/.compose-manifest.json" ]]
-    local has_preset
-    has_preset=$(jq 'has("presets")' "${TEST_TEMP_DIR}/workspace/.compose-manifest.json")
-    [[ "$has_preset" == "true" ]]
+    [[ -f "${TEST_TEMP_DIR}/workspace/${COMPOSE_MANIFEST}" ]]
 }
 
 @test "build creates hash file" {
     cd "${TEST_TEMP_DIR}/workspace"
     create_config '{"resources":{"mcp":{"srv":{"command":"echo"}}}}'
     run build "true"
-    [[ -f "${TEST_TEMP_DIR}/workspace/.compose-hash" ]]
+    [[ -f "${TEST_TEMP_DIR}/workspace/${COMPOSE_HASH}" ]]
     local hash_val
-    hash_val=$(cat "${TEST_TEMP_DIR}/workspace/.compose-hash")
+    hash_val=$(cat "${TEST_TEMP_DIR}/workspace/${COMPOSE_HASH}")
     [[ ${#hash_val} -eq 32 ]]
 }
 
@@ -104,12 +71,3 @@ teardown() {
     assert_success
 }
 
-@test "build with multiple presets" {
-    create_preset "preset-a"
-    create_preset "preset-b"
-    cd "${TEST_TEMP_DIR}/workspace"
-    create_config '{"presets":["preset-a","preset-b"]}'
-    run build "true"
-    [[ -e "${TEST_TEMP_DIR}/workspace/.claude/agents/preset-a-agent.md" ]]
-    [[ -e "${TEST_TEMP_DIR}/workspace/.claude/agents/preset-b-agent.md" ]]
-}

@@ -1,5 +1,5 @@
-# Clean resources tracked in manifest for a given section (presets or workspaces)
-# $1 = old manifest, $2 = section name ("presets" or "workspaces")
+# Clean resources tracked in manifest for a given section
+# $1 = old manifest, $2 = section name (e.g. "workspaces", "resources")
 clean_manifest_section() {
     local old_manifest="$1"
     local section="$2"
@@ -38,10 +38,10 @@ clean_manifest_section() {
             fi
         done <<< "$skills"
 
-        # Remove MCP servers from .mcp.json
+        # Remove MCP servers from $COMPOSE_MCP
         local mcp_servers
         mcp_servers=$(echo "$source_data" | jq -r '.mcp_servers // [] | .[]' 2>/dev/null || true)
-        if [[ -f ".mcp.json" ]]; then
+        if [[ -f "$COMPOSE_MCP" ]]; then
             local -a servers_to_delete=()
             while IFS= read -r server; do
                 [[ -z "$server" ]] && continue
@@ -52,13 +52,13 @@ clean_manifest_section() {
                 local del_array
                 del_array=$(printf '%s\n' "${servers_to_delete[@]}" | jq -R . | jq -sc .)
                 local tmp
-                tmp=$(jq --argjson del "$del_array" 'reduce $del[] as $s (.; del(.mcpServers[$s]))' ".mcp.json")
-                atomic_write ".mcp.json" "$tmp"
+                tmp=$(jq --argjson del "$del_array" 'reduce $del[] as $s (.; del(.mcpServers[$s]))' "$COMPOSE_MCP")
+                atomic_write "$COMPOSE_MCP" "$tmp"
             fi
             local server_count
-            server_count=$(jq '.mcpServers | length' ".mcp.json" 2>/dev/null || echo 0)
+            server_count=$(jq '.mcpServers | length' "$COMPOSE_MCP" 2>/dev/null || echo 0)
             if [[ "$server_count" -eq 0 ]]; then
-                rm -f ".mcp.json"
+                rm -f "$COMPOSE_MCP"
             fi
         fi
     done <<< "$source_names"

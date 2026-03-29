@@ -14,7 +14,8 @@ Top-level fields:
 |-------|------|---------|-------------|
 | `projects` | array | `[]` | List of external projects for file access |
 | `workspaces` | array | `[]` | Other workspaces to sync config from |
-| `presets` | string[] | `[]` | Preset names to activate |
+| `plugins` | array | `[]` | Plugins: marketplace names or local paths |
+| `marketplaces` | object | `{}` | Custom plugin marketplaces |
 
 Each project in the `projects` array:
 
@@ -24,7 +25,7 @@ Each project in the `projects` array:
 | `name` | string | **required** | Short alias for the project (used as `name://` file reference prefix) |
 | `claude_md` | boolean | `true` | Load CLAUDE.md from project |
 
-Projects provide file access via `--add-dir` — nothing else. MCP servers, agents, skills, and permissions are managed directly in the workspace, via presets, or synced from other workspaces.
+Projects provide file access via `--add-dir` — nothing else. MCP servers, agents, skills, and permissions are managed directly in the workspace, via plugins, or synced from other workspaces.
 
 ## Workspaces (cross-sync)
 
@@ -45,46 +46,31 @@ Sync MCP servers, agents, and skills from other workspaces at build time:
 
 Source workspace's own projects (from its `claude-compose.json`) are transitively added via `--add-dir`.
 
-## Presets
+## Plugins
 
-Presets are reusable sets of Claude resources stored globally at `~/.claude-compose/presets/<name>/` or referenced by filesystem path. Each preset uses a `claude-compose-preset.json` file with the same format as a workspace config — resources are declared explicitly via paths.
+Plugins are reusable Claude Code extensions installed from marketplaces or local paths.
 
-Presets can be referenced three ways:
-- **By name** (string): `"my-tools"` → resolves to `~/.claude-compose/presets/my-tools/`
-- **By path** (string containing `/` or `~`): `"./local-preset"`, `"~/presets/custom"` → resolves relative to config file
-- **By object with `path` field**: `{"path": "./local-preset"}` → same resolution, supports filters
+Plugin entries can be:
+- **Marketplace name** (string): `"ralph-loop"` → auto-installed from default marketplace
+- **Marketplace with specific marketplace** (string): `"code-review@my-marketplace"` → installed from named marketplace
+- **Local path** (string starting with `./`, `~/`, or `/`): `"./local/plugin"` → loaded via `--plugin-dir`
+- **Object with `name`**: `{"name": "security-guidance", "config": {"mode": "strict"}}` → marketplace with config
+- **Object with `path`**: `{"path": "./vendor/my-plugin"}` → local plugin
 
-### Preset directory structure
+Plugin config values are passed as `CLAUDE_PLUGIN_OPTION_*` env vars (keys uppercased).
 
+### Custom Marketplaces
+
+```json
+"marketplaces": {
+  "team-tools": {
+    "source": "github",
+    "repo": "our-org/claude-plugins"
+  }
+}
 ```
-~/.claude-compose/presets/<name>/
-├── claude-compose-preset.json    # required — resource declarations
-├── agents/                # agent .md files
-├── skills/                # skill directories
-├── CLAUDE.md              # optional — loaded via --add-dir
-└── .env.json              # optional — env vars for MCP prefixing
-```
 
-### Preset claude-compose-preset.json schema
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `resources.agents` | string[] | `[]` | Relative paths to agent .md files |
-| `resources.skills` | string[] | `[]` | Relative paths to skill directories |
-| `resources.mcp` | object | `{}` | MCP server configs (same format as workspace) |
-| `resources.env_files` | string[] | `[]` | Env files for MCP variable substitution |
-| `claude_md` | boolean | `true` | Load CLAUDE.md from preset |
-| `presets` | string[] | `[]` | Nested preset names (recursive) |
-| `projects` | array | `[]` | External projects (`path` + optional `name`, `claude_md`) |
-
-MCP servers from presets get env var prefixing to prevent cross-source conflicts.
-
-### Preset management operations
-
-- **Create preset**: Set up `claude-compose-preset.json` and resource files in `~/.claude-compose/presets/<name>/`
-- **List presets**: Scan `~/.claude-compose/presets/` and show contents summary
-- **Delete preset**: Remove the preset directory
-- **Edit preset**: Modify `claude-compose-preset.json` or resource files in the preset directory
+Custom marketplaces are added to `extraKnownMarketplaces` in Claude settings.
 
 ## Simplification rules — IMPORTANT
 
@@ -121,13 +107,13 @@ Check if `__CONFIG_FILE__` exists:
 1. **Read** `__CONFIG_FILE__` and show summary:
    - Project paths
    - claude_md toggle (only show if non-default)
-   - Active presets
+   - Active plugins
 
 2. **Ask** what to do:
    - **Add** a new project
    - **Edit** a project (change path or claude_md toggle)
    - **Remove** a project
-   - **Manage presets** — add/remove preset names in config
+   - **Manage plugins** — add/remove plugins in config
    - **Manage workspaces** — add/remove/edit workspace entries (path or scan, with filters)
    - **Done** — finish
 
@@ -147,14 +133,14 @@ Show the user how to launch and manage:
 Ready to launch:
   claude-compose__CONFIG_F_FLAG__
 
-Build presets:
+Build workspace:
   claude-compose build__CONFIG_F_FLAG__
 
 Validate:
   claude-compose config --check__CONFIG_F_FLAG__
 ```
 
-If presets were added/changed, suggest running `claude-compose build`.
+If plugins or workspaces were added/changed, suggest running `claude-compose build`.
 
 ## Rules
 - Keep `~` in paths as-is (claude-compose expands at runtime)

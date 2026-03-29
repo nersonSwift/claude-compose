@@ -142,106 +142,6 @@ teardown() {
     assert_output ""
 }
 
-# ── _validate_presets ──────────────────────────────────────────────
-
-@test "_validate_presets: string preset (bare name) passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":["my-preset"]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output ""
-}
-
-@test "_validate_presets: string preset (path) passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":["./local-preset"]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output ""
-}
-
-@test "_validate_presets: object with source github passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    cat > "$cfg" <<'JSON'
-{"presets":[{"source":"github:owner/repo"}]}
-JSON
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output ""
-}
-
-@test "_validate_presets: object with name passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"name":"preset-name"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output ""
-}
-
-@test "_validate_presets: object with path passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"path":"./local"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output ""
-}
-
-@test "_validate_presets: mutually exclusive fields (source + name) produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"source":"github:owner/repo","name":"x"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "mutually exclusive"
-}
-
-@test "_validate_presets: invalid github source format (no slash) produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"source":"github:noslash"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "must contain at least owner/repo"
-}
-
-@test "_validate_presets: name with .. traversal produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"name":"evil..path"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "invalid preset name"
-}
-
-@test "_validate_presets: invalid prefix format produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"source":"github:owner/repo","prefix":"-bad-"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "prefix"
-}
-
-@test "_validate_presets: filter field agents as non-object produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"name":"p","agents":"bad"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "must be an object"
-}
-
-@test "_validate_presets: rename as non-object produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"source":"github:owner/repo","rename":"bad"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "rename must be an object"
-}
-
-@test "_validate_presets: env_files in preset as non-array produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"presets":[{"source":"github:owner/repo","env_files":"bad"}]}' > "$cfg"
-    run _validate_presets "$cfg"
-    assert_success
-    assert_output -p "env_files must be an array"
-}
-
 # ── _validate_workspaces ──────────────────────────────────────────
 
 @test "_validate_workspaces: valid workspace passes" {
@@ -276,38 +176,39 @@ JSON
     assert_output -p "must be an object"
 }
 
-# ── _validate_update_interval ─────────────────────────────────────
+# ── _validate_marketplaces ────────────────────────────────────────
 
-@test "_validate_update_interval: positive number passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"update_interval":24}' > "$cfg"
-    run _validate_update_interval "$cfg"
+@test "_validate_marketplaces: valid object passes" {
+    local config
+    config=$(mktemp "$BATS_TEST_TMPDIR/cfg.XXXXXX")
+    echo '{"marketplaces":{"team":{"source":"github","repo":"org/plugins"}}}' > "$config"
+    run _validate_marketplaces "$config"
     assert_success
     assert_output ""
 }
 
-@test "_validate_update_interval: zero passes" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"update_interval":0}' > "$cfg"
-    run _validate_update_interval "$cfg"
-    assert_success
-    assert_output ""
+@test "_validate_marketplaces: non-object fails" {
+    local config
+    config=$(mktemp "$BATS_TEST_TMPDIR/cfg.XXXXXX")
+    echo '{"marketplaces":["bad"]}' > "$config"
+    run _validate_marketplaces "$config"
+    assert_output --partial "must be an object"
 }
 
-@test "_validate_update_interval: negative number produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"update_interval":-5}' > "$cfg"
-    run _validate_update_interval "$cfg"
-    assert_success
-    assert_output -p "must be >= 0"
+@test "_validate_marketplaces: missing source fails" {
+    local config
+    config=$(mktemp "$BATS_TEST_TMPDIR/cfg.XXXXXX")
+    echo '{"marketplaces":{"team":{"repo":"org/plugins"}}}' > "$config"
+    run _validate_marketplaces "$config"
+    assert_output --partial "must have a \"source\" field"
 }
 
-@test "_validate_update_interval: non-number type produces error" {
-    local cfg="${TEST_TEMP_DIR}/cfg.json"
-    echo '{"update_interval":"24"}' > "$cfg"
-    run _validate_update_interval "$cfg"
-    assert_success
-    assert_output -p "must be a number"
+@test "_validate_marketplaces: missing repo fails" {
+    local config
+    config=$(mktemp "$BATS_TEST_TMPDIR/cfg.XXXXXX")
+    echo '{"marketplaces":{"team":{"source":"github"}}}' > "$config"
+    run _validate_marketplaces "$config"
+    assert_output --partial "must have a \"repo\" field"
 }
 
 # ── validate_config_semantics ─────────────────────────────────────
@@ -318,9 +219,7 @@ JSON
 {
     "projects": [{"name":"app","path":"/tmp"}],
     "resources": {"agents":["a.md"]},
-    "presets": ["my-preset"],
-    "workspaces": [{"path":"~/other"}],
-    "update_interval": 12
+    "workspaces": [{"path":"~/other"}]
 }
 JSON
     local captured_stdout
