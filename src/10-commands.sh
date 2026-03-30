@@ -38,6 +38,8 @@ cmd_migrate() {
     # Scan project for Claude files
     local found_something=false
     local has_mcp=false has_agents=false has_skills=false has_settings=false has_claude_md=false
+    local -a copied_agents=() copied_skills=()
+    local copied_claude_md=false
 
     [[ -f "$project_path/.mcp.json" ]] && has_mcp=true && found_something=true
     [[ -d "$project_path/.claude/agents" ]] && ls "$project_path/.claude/agents/"*.md &>/dev/null 2>&1 && has_agents=true && found_something=true
@@ -91,6 +93,7 @@ cmd_migrate() {
                 echo -e "${YELLOW}Skip (exists):${NC} .claude/agents/${agent_name}" >&2
             else
                 cp "$agent_file" "$workspace/.claude/agents/${agent_name}"
+                copied_agents+=("$agent_file")
                 echo -e "${GREEN}Copied:${NC} .claude/agents/${agent_name}" >&2
             fi
         done
@@ -107,6 +110,7 @@ cmd_migrate() {
                 echo -e "${YELLOW}Skip (exists):${NC} .claude/skills/${skill_name}/" >&2
             else
                 cp -R "$skill_path" "$workspace/.claude/skills/${skill_name}"
+                copied_skills+=("$skill_path")
                 echo -e "${GREEN}Copied:${NC} .claude/skills/${skill_name}/" >&2
             fi
         done
@@ -142,10 +146,12 @@ cmd_migrate() {
                     echo ""
                     cat "$project_path/CLAUDE.md"
                 } >> "$workspace/CLAUDE.md"
+                copied_claude_md=true
                 echo -e "${GREEN}Appended:${NC} CLAUDE.md" >&2
             fi
         else
             cp "$project_path/CLAUDE.md" "$workspace/CLAUDE.md"
+            copied_claude_md=true
             echo -e "${GREEN}Copied:${NC} CLAUDE.md" >&2
         fi
     fi
@@ -168,19 +174,23 @@ cmd_migrate() {
             echo -e "${GREEN}Added to config:${NC} ${rel_path}" >&2
         fi
     else
-        atomic_write "$config_path" "$(jq -n --arg p "$rel_path" --arg n "$project_name" '{projects: [{path: $p, name: $n}]}')"
+        atomic_write "$config_path" "$(jq -n --arg ws "$(basename "$workspace")" --arg p "$rel_path" --arg n "$project_name" '{name: $ws, projects: [{path: $p, name: $n}]}')"
         echo -e "${GREEN}Created:${NC} ${CONFIG_FILE}" >&2
     fi
 
-    # Delete originals if --delete
+    # Delete originals if --delete (only files that were actually copied, not skipped)
     if [[ "$MIGRATE_DELETE" == true ]]; then
         echo "" >&2
         echo -e "${CYAN}Removing originals...${NC}" >&2
         [[ "$has_mcp" == true ]] && rm -f "$project_path/.mcp.json" && echo -e "  ${RED}Deleted:${NC} .mcp.json" >&2
-        [[ "$has_agents" == true ]] && rm -f "$project_path/.claude/agents/"*.md && echo -e "  ${RED}Deleted:${NC} .claude/agents/*.md" >&2
-        [[ "$has_skills" == true ]] && rm -rf "$project_path/.claude/skills" && echo -e "  ${RED}Deleted:${NC} .claude/skills/" >&2
+        for f in "${copied_agents[@]}"; do
+            rm -f "$f" && echo -e "  ${RED}Deleted:${NC} $(basename "$f")" >&2
+        done
+        for d in "${copied_skills[@]}"; do
+            rm -rf "$d" && echo -e "  ${RED}Deleted:${NC} $(basename "$d")/" >&2
+        done
         [[ "$has_settings" == true ]] && rm -f "$project_path/.claude/settings.local.json" && echo -e "  ${RED}Deleted:${NC} .claude/settings.local.json" >&2
-        [[ "$has_claude_md" == true ]] && rm -f "$project_path/CLAUDE.md" && echo -e "  ${RED}Deleted:${NC} CLAUDE.md" >&2
+        [[ "$copied_claude_md" == true ]] && rm -f "$project_path/CLAUDE.md" && echo -e "  ${RED}Deleted:${NC} CLAUDE.md" >&2
     fi
 
     echo "" >&2
@@ -360,7 +370,7 @@ cmd_config() {
         fi
         local tmp
         tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        if ! jq -n --arg p "$CONFIG_PATH" --arg n "$(basename "$CONFIG_PATH")" '{projects: [{path: $p, name: $n}]}' > "$tmp"; then
+        if ! jq -n --arg ws "$(basename "$WORKSPACE_DIR")" --arg p "$CONFIG_PATH" --arg n "$(basename "$CONFIG_PATH")" '{name: $ws, projects: [{path: $p, name: $n}]}' > "$tmp"; then
             rm -f "$tmp"
             echo -e "${RED}Error: Failed to create config${NC}" >&2
             exit 1
