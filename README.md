@@ -61,7 +61,6 @@ claude-compose copy <src> [dst]       # Clone workspace
 claude-compose doctor                 # Diagnose problems
 claude-compose start [root]           # Onboarding wizard
 claude-compose ide [variant]          # IDE setup (VS Code/Cursor)
-claude-compose instructions           # Show guide
 claude-compose --dry-run              # Preview mode
 ```
 

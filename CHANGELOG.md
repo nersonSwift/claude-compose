@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.1] - 2026-03-30
+
+### Changed
+
+- **`instructions` command removed**: Replaced by built-in `compose-guide` agent, `compose-help` and `compose-doctor` skills in the embedded plugin. Run the compose-help skill or ask the compose-guide agent instead.
+- **Structured warning system**: Build warnings are now collected and displayed as a summary. Critical warnings (missing env files, missing project paths, failed plugin installs) trigger doctor mode. Informational warnings are displayed but don't block launch.
+- **Managed dirs change detection**: Build now detects manual changes to `.claude/agents/` and `.claude/skills/` directories before wiping them. If manual files are found, build aborts with doctor guidance to move them into config.
+- **Version included in build hash**: Upgrading claude-compose now triggers a rebuild automatically.
+- **Makefile `V=` override**: Build supports explicit version injection via `make V=x.y.z`.
+- **Build lock release in wrap mode**: Fixed lock leak when build fails in IDE wrap mode subshell.
+
 ## [3.0.0] - 2026-03-30
 
 ### Breaking Changes

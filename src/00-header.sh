@@ -6,4 +6,4 @@ set -eEuo pipefail
 # (MCP, agents, skills, permissions) lives in the workspace directory.
 # Plugins contribute shared resources at build time.
 
-VERSION="3.0.0"
+VERSION="3.0.1"

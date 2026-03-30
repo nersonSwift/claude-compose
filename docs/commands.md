@@ -207,18 +207,6 @@ claude-compose start ~/Code
 
 ---
 
-## claude-compose instructions
-
-Show the workspace management guide.
-
-```bash
-claude-compose instructions
-```
-
-Prints the workspace management guide to stdout.
-
----
-
 ## claude-compose ide
 
 Set up IDE integration (VS Code, Cursor).
