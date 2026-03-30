@@ -147,11 +147,11 @@ ls -la ~/workspaces/team-tools/claude-compose.json
 2. Verify env vars are loaded: `claude-compose --dry-run` shows env file status
 3. Check that `${VAR}` references in MCP env blocks match keys in your env files
 
-### Deprecated `presets` warning
+### Unknown config key `presets`
 
-**Symptom:** `Warning: The 'presets' key is no longer supported`
+**Symptom:** `Warning: unknown config key "presets"`
 
-**Fix:** Replace `presets` with `plugins` for marketplace/local extensions, or `workspaces` for sharing config from other workspaces.
+**Fix:** The `presets` key was removed in v3.0.0. Replace with `plugins` for marketplace/local extensions, or `workspaces` for sharing config from other workspaces.
 
 ### How do I uninstall?
 

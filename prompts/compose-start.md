@@ -89,6 +89,7 @@ For each workspace to create:
    ```bash
    tmp=$(mktemp "<workspace-path>/claude-compose.json.XXXXXX")
    jq -n '{
+     name: "<workspace-name>",
      projects: [
        {path: "~/Code/app", name: "app"},
        {path: "~/Code/lib", name: "lib"}

@@ -1,10 +1,57 @@
 # Changelog
 
-## [2.3.0] - 2026-03-28
+## [3.0.0] - 2026-03-30
+
+### Breaking Changes
+
+- **Preset system removed**: The entire preset/registry subsystem has been removed. `presets`, `update_interval` config keys, `update` and `registries` commands are gone. Use `plugins` for reusable extensions instead.
+- **Compose artifacts relocated**: Build artifacts moved from workspace root to `.claude/claude-compose/`:
+  - `.compose-manifest.json` → `.claude/claude-compose/manifest.json`
+  - `.compose-hash` → `.claude/claude-compose/hash`
+  - `.mcp.json` (compose-managed) → `.claude/claude-compose/mcp.json`
+  - `.compose-build.lock` → `.claude/claude-compose/build.lock`
+  - New: `.claude/claude-compose/settings.json`
+- **`name` field required**: Top-level `name` field is now mandatory in `claude-compose.json`. Used for `.code-workspace` filename and workspace identification.
+- **`vscode` command renamed to `ide`**: `claude-compose vscode` is now `claude-compose ide [variant]` with support for `code`, `insiders`, and `cursor`.
+
+### Added
+
+- **Plugin system**: New `plugins` config array supports marketplace plugins (auto-installed via `claude plugins install`) and local plugins (loaded via `--plugin-dir`). Plugin config values passed as `CLAUDE_PLUGIN_OPTION_*` env vars.
+- **Custom marketplaces**: `marketplaces` config field for defining custom plugin sources with `source` and `repo` fields.
+- **IDE integration (wrap mode)**: `claude-compose wrap` — process wrapper for VS Code/Cursor that auto-builds workspace and merges system prompts. `claude-compose ide` — configures IDE settings and generates `.code-workspace` files.
+- **`workspace_path` field**: Allows config file and workspace directory to be in different locations. Config is auto-symlinked to workspace.
+- **Plugin sync from workspaces**: Sync plugins from other workspaces with include/exclude filtering and last-wins dedup.
+- **`claude_md` cascading from workspaces**: `claude_md` and `claude_md_overrides` fields on workspace entries control CLAUDE.md loading from synced sources.
+- **Knowledge base prompt**: Built-in `compose-knowledge.md` provides comprehensive reference for doctor and start commands.
+- **`append_system_prompt_files` resource**: Array of markdown files appended to system prompt at launch.
+- **`resources.settings` field**: Path to settings JSON file merged into Claude settings at build time.
+- **Built-in plugin**: Embedded plugin extracted to `~/.claude-compose/compose-plugin/` (replaces old `skills/` directory).
+
+### Improved
+
+- **Documentation restructured**: README condensed; 9 new docs added covering architecture, commands, configuration, environment, getting-started, global-config, plugins, troubleshooting, and workspaces.
+- **Build refactored**: `src/09-build.sh` simplified (~800 → ~450 lines). New `src/08a-collect.sh` extracts shared arg-collection helpers for CLI and wrap mode.
+- **Validation improved**: `_validate_string_array()` extracted; `printf -v` replaces subshells for joins; doctor prompt sanitized against `$` and `\` injection.
+- **Hash computation simplified**: Registry-related hashing removed (~243 → ~130 lines).
+- **Embedded plugin renamed**: `__EMBEDDED_SKILLS__` → `__EMBEDDED_PLUGIN__`, `extract_embedded_skills()` → `extract_embedded_plugin()`.
+- **`migrate --delete` safety**: Now tracks which agents, skills, and CLAUDE.md were actually copied vs skipped on conflict, only deleting originals that were successfully migrated. MCP and settings are always merged, so always deleted.
+
+### Removed
+
+- `update` command (preset update checking)
+- `registries` command (preset listing)
+- GitHub registry presets (`github:owner/repo@version`)
+- `require_git` check (git is no longer required)
+- `presets` config key (use `plugins` instead)
+- `update_interval` config key
+- Preset-related functions: `merge_preset_filters()`, `extract_preset_filters()`, `process_preset()`, `iterate_presets()`, `_is_preset_path()`, `resolve_preset_path()`
 
 ### Fixed
+
 - Homebrew release workflow: use explicit version in formula URL, copy full formula to tap instead of sed-patching
-- Release assets: include `claude-compose-wrapper` in GitHub Release and `.deb` package (previously only available via Homebrew source build)
+- Release assets: include `claude-compose-wrapper` in GitHub Release and `.deb` package
+- `config -y` now creates valid config with required `name` field
+- `migrate` now creates valid config with required `name` field when no config exists
 
 ## [2.2.0] - 2026-03-25
 

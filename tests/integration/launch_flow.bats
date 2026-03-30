@@ -17,7 +17,7 @@ teardown() {
     cd "${TEST_TEMP_DIR}/workspace"
     local proj="${TEST_TEMP_DIR}/proj1"
     mkdir -p "$proj"
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -32,7 +32,7 @@ teardown() {
     local proj1="${TEST_TEMP_DIR}/p1"
     local proj2="${TEST_TEMP_DIR}/p2"
     mkdir -p "$proj1" "$proj2"
-    create_config "{\"projects\":[{\"name\":\"a\",\"path\":\"$proj1\"},{\"name\":\"b\",\"path\":\"$proj2\"}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"a\",\"path\":\"$proj1\"},{\"name\":\"b\",\"path\":\"$proj2\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -51,7 +51,7 @@ teardown() {
     cd "${TEST_TEMP_DIR}/workspace"
     local proj="${TEST_TEMP_DIR}/proj_sp"
     mkdir -p "$proj"
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -72,7 +72,7 @@ teardown() {
     local p2="${TEST_TEMP_DIR}/mx2"
     local p3="${TEST_TEMP_DIR}/mx3"
     mkdir -p "$p1" "$p2" "$p3"
-    create_config "{\"projects\":[{\"name\":\"a\",\"path\":\"$p1\"},{\"name\":\"b\",\"path\":\"$p2\"},{\"name\":\"c\",\"path\":\"$p3\"}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"a\",\"path\":\"$p1\"},{\"name\":\"b\",\"path\":\"$p2\"},{\"name\":\"c\",\"path\":\"$p3\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -90,7 +90,7 @@ teardown() {
     cd "${TEST_TEMP_DIR}/workspace"
     local proj="${TEST_TEMP_DIR}/proj_ea"
     mkdir -p "$proj"
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}]}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -115,7 +115,7 @@ teardown() {
     local proj="${TEST_TEMP_DIR}/proj_env"
     mkdir -p "$proj"
     create_env_file "${TEST_TEMP_DIR}/workspace/env.json" '{"TEST_VAR":"hello"}'
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}],\"resources\":{\"env_files\":[\"env.json\"]}}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"app\",\"path\":\"$proj\"}],\"resources\":{\"env_files\":[\"env.json\"]}}"
     reset_globals
     CONFIG_FILE="${TEST_TEMP_DIR}/workspace/claude-compose.json"
 
@@ -129,7 +129,7 @@ teardown() {
     cd "${TEST_TEMP_DIR}/workspace"
     local proj="${TEST_TEMP_DIR}/proj_set"
     mkdir -p "$proj"
-    create_config "{\"projects\":[{\"name\":\"app\",\"path\":\"$proj\",\"claude_md\":false}]}"
+    create_config "{\"name\":\"test\",\"projects\":[{\"name\":\"app\",\"path\":\"$proj\",\"claude_md\":false}]}"
     reset_globals
     run main --dry-run -f "${TEST_TEMP_DIR}/workspace/claude-compose.json"
     assert_success

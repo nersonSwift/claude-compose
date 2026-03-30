@@ -373,7 +373,7 @@ validate_config_semantics() {
     local is_global="${2:-false}"
 
     # Warn on unknown top-level keys
-    local known_keys='["name","projects","presets","workspaces","resources","update_interval","plugins","marketplaces","workspace_path"]'
+    local known_keys='["name","projects","workspaces","resources","plugins","marketplaces","workspace_path"]'
     local unknown_keys
     unknown_keys=$(jq -r --argjson known "$known_keys" 'keys | map(select(. as $k | $known | index($k) | not)) | .[]' "$config_file" 2>/dev/null || true)
     if [[ -n "$unknown_keys" ]]; then
@@ -381,14 +381,6 @@ validate_config_semantics() {
             [[ -z "$uk" ]] && continue
             echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
         done <<< "$unknown_keys"
-    fi
-
-    # Deprecation warnings
-    if jq -e 'has("presets")' "$config_file" >/dev/null 2>&1; then
-        echo -e "${YELLOW}Warning: The 'presets' key is no longer supported. Use 'plugins' for reusable extensions.${NC}" >&2
-    fi
-    if jq -e 'has("update_interval")' "$config_file" >/dev/null 2>&1; then
-        echo -e "${YELLOW}Warning: The 'update_interval' key is no longer supported.${NC}" >&2
     fi
 
     local err

@@ -16,7 +16,7 @@ Complete reference for `claude-compose.json`.
 | `marketplaces` | object | `{}` | Custom plugin marketplace definitions |
 | `workspace_path` | string | — | Override workspace directory location |
 
-> **Deprecated fields:** `presets` and `update_interval` are no longer supported. If present, a warning is shown. Use `plugins` for reusable extensions and `workspaces` for config sharing.
+> **Removed fields:** `presets` and `update_interval` are no longer supported. If present, an "unknown config key" warning is shown. Use `plugins` for reusable extensions and `workspaces` for config sharing.
 
 ## Projects
 
@@ -152,6 +152,7 @@ A minimal valid config:
 
 ```json
 {
+  "name": "app",
   "projects": [
     { "path": "~/Code/app", "name": "app" }
   ]

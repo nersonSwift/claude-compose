@@ -215,7 +215,7 @@ Show the workspace management guide.
 claude-compose instructions
 ```
 
-Displays how to add resources, best practices, and the current workspace state. Launches Claude with the instructions prompt.
+Prints the workspace management guide to stdout.
 
 ---
 

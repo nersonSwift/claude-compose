@@ -18,6 +18,7 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
 
 ```json
 {
+  "name": "my-workspace",
   "resources": {
     "agents": ["agents/reviewer.md"],
     "skills": ["skills/commit"],
@@ -36,6 +37,7 @@ claude-compose is a multi-project workspace launcher (like Docker Compose for Cl
 ```
 
 Field rules:
+- `name` — workspace name (required, filesystem-safe: letters, digits, dots, hyphens, underscores)
 - `projects[].path` — path to external project (required)
 - `projects[].name` — alias for file references (required)
 - `projects[].claude_md` — load CLAUDE.md from project (default: `true`, omit if true)
@@ -49,6 +51,9 @@ Field rules:
 - `workspaces[].mcp.include/exclude/rename` — MCP server filters
 - `workspaces[].agents.include/exclude/rename` — agent filters
 - `workspaces[].skills.include/exclude` — skill filters
+- `workspace_path` — alternative workspace directory (config and workspace can be in different dirs)
+- `resources.append_system_prompt_files` — array of markdown files to append to system prompt
+- `resources.settings` — path to settings JSON file to merge into Claude settings
 
 ### CLI reference
 
@@ -63,6 +68,8 @@ claude-compose copy ~/ws/src ~/ws/dst # clone workspace
 claude-compose instructions           # show workspace management guide
 claude-compose doctor                 # diagnose and fix problems
 claude-compose start [root-path]      # onboarding wizard
-claude-compose --dry-run              # preview without mutations
-claude-compose -- -p "prompt"         # pass args through to claude
+claude-compose ide [variant]         # set up VS Code/Cursor integration
+claude-compose wrap                  # VS Code process wrapper (internal)
+claude-compose --dry-run             # preview without mutations
+claude-compose -- -p "prompt"        # pass args through to claude
 ```
