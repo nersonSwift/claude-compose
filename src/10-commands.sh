@@ -297,54 +297,6 @@ cmd_copy() {
     fi
 }
 
-# ── Instructions Command ─────────────────────────────────────────────
-cmd_instructions() {
-    require_jq
-
-    local config_file="${CONFIG_FILE:-claude-compose.json}"
-    if [[ ! -f "$config_file" ]]; then
-        echo "No claude-compose.json found. Create one with: claude-compose config"
-        return
-    fi
-
-    # Build dynamic workspace summary
-    local summary=""
-    local project_count ws_count
-    project_count=$(jq '.projects // [] | length' "$config_file")
-    ws_count=$(jq '.workspaces // [] | length' "$config_file")
-    local agent_count skill_count mcp_count env_count
-    agent_count=$(jq '.resources.agents // [] | length' "$config_file")
-    skill_count=$(jq '.resources.skills // [] | length' "$config_file")
-    mcp_count=$(jq '.resources.mcp // {} | length' "$config_file")
-    env_count=$(jq '.resources.env_files // [] | length' "$config_file")
-
-    summary="## Current workspace"$'\n'
-    summary+="- Projects: $project_count"$'\n'
-    if [[ "$ws_count" -gt 0 ]]; then
-        summary+="- Workspaces: $ws_count"$'\n'
-    fi
-    local aspf_count settings_val
-    aspf_count=$(jq '.resources.append_system_prompt_files // [] | length' "$config_file")
-    settings_val=$(jq -r '.resources.settings // empty' "$config_file")
-    summary+="- Local resources: $agent_count agents, $skill_count skills, $mcp_count MCP servers, $env_count env files"
-    if [[ "$aspf_count" -gt 0 ]]; then
-        summary+=", $aspf_count system prompt files"
-    fi
-    if [[ -n "$settings_val" ]]; then
-        summary+=", settings: $settings_val"
-    fi
-
-    if [[ "$ws_count" -gt 0 ]]; then
-        summary+=$'\n'$'\n'"External resources are synced from workspaces. Agents and skills"
-        summary+=" are symlinked from source directories. MCP servers are merged into ${COMPOSE_MCP}."
-    fi
-
-    # Output prompt template with interpolated summary
-    local prompt
-    prompt=$(compose_instructions_prompt "$summary")
-    echo "$prompt"
-}
-
 # ── Subcommand: config ──────────────────────��────────────────────────
 cmd_config() {
     require_jq
@@ -527,6 +479,8 @@ cmd_wrap() {
         # On failure: launch doctor in IDE
         local _build_err=""
         _build_err=$(build "false" 2>&1 >/dev/null) || {
+            # Release lock (subshell can't clean up — _BUILD_LOCK_HELD lost)
+            _release_lock "$COMPOSE_LOCK" 2>/dev/null || true
             _wrap_launch_doctor "${_build_err:-Build failed}"
         }
 
@@ -558,6 +512,9 @@ cmd_wrap() {
 
     # Plugin dirs
     _collect_plugin_args "false" "$CONFIG_DIR"
+
+    # Check for critical warnings from arg collection phase
+    _wrap_check_warnings
 
     # 12. Merge --append-system-prompt from VS Code and compose
 

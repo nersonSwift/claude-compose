@@ -14,7 +14,7 @@ process_workspace_source() {
         ws_config_file="$ws_path"
         ws_path=$(dirname "$ws_path")
     elif [[ ! -d "$ws_path" ]]; then
-        echo -e "${YELLOW}Warning: Workspace not found, skipping: ${raw_path}${NC}" >&2
+        warn_critical "workspaces" "Workspace not found, skipping: ${raw_path}"
         return
     fi
 
@@ -25,14 +25,14 @@ process_workspace_source() {
     local self_dir
     self_dir=$(pwd -P)
     if [[ "$ws_path" == "$self_dir" ]]; then
-        echo -e "${YELLOW}Warning: Skipping self: ${ws_path}${NC}" >&2
+        warn_info "workspaces" "Skipping self-reference: ${ws_path}"
         return
     fi
 
     # Deduplication — skip if already processed
     for processed in "${PROCESSED_WORKSPACES[@]+"${PROCESSED_WORKSPACES[@]}"}"; do
         if [[ "$processed" == "$ws_path" ]]; then
-            echo -e "${YELLOW}Warning: Workspace already processed, skipping: ${ws_path}${NC}" >&2
+            warn_info "workspaces" "Workspace already processed, skipping: ${ws_path}"
             return
         fi
     done
@@ -117,7 +117,7 @@ process_workspace_source() {
                         [[ "$_cwp_name" == "$_cmo_key" ]] && _cmo_matched=true && break
                     done
                     if [[ "$_cmo_matched" == "false" ]]; then
-                        echo -e "  ${YELLOW}Warning: claude_md_overrides key \"$_cmo_key\" does not match any project in workspace${NC}" >&2
+                        warn_info "workspaces" "claude_md_overrides key \"$_cmo_key\" does not match any project in workspace"
                     fi
                 done <<< "$_cmo_keys"
             fi
@@ -160,12 +160,12 @@ process_resources() {
         [[ -z "$agent_path" ]] && continue
         local abs_path="$base_dir/$agent_path"
         if [[ ! -f "$abs_path" ]]; then
-            echo -e "  ${YELLOW}Warning: agent not found: ${agent_path}${NC}" >&2
+            warn_critical "resources" "Agent file not found: ${agent_path}"
             continue
         fi
         abs_path=$(cd "$(dirname "$abs_path")" && pwd -P)/$(basename "$abs_path")
         if ! _is_within_dir "$abs_path" "$base_dir"; then
-            echo -e "  ${YELLOW}Warning: agent escapes base directory, skipping: ${agent_path}${NC}" >&2
+            warn_info "resources" "Agent escapes base directory, skipping: ${agent_path}"
             continue
         fi
         local agent_basename
@@ -187,12 +187,12 @@ process_resources() {
         [[ -z "$skill_path" ]] && continue
         local abs_path="$base_dir/$skill_path"
         if [[ ! -d "$abs_path" ]]; then
-            echo -e "  ${YELLOW}Warning: skill not found: ${skill_path}${NC}" >&2
+            warn_critical "resources" "Skill directory not found: ${skill_path}"
             continue
         fi
         abs_path=$(cd "$abs_path" && pwd -P)
         if ! _is_within_dir "$abs_path" "$base_dir"; then
-            echo -e "  ${YELLOW}Warning: skill escapes base directory, skipping: ${skill_path}${NC}" >&2
+            warn_info "resources" "Skill escapes base directory, skipping: ${skill_path}"
             continue
         fi
         local skill_basename
@@ -266,7 +266,7 @@ process_global() {
             proj_claude_md=$(jq -r ".projects[$gpi2].claude_md // true" "$GLOBAL_CONFIG")
 
             if [[ ! -d "$proj_path" ]]; then
-                echo -e "  ${YELLOW}Warning: Global project path not found, skipping: ${proj_path}${NC}" >&2
+                warn_critical "projects" "Global project path not found, skipping: ${proj_path}"
                 continue
             fi
 
@@ -313,7 +313,7 @@ build() {
 
     # Acquire build lock to prevent concurrent builds
     if ! _acquire_lock "$COMPOSE_LOCK"; then
-        echo -e "${YELLOW}Warning: Another build is in progress, skipping.${NC}" >&2
+        warn_info "build" "Another build is in progress, skipping build"
         return
     fi
     # Release lock on normal return; also chain into EXIT trap for abnormal exit (die_doctor, etc.)
@@ -328,6 +328,9 @@ build() {
     local pre_build_hash
     pre_build_hash=$(compute_build_hash)
 
+    # Check managed dirs for manual changes BEFORE any cleanup
+    check_managed_dirs
+
     # Clean old resources from all sections
     local old_manifest
     old_manifest=$(read_manifest)
@@ -340,6 +343,11 @@ build() {
     # Reset state
     PROCESSED_WORKSPACES=()
     MANIFEST_JSON='{"global":{},"workspaces":{},"resources":{}}'
+    _WARNINGS_CRITICAL=()
+    _WARNINGS_INFO=()
+
+    # Wipe managed dirs — aborts with doctor if manual changes were detected
+    wipe_managed_dirs
 
     # Pre-scan direct project paths for "direct wins" dedup
     DIRECT_PROJECT_PATHS=()
@@ -385,6 +393,12 @@ build() {
         tmp=$(jq '._warning = "This file is managed by claude-compose. Do not edit directly."' "$COMPOSE_MCP")
         atomic_write "$COMPOSE_MCP" "$tmp"
     fi
+
+    # Save managed dirs hash for next build's change detection
+    save_managed_dirs_hash
+
+    # Check for warnings before declaring success
+    _check_warnings_and_report
 
     echo "" >&2
     echo -e "${GREEN}Build complete.${NC}" >&2

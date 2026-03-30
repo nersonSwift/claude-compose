@@ -65,7 +65,6 @@ claude-compose config -y ~/path       # quick-create config with one project
 claude-compose config --check         # validate config
 claude-compose migrate ~/project      # import config from existing project
 claude-compose copy ~/ws/src ~/ws/dst # clone workspace
-claude-compose instructions           # show workspace management guide
 claude-compose doctor                 # diagnose and fix problems
 claude-compose start [root-path]      # onboarding wizard
 claude-compose ide [variant]         # set up VS Code/Cursor integration

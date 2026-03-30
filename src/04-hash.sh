@@ -72,6 +72,7 @@ compute_build_hash() {
     hash_tmp=$(mktemp)
     trap 'rm -f "$hash_tmp"' RETURN
 
+    echo "$VERSION" >> "$hash_tmp"
     cat "$CONFIG_FILE" >> "$hash_tmp"
 
     # Hash global config
@@ -121,6 +122,16 @@ compute_build_hash() {
     _hash_config_resources "$CONFIG_FILE" "$CONFIG_DIR" "$hash_tmp"
     [[ -f "$GLOBAL_CONFIG" ]] && _hash_config_resources "$GLOBAL_CONFIG" "$GLOBAL_CONFIG_DIR" "$hash_tmp"
 
+    # Hash managed dirs content — detects manual changes to .claude/agents/ and .claude/skills/
+    local dir
+    for dir in ".claude/agents" ".claude/skills"; do
+        if [[ -d "$dir" ]]; then
+            find "$dir" \( -type f -o -type l \) -print0 2>/dev/null \
+                | sort -z \
+                | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
+        fi
+    done
+
     local result
     result=$(_shasum256 < "$hash_tmp" | cut -c1-32)
     echo "$result"
@@ -144,4 +155,31 @@ read_manifest() {
     else
         echo '{"global":{},"workspaces":{},"resources":{}}'
     fi
+}
+
+# Compute content hash of managed dirs (.claude/agents/ and .claude/skills/).
+# Covers ALL files, not just manifest-tracked, so we detect manual edits.
+compute_managed_dirs_hash() {
+    local hash_tmp
+    hash_tmp=$(mktemp)
+    trap 'rm -f "$hash_tmp"' RETURN
+
+    local dir
+    for dir in ".claude/agents" ".claude/skills"; do
+        if [[ -d "$dir" ]]; then
+            find "$dir" \( -type f -o -type l \) -print0 2>/dev/null \
+                | sort -z \
+                | xargs -0 "$_SHASUM_CMD" 2>/dev/null >> "$hash_tmp" || true
+        fi
+    done
+
+    _shasum256 < "$hash_tmp" | cut -c1-32
+}
+
+# Save managed dirs hash for next build's change detection.
+save_managed_dirs_hash() {
+    ensure_compose_dir
+    local hash
+    hash=$(compute_managed_dirs_hash)
+    atomic_write "$COMPOSE_DIRS_HASH" "$hash"
 }

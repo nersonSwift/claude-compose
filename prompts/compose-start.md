@@ -129,7 +129,7 @@ Suggest next steps:
 - `cd <workspace> && claude-compose` to launch
 - `claude-compose config` to edit config interactively
 - `claude-compose migrate <project>` for projects with existing Claude config
-- `claude-compose instructions` for the workspace management guide
+- Ask the **compose-guide** agent or use the **compose-help** skill for workspace guidance
 
 ---
 

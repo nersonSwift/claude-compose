@@ -46,6 +46,11 @@ CURRENT_SOURCE_ADD_DIRS=()
 CURRENT_SOURCE_PROJECT_DIRS=()
 CURRENT_SOURCE_NAME=""
 _BUILD_LOCK_HELD=false
+_MANAGED_DIRS_MODIFIED=false
+
+# Warning collection (populated during build/launch, checked after)
+_WARNINGS_CRITICAL=()    # "source|message" entries — trigger doctor
+_WARNINGS_INFO=()        # "source|message" entries — informational only
 
 # ── Compose output directory & file paths ────────────────────────────
 COMPOSE_DIR=".claude/claude-compose"
@@ -54,6 +59,7 @@ COMPOSE_MANIFEST="${COMPOSE_DIR}/manifest.json"
 COMPOSE_HASH="${COMPOSE_DIR}/hash"
 COMPOSE_SETTINGS="${COMPOSE_DIR}/settings.json"
 COMPOSE_LOCK="${COMPOSE_DIR}/build.lock"
+COMPOSE_DIRS_HASH="${COMPOSE_DIR}/dirs.hash"
 
 _MCP_EMPTY='{"_warning":"This file is managed by claude-compose. Do not edit directly.","mcpServers":{}}'
 

@@ -33,7 +33,6 @@ main() {
         build) cmd_build; return ;;
         migrate) cmd_migrate; return ;;
         copy) cmd_copy; return ;;
-        instructions) cmd_instructions; return ;;
         doctor) cmd_doctor; return ;;
         start) cmd_start; return ;;
         ide) cmd_ide; return ;;
@@ -62,6 +61,10 @@ main() {
         build "false"
     fi
 
+    # Clear build-phase warnings (already reported by build)
+    _WARNINGS_CRITICAL=()
+    _WARNINGS_INFO=()
+
     # Load global env files (no prefix, before local so local wins)
     load_global_env_files
     # Load env files from resources.env_files (local)
@@ -82,6 +85,9 @@ main() {
 
     # Collect plugin dirs
     _collect_plugin_args "true" "$CONFIG_DIR"
+
+    # Check for warnings from arg collection phase
+    _check_warnings_and_report
 
     # Extra args
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then

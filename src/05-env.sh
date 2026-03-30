@@ -5,14 +5,14 @@ _validate_env_key() {
     # Reject non-POSIX identifiers (must start with letter/underscore, contain only alnum/underscore)
     case "$key" in
         [!a-zA-Z_]*|*[!a-zA-Z0-9_]*)
-            echo -e "${RED}Warning: invalid env key '${key}' in ${source_label} — skipped${NC}" >&2
+            warn_info "env" "Invalid env key '${key}' in ${source_label} — skipped"
             return 1
             ;;
     esac
     # Blocklist dangerous variables
     case "$key" in
         PATH|HOME|SHELL|USER|LOGNAME|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_*|IFS|CDPATH|BASH_ENV|ENV|TMPDIR|LD_AUDIT|LD_CONFIG|BASH_FUNC_*|PROMPT_COMMAND|GLOBIGNORE|HISTFILE|PYTHONPATH|NODE_PATH|RUBYLIB|PERL5LIB|GIT_SSH_COMMAND|GIT_EXEC_PATH|GIT_CONFIG_GLOBAL|GIT_DIR|GIT_WORK_TREE|GIT_AUTHOR_*|GIT_COMMITTER_*|GCONV_PATH|OPENAI_*|EDITOR|VISUAL|http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|no_proxy|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS|NODE_OPTIONS|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|ANTHROPIC_*|CLAUDE_*|XDG_CONFIG_HOME|XDG_DATA_HOME)
-            echo -e "${RED}Warning: dangerous env key '${key}' in ${source_label} — skipped${NC}" >&2
+            warn_info "env" "Dangerous env key '${key}' in ${source_label} — skipped"
             return 1
             ;;
     esac
@@ -49,11 +49,11 @@ _load_env_files_impl() {
         [[ -z "$env_file" ]] && continue
         local abs_path="$base_dir/$env_file"
         if ! _is_within_dir "$abs_path" "$base_dir"; then
-            echo -e "${YELLOW}Warning: env file escapes base directory, skipping: ${env_file}${NC}" >&2
+            warn_info "env" "Env file escapes base directory, skipping: ${env_file}" "$verbose"
             continue
         fi
         if [[ ! -f "$abs_path" ]]; then
-            [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: env file not found: ${env_file}${NC}" >&2
+            warn_critical "env" "Env file not found: ${env_file}" "$verbose"
             continue
         fi
         if ! jq empty "$abs_path" 2>/dev/null; then

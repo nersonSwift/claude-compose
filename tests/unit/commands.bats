@@ -152,22 +152,6 @@ teardown() {
     [[ -f "$dest_ws/.claude/agents/a.md" ]]
 }
 
-# ── cmd_instructions ─────────────────────────────────────────────────
-
-@test "cmd_instructions runs without error" {
-    reset_globals
-    create_config '{"projects":[{"name":"app","path":"/tmp/app"}]}'
-    run cmd_instructions
-    assert_success
-}
-
-@test "cmd_instructions runs with resources" {
-    reset_globals
-    create_config '{"projects":[],"resources":{"agents":["a.md","b.md"],"skills":[],"mcp":{"s":{"command":"echo"}},"env_files":[]}}'
-    run cmd_instructions
-    assert_success
-}
-
 # ── cmd_build ────────────────────────────────────────────────────────
 
 @test "cmd_build with valid config" {

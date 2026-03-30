@@ -33,7 +33,7 @@ _collect_project_args() {
         project_name="${project_name//$'\r'/}"
 
         if [[ ! -d "$project_path" ]]; then
-            [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: Project path not found, skipping: ${raw_path}${NC}" >&2
+            warn_critical "projects" "Project path not found, skipping: ${raw_path}" "$verbose"
             continue
         fi
 
@@ -143,7 +143,7 @@ _collect_manifest_args() {
             if [[ -f "$abs_aspf" ]]; then
                 _SYSTEM_PROMPT+=$'\n\n'"$(cat "$abs_aspf")"
             else
-                [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: global system prompt file not found: ${aspf}${NC}" >&2
+                warn_critical "resources" "Global system prompt file not found: ${aspf}" "$verbose"
             fi
         done <<< "$global_aspf"
     fi
@@ -156,7 +156,7 @@ _collect_manifest_args() {
         if [[ -f "$abs_aspf" ]]; then
             _SYSTEM_PROMPT+=$'\n\n'"$(cat "$abs_aspf")"
         else
-            [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: system prompt file not found: ${aspf}${NC}" >&2
+            warn_critical "resources" "System prompt file not found: ${aspf}" "$verbose"
         fi
     done <<< "$local_aspf"
 
@@ -191,7 +191,7 @@ _build_settings() {
             if [[ -f "$abs_gs" ]] && jq empty "$abs_gs" 2>/dev/null; then
                 _COMPOSE_SETTINGS=$(merge_compose_settings "$_COMPOSE_SETTINGS" "$(cat "$abs_gs")")
             else
-                [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: global settings file not found or invalid: ${global_sp}${NC}" >&2
+                warn_critical "resources" "Global settings file not found or invalid: ${global_sp}" "$verbose"
             fi
         fi
     fi
@@ -203,7 +203,7 @@ _build_settings() {
         if [[ -f "$abs_ls" ]] && jq empty "$abs_ls" 2>/dev/null; then
             _COMPOSE_SETTINGS=$(merge_compose_settings "$_COMPOSE_SETTINGS" "$(cat "$abs_ls")")
         else
-            [[ "$verbose" == "true" ]] && echo -e "${YELLOW}Warning: settings file not found or invalid: ${local_sp}${NC}" >&2
+            warn_critical "resources" "Settings file not found or invalid: ${local_sp}" "$verbose"
         fi
     fi
 
@@ -266,7 +266,7 @@ _install_marketplace_plugin() {
     fi
     echo -e "${CYAN}Installing plugin: $name${NC}" >&2
     if ! claude plugins install "$name" --scope user 2>&1; then
-        echo -e "${YELLOW}Warning: Failed to install plugin: $name${NC}" >&2
+        warn_critical "plugins" "Failed to install plugin: $name"
         return 1
     fi
 }
@@ -309,11 +309,11 @@ _resolve_single_plugin() {
                 _dedup_plugin_dir "$plugin_dir"
                 PLUGIN_DIRS+=("$plugin_dir")
             else
-                echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
+                warn_critical "plugins" "Plugin directory not found: ${plugin_dir}"
             fi
         else
             _dedup_marketplace_plugin "$str_val"
-            _install_marketplace_plugin "$str_val"
+            _install_marketplace_plugin "$str_val" || true
             MARKETPLACE_PLUGINS+=("$str_val")
         fi
 
@@ -330,11 +330,11 @@ _resolve_single_plugin() {
                 _dedup_plugin_dir "$plugin_dir"
                 PLUGIN_DIRS+=("$plugin_dir")
             else
-                echo -e "  ${YELLOW}Warning: plugin directory not found: ${plugin_dir}${NC}" >&2
+                warn_critical "plugins" "Plugin directory not found: ${plugin_dir}"
             fi
         elif [[ -n "$p_name" ]]; then
             _dedup_marketplace_plugin "$p_name"
-            _install_marketplace_plugin "$p_name"
+            _install_marketplace_plugin "$p_name" || true
             MARKETPLACE_PLUGINS+=("$p_name")
 
             # Parse config keys → CLAUDE_PLUGIN_OPTION_* env vars

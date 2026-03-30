@@ -8,7 +8,6 @@ usage() {
     echo "  claude-compose config [-y <path>] [--check] [-f <file>]"
     echo "  claude-compose migrate <project-path> [--delete] [--workspace <path>]"
     echo "  claude-compose copy <source-workspace> [dest-path]"
-    echo "  claude-compose instructions"
     echo "  claude-compose doctor"
     echo "  claude-compose start [root-path]"
     echo "  claude-compose wrap <claude-binary> [args...]"
@@ -19,7 +18,6 @@ usage() {
     echo "  config        Create or manage claude-compose.json config"
     echo "  migrate       Copy Claude config from a project into this workspace"
     echo "  copy          Clone a workspace to a new location"
-    echo "  instructions  Show instructions for managing workspace resources"
     echo "  doctor        Diagnose and fix compose problems"
     echo "  start         Onboarding wizard — scan for projects and create workspaces"
     echo "  wrap          VS Code process wrapper mode (used internally by wrapper script)"
@@ -112,7 +110,7 @@ parse_args() {
     # Detect subcommand as first positional argument
     if [[ $# -gt 0 ]]; then
         case "$1" in
-            config|build|migrate|copy|instructions|doctor|start|wrap|ide)
+            config|build|migrate|copy|doctor|start|wrap|ide)
                 SUBCOMMAND="$1"
                 shift
                 ;;
@@ -439,7 +437,7 @@ _resolve_workspace_dir() {
                 if [[ ! -e "$ws_config" ]] || [[ -L "$ws_config" ]]; then
                     ln -sf "$CONFIG_FILE" "$ws_config"
                 elif [[ -f "$ws_config" ]]; then
-                    echo -e "${YELLOW}Warning: workspace_path contains its own claude-compose.json, skipping symlink${NC}" >&2
+                    warn_info "workspace" "workspace_path contains its own claude-compose.json, skipping symlink"
                 fi
             fi
         fi
@@ -494,6 +492,79 @@ _reset_current_source() {
     CURRENT_SOURCE_ADD_DIRS=()
     CURRENT_SOURCE_PROJECT_DIRS=()
     CURRENT_SOURCE_NAME=""
+}
+
+# ── Warning collection helpers ────────────────────────────────────────
+# Record a critical warning (will trigger doctor at end of build).
+# $1 = source label, $2 = message, $3 = verbose (default "true")
+warn_critical() {
+    local source="$1" msg="$2" verbose="${3:-true}"
+    _WARNINGS_CRITICAL+=("${source}|${msg}")
+    if [[ "$verbose" == "true" ]]; then
+        echo -e "  ${YELLOW}Warning: ${msg}${NC}" >&2
+    fi
+}
+
+# Record an informational warning (display only, no doctor).
+# $1 = source label, $2 = message, $3 = verbose (default "true")
+warn_info() {
+    local source="$1" msg="$2" verbose="${3:-true}"
+    _WARNINGS_INFO+=("${source}|${msg}")
+    if [[ "$verbose" == "true" ]]; then
+        echo -e "  ${YELLOW}Warning: ${msg}${NC}" >&2
+    fi
+}
+
+# Format all collected warnings as structured text.
+_format_warning_summary() {
+    local summary=""
+    if [[ ${#_WARNINGS_CRITICAL[@]} -gt 0 ]]; then
+        summary+="Critical warnings (${#_WARNINGS_CRITICAL[@]}):"$'\n'
+        local w
+        for w in "${_WARNINGS_CRITICAL[@]}"; do
+            summary+="  [${w%%|*}] ${w#*|}"$'\n'
+        done
+    fi
+    if [[ ${#_WARNINGS_INFO[@]} -gt 0 ]]; then
+        [[ -n "$summary" ]] && summary+=$'\n'
+        summary+="Informational warnings (${#_WARNINGS_INFO[@]}):"$'\n'
+        local w
+        for w in "${_WARNINGS_INFO[@]}"; do
+            summary+="  [${w%%|*}] ${w#*|}"$'\n'
+        done
+    fi
+    echo "$summary"
+}
+
+# Check warnings and trigger doctor if critical ones exist.
+# Always prints summary (regardless of verbose).
+_check_warnings_and_report() {
+    local total=$(( ${#_WARNINGS_CRITICAL[@]} + ${#_WARNINGS_INFO[@]} ))
+    [[ "$total" -eq 0 ]] && return 0
+
+    echo "" >&2
+    echo -e "${BOLD}── Warning Summary ──${NC}" >&2
+    _format_warning_summary >&2
+
+    if [[ ${#_WARNINGS_CRITICAL[@]} -gt 0 ]]; then
+        local summary
+        summary=$(_format_warning_summary)
+        die_doctor "Build completed with critical warnings:"$'\n'"${summary}"
+    fi
+}
+
+# Wrap-mode variant: check warnings and launch wrap doctor if critical.
+# Uses _wrap_launch_doctor instead of die_doctor (no EXIT trap in wrap mode).
+_wrap_check_warnings() {
+    [[ ${#_WARNINGS_CRITICAL[@]} -eq 0 ]] && return 0
+
+    echo "" >&2
+    echo -e "${BOLD}── Warning Summary ──${NC}" >&2
+    _format_warning_summary >&2
+
+    local summary
+    summary=$(_format_warning_summary)
+    _wrap_launch_doctor "Critical warnings during workspace preparation:"$'\n'"${summary}"
 }
 
 # Acquire a directory-based lock (POSIX-portable, no flock needed)

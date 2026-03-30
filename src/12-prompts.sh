@@ -28,16 +28,6 @@ PROMPT_EOF
     echo "$prompt"
 }
 
-compose_instructions_prompt() {
-    local workspace_summary="$1"
-    local prompt
-    IFS= read -r -d '' prompt <<'PROMPT_EOF' || true
-__PROMPT_COMPOSE_INSTRUCTIONS__
-PROMPT_EOF
-    prompt="${prompt//__WORKSPACE_SUMMARY__/$workspace_summary}"
-    echo "$prompt"
-}
-
 compose_doctor_prompt() {
     local config_file="$1"
     local workspace_dir="$2"

@@ -46,13 +46,6 @@ teardown() {
     [[ -z "$result" || -n "$result" ]]
 }
 
-# ── compose_instructions_prompt ──────────────────────────────────────
-
-@test "compose_instructions_prompt accepts summary arg" {
-    run compose_instructions_prompt "test summary"
-    assert_success
-}
-
 # ── compose_start_prompt ─────────────────────────────────────────────
 
 @test "compose_start_prompt accepts root_path" {

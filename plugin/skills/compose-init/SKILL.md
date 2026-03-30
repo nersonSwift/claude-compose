@@ -13,7 +13,7 @@ This skill initializes CLAUDE.md files across the entire compose workspace:
 
 ## Phase 1: Gather workspace context
 
-1. Run `claude-compose instructions` and read the output to understand workspace structure and what is managed by build.
+1. Read `claude-compose.json` and the workspace CLAUDE.md to understand workspace structure and what is managed by build.
 
 2. Read `claude-compose.json` to get the exact list of projects:
    ```bash
@@ -149,4 +149,4 @@ Workspace initialized:
 - **Do NOT touch projects from connected workspaces** — only read their CLAUDE.md for context
 - **Always write CLAUDE.md content in English** — translate user input if needed
 - **Always use project aliases** — never hardcode absolute paths in CLAUDE.md
-- If `claude-compose instructions` fails or no projects are configured, tell the user to run `claude-compose config` first
+- If no projects are configured, tell the user to run `claude-compose config` first

@@ -14,7 +14,6 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(PLUGIN_FILES)
 		case "$$line" in \
 			*__PROMPT_COMPOSE_SYSTEM__*) cat prompts/compose-system.md ;; \
 			*__PROMPT_COMPOSE_CONFIG__*) cat prompts/compose-config.md ;; \
-			*__PROMPT_COMPOSE_INSTRUCTIONS__*) cat prompts/compose-instructions.md ;; \
 			*__PROMPT_COMPOSE_DOCTOR__*) cat prompts/compose-doctor.md ;; \
 			*__PROMPT_COMPOSE_START__*) cat prompts/compose-start.md ;; \
 			*__PROMPT_COMPOSE_KNOWLEDGE__*) cat prompts/compose-knowledge.md ;; \
@@ -34,9 +33,11 @@ $(TARGET): $(SOURCES) $(PROMPTS) $(PLUGIN_FILES)
 	done < $@.tmp > $@
 	@rm -f $@.tmp
 	@chmod +x $@
-	@if git describe --exact-match --tags HEAD 2>/dev/null | grep -qE '^v[0-9]'; then \
+	@if [ -n "$(V)" ]; then \
+		sed -i.bak 's|^VERSION=".*"|VERSION="$(V)"|' $@ && rm -f $@.bak; \
+	elif git describe --exact-match --tags HEAD 2>/dev/null | grep -qE '^v[0-9]'; then \
 		TAG_VER=$$(git describe --exact-match --tags HEAD 2>/dev/null | sed 's/^v//'); \
-		sed -i.bak "s/^VERSION=\".*\"/VERSION=\"$$TAG_VER\"/" $@ && rm -f $@.bak; \
+		sed -i.bak "s|^VERSION=\".*\"|VERSION=\"$$TAG_VER\"|" $@ && rm -f $@.bak; \
 	fi
 	@cp scripts/vscode-wrapper.sh $(WRAPPER)
 	@chmod +x $(WRAPPER)

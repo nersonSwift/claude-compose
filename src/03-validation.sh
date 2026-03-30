@@ -379,7 +379,7 @@ validate_config_semantics() {
     if [[ -n "$unknown_keys" ]]; then
         while IFS= read -r uk; do
             [[ -z "$uk" ]] && continue
-            echo -e "${YELLOW}Warning: unknown config key \"${uk}\" in $(basename "$config_file")${NC}" >&2
+            warn_info "config" "Unknown config key \"${uk}\" in $(basename "$config_file")"
         done <<< "$unknown_keys"
     fi
 

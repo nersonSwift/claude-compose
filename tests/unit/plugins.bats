@@ -196,7 +196,7 @@ teardown() {
     PLUGIN_DIRS=()
     _PLUGINS_RESOLVED=false
     run resolve_plugins "$cfg" "${TEST_TEMP_DIR}/workspace"
-    assert_output --partial 'Warning: plugin directory not found'
+    assert_output --partial 'Plugin directory not found'
 }
 
 @test "resolve_plugins: no plugins key does nothing" {
